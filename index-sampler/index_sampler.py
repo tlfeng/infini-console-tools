@@ -82,6 +82,7 @@ class SamplingReport:
 def sample_cluster(
     client: ConsoleClient,
     cluster: Dict,
+    clusters_status: Dict,
     sample_size: int,
     max_indices: int,
     include_system_indices: bool,
@@ -91,6 +92,16 @@ def sample_cluster(
     cluster_name = cluster.get("name", "")
 
     print(f"Processing cluster: {cluster_name} ({cluster_id})")
+
+    # 检查集群健康状态
+    cluster_status = clusters_status.get(cluster_id)
+    if not cluster_status:
+        print(f"  Skipping cluster: {cluster_name} (no status info)")
+        return None
+    
+    if not cluster_status.get("available", False):
+        print(f"  Skipping cluster: {cluster_name} (not available)")
+        return None
 
     try:
         indices = client.get_indices(cluster_id)
@@ -112,6 +123,12 @@ def sample_cluster(
 
         if max_indices > 0 and processed >= max_indices:
             break
+
+        # 检查索引健康状态
+        health = index_info.get("health", "").lower()
+        if health == "unavailable":
+            print(f"  Skipping index: {index_name} (health: {health})")
+            continue
 
         print(f"  Sampling index: {index_name}")
 
@@ -296,6 +313,14 @@ Examples:
 
     print(f"Found {len(filtered_clusters)} clusters (skipped {len(clusters) - len(filtered_clusters)} system clusters)")
 
+    # 获取所有集群状态
+    print("Fetching clusters status...")
+    try:
+        clusters_status = client.get_clusters_status()
+    except Exception as e:
+        print(f"Error: Failed to get clusters status: {e}")
+        sys.exit(1)
+
     # 创建报告
     report = SamplingReport()
     report.total_clusters = len(filtered_clusters)
@@ -305,6 +330,7 @@ Examples:
         result = sample_cluster(
             client,
             cluster,
+            clusters_status,
             args.sample_size,
             args.max_indices,
             args.include_system_indices,
