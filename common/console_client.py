@@ -168,22 +168,34 @@ class ConsoleClient:
     def get_indices(self, cluster_id: str) -> Dict[str, Any]:
         """获取集群索引列表"""
         try:
-            # 尝试使用 _cat/indices
-            result = self._make_request(
-                f"/elasticsearch/{cluster_id}/_cat/indices", "GET"
+            # 使用 _proxy 直接查询 ES _cat/indices API 获取完整信息
+            result = self.proxy_request(
+                cluster_id, "GET",
+                "/_cat/indices?format=json&h=index,health,status,shards,pri,rep,docs.count,docs.deleted,store.size,pri.store.size"
             )
-            if isinstance(result, list):
-                return {item["index"]: item for item in result if "index" in item}
-            elif isinstance(result, dict):
-                return result
+            response_body = result.get("response_body") if isinstance(result, dict) else result
+            if isinstance(response_body, str):
+                import json
+                try:
+                    response_body = json.loads(response_body)
+                except json.JSONDecodeError:
+                    response_body = None
+            
+            if isinstance(response_body, list):
+                return {item["index"]: item for item in response_body if "index" in item}
+            elif isinstance(response_body, dict):
+                return response_body
             return {}
         except Exception:
-            # 回退到普通 indices 接口
-            result = self._make_request(f"/elasticsearch/{cluster_id}/indices", "GET")
-            if isinstance(result, list):
-                return {item["index"]: item for item in result if "index" in item}
-            elif isinstance(result, dict):
-                return result
+            # 回退到 Console 的 indices 接口
+            try:
+                result = self._make_request(f"/elasticsearch/{cluster_id}/indices", "GET")
+                if isinstance(result, list):
+                    return {item["index"]: item for item in result if "index" in item}
+                elif isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
             return {}
 
     def proxy_request(
