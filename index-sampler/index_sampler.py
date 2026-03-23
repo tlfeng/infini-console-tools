@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Any
 # 添加父目录到路径以导入 common 模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
+from common.config import add_common_args, load_and_merge_config, get_config_value
 
 
 class IndexSample:
@@ -216,72 +217,90 @@ def export_csv(report: SamplingReport, filepath: Path):
                 writer.writerow(row)
 
 
-def main():
+def parse_args():
+    """解析命令行参数"""
     parser = argparse.ArgumentParser(
         description="Index Sampler - 从 INFINI Console 管理的集群中采样索引信息",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
+  # 基础用法
   python index_sampler.py -c http://localhost:9000
 
-  # With authentication
+  # 使用认证
   python index_sampler.py -c http://localhost:9000 -u admin -p password
 
-  # Include system indices
+  # 使用配置文件
+  python index_sampler.py --config config.json
+
+  # 包含系统索引
   python index_sampler.py -c http://localhost:9000 --include-system-indices
 
-  # Include Console system cluster (usually not needed)
+  # 包含 Console 系统集群
   python index_sampler.py -c http://localhost:9000 --include-console-cluster
+
+Environment Variables:
+  CONSOLE_URL       Console URL (默认: http://localhost:9000)
+  CONSOLE_USERNAME  用户名
+  CONSOLE_PASSWORD  密码
+  CONSOLE_TIMEOUT   超时时间(秒)
         """,
     )
 
-    parser.add_argument(
-        "-c",
-        "--console",
-        default="http://localhost:9000",
-        help="INFINI Console API URL (default: http://localhost:9000)",
-    )
-    parser.add_argument("-u", "--username", default="", help="Login username")
-    parser.add_argument("-p", "--password", default="", help="Login password")
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="./index_sampling_output",
-        help="Output directory for results (default: ./index_sampling_output)",
-    )
+    # 添加通用参数
+    parser = add_common_args(parser)
+
+    # 添加本工具特有参数
     parser.add_argument(
         "-s",
         "--sample-size",
         type=int,
         default=2,
-        help="Number of sample documents per index (default: 2)",
+        help="每个索引采样的文档数量 (默认: 2)",
     )
     parser.add_argument(
         "-m",
         "--max-indices",
         type=int,
         default=0,
-        help="Maximum indices to sample per cluster (0 = unlimited, default: 0)",
+        help="每个集群最大采样索引数 (0=无限制, 默认: 0)",
     )
     parser.add_argument(
         "--include-system-indices",
         action="store_true",
-        help="Include system indices (starting with .)",
+        help="包含系统索引(以 . 开头)",
     )
     parser.add_argument(
         "--include-console-cluster",
         action="store_true",
-        help="Include INFINI Console system cluster (default: excluded)",
+        help="包含 INFINI Console 系统集群 (默认: 排除)",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config, _ = load_and_merge_config(args)
+
+    # 从配置文件、环境变量或命令行参数获取值
+    console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', 'http://localhost:9000')
+    username = get_config_value(args.username, config.get('auth', {}).get('username'), 'CONSOLE_USERNAME', '')
+    password = get_config_value(args.password, config.get('auth', {}).get('password'), 'CONSOLE_PASSWORD', '')
+    timeout = int(get_config_value(str(args.timeout), str(config.get('timeout')), 'CONSOLE_TIMEOUT', '60'))
+    insecure = args.insecure or config.get('insecure', False)
+    
+    output = args.output or config.get('output', './index_sampling_output')
+    sample_size = args.sample_size or config.get('sampleSize', 2)
+    max_indices = args.max_indices or config.get('maxIndices', 0)
+    include_system_indices = args.include_system_indices or config.get('includeSystemIndices', False)
+    include_console_cluster = args.include_console_cluster or config.get('includeConsoleCluster', False)
 
     # 创建客户端
-    client = ConsoleClient(args.console, args.username, args.password)
+    client = ConsoleClient(console_url, username, password, timeout=timeout, verify_ssl=not insecure)
 
     # 登录获取 token
-    if args.username and args.password:
+    if username and password:
         print("Logging in...")
         try:
             if not client.login():
@@ -304,7 +323,7 @@ Examples:
         cluster_id = cluster.get("id", "")
         cluster_name = cluster.get("name", "")
 
-        if not args.include_console_cluster and ConsoleClient.is_system_cluster(
+        if not include_console_cluster and ConsoleClient.is_system_cluster(
             cluster_id, cluster_name
         ):
             print(f"  Skipping Console system cluster: {cluster_name} ({cluster_id})")
@@ -331,18 +350,18 @@ Examples:
             client,
             cluster,
             clusters_status,
-            args.sample_size,
-            args.max_indices,
-            args.include_system_indices,
+            sample_size,
+            max_indices,
+            include_system_indices,
         )
         if result:
             report.results.append(result)
 
     # 导出结果
     print("\nExporting results...")
-    export_results(report, args.output)
+    export_results(report, output)
 
-    print(f"\nSampling complete. Results exported to: {args.output}")
+    print(f"\nSampling complete. Results exported to: {output}")
 
 
 if __name__ == "__main__":

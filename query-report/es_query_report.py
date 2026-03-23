@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Query Report - ES 查询报告生成工具
+
+按 Kibana 风格请求文件生成 ES 查询与索引信息 Markdown 报告
+"""
 
 import argparse
 import getpass
@@ -17,11 +22,12 @@ try:
 except ModuleNotFoundError:
     requests = None
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from common.config import add_common_args, load_and_merge_config, get_config_value
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_DIR = SCRIPT_DIR / "config"
-DEFAULT_INPUT_PATH = DEFAULT_CONFIG_DIR / "queries.txt"
-DEFAULT_AUTH_CONFIG_PATH = DEFAULT_CONFIG_DIR / "auth-config.json"
+DEFAULT_INPUT_PATH = SCRIPT_DIR / "config" / "queries.txt"
 
 
 @dataclass
@@ -94,7 +100,7 @@ def parse_requests(text: str) -> List[RequestCase]:
         while body_lines and not body_lines[0].strip():
             body_lines = body_lines[1:]
         while body_lines and not body_lines[-1].strip():
-            body_lines = body_lines[:-1]
+            body_lines = body_lines[:-1:]
         body_raw = "\n".join(body_lines)
 
         parsed_body: Any = None
@@ -579,104 +585,104 @@ def load_input_text(input_path: Optional[str]) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="按 Kibana 风格请求文件生成 ES 查询与索引信息 Markdown 报告。"
+        description="Query Report - 按 Kibana 风格请求文件生成 ES 查询与索引信息 Markdown 报告",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 基础用法 (需要配置文件或环境变量)
+  python es_query_report.py -i queries.txt
+
+  # 完整参数
+  python es_query_report.py -c http://localhost:9000 -u admin -p password \\
+    --cluster-id xxx -i queries.txt -o report.md
+
+  # 使用配置文件
+  python es_query_report.py --config config.json -i queries.txt
+
+Environment Variables:
+  CONSOLE_URL       Console URL
+  CONSOLE_USERNAME  用户名
+  CONSOLE_PASSWORD  密码
+  CONSOLE_CLUSTER_ID    集群 ID
+  CONSOLE_CLUSTER_NAME  集群名称 (可替代 cluster-id)
+        """,
     )
+
+    # 添加通用参数
+    parser = add_common_args(parser)
+
+    # 添加本工具特有参数
     parser.add_argument(
-        "--input",
         "-i",
+        "--input",
         default=str(DEFAULT_INPUT_PATH),
         help=f"输入文件路径（默认: {DEFAULT_INPUT_PATH}）；传 '-' 则从 stdin 读取。",
     )
-    parser.add_argument("--output", "-o", default="query-report.md", help="输出 Markdown 文件路径。")
     parser.add_argument(
-        "--auth-config",
-        default=str(DEFAULT_AUTH_CONFIG_PATH),
-        help="认证配置 JSON 文件路径，支持 baseUrl/auth.username/auth.password/clusterId/clusterName。",
+        "--cluster-id",
+        default="",
+        help="目标集群 ID (环境变量: CONSOLE_CLUSTER_ID)"
     )
-    parser.add_argument("--base-url", default=os.getenv("CONSOLE_BASE_URL"), help="Console 地址，例如 http://localhost:9000")
-    parser.add_argument("--cluster-id", default=os.getenv("CONSOLE_CLUSTER_ID"), help="目标集群 ID")
-    parser.add_argument("--cluster-name", default=os.getenv("CONSOLE_CLUSTER_NAME"), help="目标集群名称（可替代 cluster-id）")
-    parser.add_argument("--username", default=os.getenv("CONSOLE_USERNAME"), help="登录用户名")
-    parser.add_argument("--password", default=os.getenv("CONSOLE_PASSWORD"), help="登录密码")
-    parser.add_argument("--timeout", type=int, default=60, help="HTTP 超时（秒）")
-    parser.add_argument("--insecure", action="store_true", help="关闭 HTTPS 证书校验")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="目标集群名称，可替代 cluster-id (环境变量: CONSOLE_CLUSTER_NAME)"
+    )
+
     return parser.parse_args()
-
-
-def require_arg(value: Optional[str], name: str) -> str:
-    if value:
-        return value
-    raise ValueError(f"缺少参数: {name}")
-
-
-def load_auth_config(path: str) -> Dict[str, Any]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError as exc:
-        raise ValueError(f"认证配置文件不存在: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"认证配置文件 JSON 格式错误: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError("认证配置文件根节点必须是 JSON 对象。")
-    return data
 
 
 def main() -> int:
     args = parse_args()
+    config, _ = load_and_merge_config(args)
+
+    # 从配置文件、环境变量或命令行参数获取值
+    console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', '')
+    if not console_url:
+        print("错误: 缺少 Console URL，请通过 -c/--console、--config 或 CONSOLE_URL 环境变量设置")
+        return 1
+
+    username = get_config_value(args.username, config.get('auth', {}).get('username'), 'CONSOLE_USERNAME', '')
+    password = get_config_value(args.password, config.get('auth', {}).get('password'), 'CONSOLE_PASSWORD', '')
+    timeout = int(get_config_value(str(args.timeout), str(config.get('timeout')), 'CONSOLE_TIMEOUT', '60'))
+    insecure = args.insecure or config.get('insecure', False)
+    
+    cluster_id = get_config_value(args.cluster_id, config.get('clusterId'), 'CONSOLE_CLUSTER_ID', '')
+    cluster_name = get_config_value(args.cluster_name, config.get('clusterName'), 'CONSOLE_CLUSTER_NAME', '')
+    output = args.output or config.get('output', 'query-report.md')
+    input_path = args.input
+
+    # 加载查询
     try:
-        input_text = load_input_text(args.input)
+        input_text = load_input_text(input_path)
         cases = parse_requests(input_text)
     except Exception as exc:
         print(f"输入解析失败: {exc}", file=sys.stderr)
         return 1
 
-    auth_data: Dict[str, Any] = {}
-    if args.auth_config:
-        try:
-            auth_data = load_auth_config(args.auth_config)
-        except Exception as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+    # 密码提示
+    if username and not password:
+        password = getpass.getpass(f"请输入 {username} 的密码: ")
 
-    auth_obj = auth_data.get("auth") if isinstance(auth_data.get("auth"), dict) else {}
-    try:
-        base_url = require_arg(
-            args.base_url or auth_data.get("baseUrl"),
-            "--base-url 或 CONSOLE_BASE_URL 或 --auth-config.baseUrl",
-        )
-        cluster_id = (args.cluster_id or auth_data.get("clusterId") or "").strip()
-        cluster_name = (args.cluster_name or auth_data.get("clusterName") or "").strip()
-        if not cluster_id and not cluster_name:
-            raise ValueError(
-                "缺少集群标识：请提供 clusterId 或 clusterName（可通过命令行、环境变量或 --auth-config）。"
-            )
-        username = require_arg(
-            args.username or auth_obj.get("username"),
-            "--username 或 CONSOLE_USERNAME 或 --auth-config.auth.username",
-        )
-        password = args.password or auth_obj.get("password") or getpass.getpass("Console 密码: ")
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
+    # 创建客户端
     client = ConsoleClient(
-        base_url=base_url,
+        base_url=console_url,
         cluster_id=cluster_id,
         username=username,
         password=password,
-        timeout=args.timeout,
-        verify_ssl=not args.insecure,
+        timeout=timeout,
+        verify_ssl=not insecure,
     )
 
+    # 登录
     try:
         client.login()
     except Exception as exc:
         print(f"登录失败: {exc}", file=sys.stderr)
         return 1
 
-    if not cluster_id:
+    # 解析集群名称
+    if not cluster_id and cluster_name:
         try:
             cluster_id = client.resolve_cluster_id_by_name(cluster_name)
             client.cluster_id = cluster_id
@@ -685,6 +691,11 @@ def main() -> int:
             print(f"解析 clusterName 失败: {exc}", file=sys.stderr)
             return 1
 
+    if not client.cluster_id:
+        print("错误: 缺少集群 ID，请通过 --cluster-id 或 --cluster-name 指定")
+        return 1
+
+    # 生成报告
     report_items: List[Dict[str, Any]] = []
     for case in cases:
         content_type = "application/x-ndjson" if case.body_is_ndjson else "application/json"
@@ -721,8 +732,8 @@ def main() -> int:
         )
 
     markdown = build_report_markdown(report_items)
-    out_path = os.path.abspath(args.output)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_path = Path(output).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(markdown)
 

@@ -1,0 +1,32 @@
+{
+  "consoleUrl": "http://localhost:9000",
+  "auth": {
+    "username": "admin",
+    "password": "password"
+  },
+  "timeout": 60,
+  "insecure": false,
+  
+  "_comment": "以下参数根据工具类型可选:",
+  
+  "indexSamplerOptions": {
+    "output": "./index_sampling_output",
+    "sampleSize": 2,
+    "maxIndices": 0,
+    "includeSystemIndices": false,
+    "includeConsoleCluster": false
+  },
+  
+  "clusterReportOptions": {
+    "output": "cluster_report.csv",
+    "summaryOnly": false,
+    "includeConsoleCluster": false
+  },
+  
+  "queryReportOptions": {
+    "clusterId": "",
+    "clusterName": "",
+    "input": "queries.txt",
+    "output": "query-report.md"
+  }
+}

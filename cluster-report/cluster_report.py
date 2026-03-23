@@ -16,6 +16,7 @@ import argparse
 import csv
 import getpass
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +25,7 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError
+from common.config import add_common_args, load_and_merge_config, get_config_value
 
 
 @dataclass
@@ -230,46 +232,80 @@ class ClusterReporter:
         print("=" * 60)
 
 
-def main():
+def parse_args():
+    """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="Console 集群信息收集工具 - 收集所有集群基本信息并输出CSV报告",
+        description="Cluster Report - 收集 INFINI Console 中所有 Elasticsearch 集群信息",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --host http://localhost:9000
-  %(prog)s --host http://localhost:9000 -u admin -p password
-  %(prog)s --host http://localhost:9000 -o my_report.csv --summary-only
+  # 基础用法
+  python cluster_report.py -c http://localhost:9000
+
+  # 使用认证
+  python cluster_report.py -c http://localhost:9000 -u admin -p password
+
+  # 使用配置文件
+  python cluster_report.py --config config.json
+
+  # 仅显示汇总信息
+  python cluster_report.py -c http://localhost:9000 --summary-only
+
+  # 包含 Console 系统集群
+  python cluster_report.py -c http://localhost:9000 --include-console-cluster
+
+Environment Variables:
+  CONSOLE_URL       Console URL (默认: http://localhost:9000)
+  CONSOLE_USERNAME  用户名
+  CONSOLE_PASSWORD  密码
+  CONSOLE_TIMEOUT   超时时间(秒)
         """,
     )
+
+    # 添加通用参数
+    parser = add_common_args(parser)
+
+    # 添加本工具特有参数
     parser.add_argument(
-        "--host", default="http://localhost:9000",
-        help="Console地址 (默认: http://localhost:9000)"
+        "--summary-only",
+        action="store_true",
+        help="仅显示汇总统计，不生成 CSV 文件"
     )
-    parser.add_argument("--username", "-u", help="用户名")
-    parser.add_argument("--password", "-p", help="密码")
-    parser.add_argument("--output", "-o", help="输出CSV文件名前缀")
     parser.add_argument(
-        "--summary-only", action="store_true",
-        help="仅显示汇总统计，不生成CSV文件"
-    )
-    parser.add_argument(
-        "--include-console-cluster", action="store_true",
+        "--include-console-cluster",
+        action="store_true",
         help="包含 INFINI Console 系统集群"
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config, _ = load_and_merge_config(args)
+
+    # 从配置文件、环境变量或命令行参数获取值
+    console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', 'http://localhost:9000')
+    username = get_config_value(args.username, config.get('auth', {}).get('username'), 'CONSOLE_USERNAME', '')
+    password = get_config_value(args.password, config.get('auth', {}).get('password'), 'CONSOLE_PASSWORD', '')
+    timeout = int(get_config_value(str(args.timeout), str(config.get('timeout')), 'CONSOLE_TIMEOUT', '60'))
+    insecure = args.insecure or config.get('insecure', False)
+    
+    output = args.output or config.get('output')
+    summary_only = args.summary_only or config.get('summaryOnly', False)
+    include_console_cluster = args.include_console_cluster or config.get('includeConsoleCluster', False)
 
     # 如果需要认证但未提供密码，提示输入
-    if args.username and not args.password:
-        args.password = getpass.getpass(f"请输入 {args.username} 的密码: ")
+    if username and not password:
+        password = getpass.getpass(f"请输入 {username} 的密码: ")
 
-    print(f"连接到 Console: {args.host}")
+    print(f"连接到 Console: {console_url}")
 
     # 创建客户端
-    client = ConsoleClient(args.host, args.username or "", args.password or "")
+    client = ConsoleClient(console_url, username, password, timeout=timeout, verify_ssl=not insecure)
 
     # 登录
-    if args.username and args.password:
+    if username and password:
         print("正在登录...")
         try:
             if not client.login():
@@ -282,7 +318,7 @@ Examples:
 
     # 收集数据
     reporter = ClusterReporter(client)
-    data = reporter.collect_all_data(args.include_console_cluster)
+    data = reporter.collect_all_data(include_console_cluster)
 
     if not data:
         print("未收集到任何数据")
@@ -292,9 +328,9 @@ Examples:
     summary = reporter.generate_summary(data)
     reporter.print_summary(summary)
 
-    if not args.summary_only:
+    if not summary_only:
         # 生成详细报告
-        detail_file = reporter.generate_csv_report(data, args.output)
+        detail_file = reporter.generate_csv_report(data, output)
         if detail_file:
             print(f"\n已生成报告: {detail_file}")
 
