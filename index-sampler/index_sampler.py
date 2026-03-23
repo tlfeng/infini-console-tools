@@ -126,7 +126,7 @@ def sample_cluster(
             break
 
         # 检查索引健康状态
-        health = index_info.get("health", "").lower()
+        health = (index_info.get("health") or "").lower()
         if health == "unavailable":
             print(f"  Skipping index: {index_name} (health: {health})")
             continue
