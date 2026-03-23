@@ -1,0 +1,7 @@
+# INFINI Console Tools - Python Dependencies
+
+# query-report 和 test-runner 需要
+requests>=2.25.0
+
+# test-runner 额外需要
+matplotlib>=3.3.0
