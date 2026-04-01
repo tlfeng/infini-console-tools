@@ -6,9 +6,114 @@
   },
   "timeout": 60,
   "insecure": false,
-  
-  "_comment": "以下参数根据工具类型可选:",
-  
+
+  "metricsExporter": {
+    "jobs": [
+      {
+        "name": "全量导出-一周",
+        "enabled": true,
+        "description": "导出所有集群一周的监控数据（全量模式）",
+        "metrics": ["cluster_health", "cluster_stats", "node_stats", "index_stats", "shard_stats"],
+        "targets": {
+          "clusters": {
+            "include": ["*"],
+            "exclude": []
+          }
+        },
+        "sampling": {
+          "mode": "full"
+        },
+        "output": {
+          "directory": "./metrics_export_full",
+          "splitBy": "metric_type",
+          "filenamePrefix": "",
+          "compress": false
+        },
+        "execution": {
+          "parallelMetrics": 3,
+          "parallelDegree": 1,
+          "batchSize": null,
+          "scrollKeepalive": "60s",
+          "maxRetries": 3,
+          "retryDelay": 5
+        },
+        "timeRangeHours": 168,
+        "maxDocs": 1000000,
+        "includeAlerts": true,
+        "alertTypes": ["alert_rules", "alert_messages", "alert_history"]
+      },
+      {
+        "name": "抽样导出-一周",
+        "enabled": false,
+        "description": "导出所有集群一周的监控数据（抽样模式，按小时降采样）",
+        "metrics": ["cluster_health", "cluster_stats", "node_stats", "index_stats", "shard_stats"],
+        "targets": {
+          "clusters": {
+            "include": ["*"],
+            "exclude": []
+          }
+        },
+        "sampling": {
+          "mode": "sampling",
+          "interval": "1h"
+        },
+        "output": {
+          "directory": "./metrics_export_sampled",
+          "splitBy": "metric_type",
+          "filenamePrefix": "sampled_",
+          "compress": false
+        },
+        "execution": {
+          "parallelMetrics": 4,
+          "batchSize": 5000,
+          "scrollKeepalive": "30s"
+        },
+        "timeRangeHours": 168,
+        "maxDocs": 500000
+      },
+      {
+        "name": "单集群分析",
+        "enabled": false,
+        "description": "导出特定集群的详细节点指标",
+        "metrics": ["node_stats", "index_stats"],
+        "targets": {
+          "clusters": {
+            "include": ["cluster-id-here"],
+            "exclude": []
+          },
+          "indices": {
+            "include": ["*"],
+            "exclude": [".*"]
+          }
+        },
+        "sampling": {
+          "mode": "full"
+        },
+        "output": {
+          "directory": "./metrics_export_single",
+          "splitBy": "metric_type"
+        },
+        "execution": {
+          "parallelMetrics": 2,
+          "batchSize": 3000
+        },
+        "timeRangeHours": 24,
+        "maxDocs": 500000,
+        "sourceFields": [
+          "timestamp",
+          "metadata.labels.cluster_id",
+          "metadata.labels.node_id",
+          "metadata.labels.node_name",
+          "payload.elasticsearch.node_stats.os",
+          "payload.elasticsearch.node_stats.jvm",
+          "payload.elasticsearch.node_stats.indices"
+        ]
+      }
+    ]
+  },
+
+  "_comment": "以下参数为其他工具的可选配置:",
+
   "indexSamplerOptions": {
     "output": "./index_sampling_output",
     "sampleSize": 2,
@@ -16,13 +121,13 @@
     "includeSystemIndices": false,
     "includeConsoleCluster": false
   },
-  
+
   "clusterReportOptions": {
     "output": "cluster_report.csv",
     "summaryOnly": false,
     "includeConsoleCluster": false
   },
-  
+
   "queryReportOptions": {
     "clusterId": "",
     "clusterName": "",

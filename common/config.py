@@ -4,23 +4,28 @@
 配置管理公共模块
 
 统一的配置文件加载、环境变量支持和参数解析
+支持新的 metricsExporter jobs 配置格式
 """
 
 import argparse
 import json
 import os
-from typing import Dict, Any, Optional
+import re
+import fnmatch
+from typing import Dict, Any, Optional, List, Set
 from pathlib import Path
+from collections import Counter
+from dataclasses import dataclass, field
 
 
 def load_config_file(config_path: str) -> Dict[str, Any]:
     """加载 JSON 配置文件"""
     if not config_path or not Path(config_path).exists():
         return {}
-    
+
     with open(config_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+
     return data if isinstance(data, dict) else {}
 
 
@@ -38,9 +43,277 @@ def get_config_value(
     return os.getenv(env_var, default)
 
 
+class ConfigValidationError(Exception):
+    """配置校验错误"""
+    pass
+
+
+@dataclass
+class TargetFilter:
+    """目标筛选配置"""
+    include: List[str] = field(default_factory=list)
+    exclude: List[str] = field(default_factory=list)
+
+    def matches(self, value: str) -> bool:
+        """检查值是否匹配筛选条件"""
+        # 如果没有 include，默认匹配所有
+        if not self.include:
+            included = True
+        else:
+            included = any(self._pattern_match(p, value) for p in self.include)
+
+        # 检查 exclude
+        if included and self.exclude:
+            excluded = any(self._pattern_match(p, value) for p in self.exclude)
+            return not excluded
+
+        return included
+
+    @staticmethod
+    def _pattern_match(pattern: str, value: str) -> bool:
+        return fnmatch.fnmatch(value, pattern)
+
+
+@dataclass
+class TargetsConfig:
+    """目标配置"""
+    clusters: Optional[TargetFilter] = None
+    nodes: Optional[TargetFilter] = None
+    indices: Optional[TargetFilter] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'TargetsConfig':
+        if not data:
+            return cls()
+
+        def parse_filter(d: Optional[Dict]) -> Optional[TargetFilter]:
+            if not d:
+                return None
+            return TargetFilter(
+                include=d.get('include', []),
+                exclude=d.get('exclude', [])
+            )
+
+        return cls(
+            clusters=parse_filter(data.get('clusters')),
+            nodes=parse_filter(data.get('nodes')),
+            indices=parse_filter(data.get('indices'))
+        )
+
+
+@dataclass
+class SamplingConfig:
+    """抽样配置"""
+    mode: str = "full"  # full 或 sampling
+    interval: Optional[str] = None  # 如 "1h", "5m" 表示 downsampling 间隔
+    ratio: Optional[float] = None  # 0.0-1.0，采样比例
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'SamplingConfig':
+        if not data:
+            return cls()
+
+        mode = data.get('mode', 'full')
+        if mode not in ('full', 'sampling'):
+            raise ConfigValidationError(f"无效的采样模式: {mode}，必须是 'full' 或 'sampling'")
+
+        interval = data.get('interval')
+        ratio = data.get('ratio')
+
+        if mode == 'sampling':
+            if interval is None and ratio is None:
+                raise ConfigValidationError("sampling 模式需要指定 interval 或 ratio")
+            if ratio is not None and (ratio <= 0 or ratio > 1):
+                raise ConfigValidationError(f"ratio 必须在 (0, 1] 范围内，当前: {ratio}")
+
+        return cls(mode=mode, interval=interval, ratio=ratio)
+
+    def is_sampling(self) -> bool:
+        return self.mode == 'sampling'
+
+
+@dataclass
+class OutputConfig:
+    """输出配置"""
+    directory: str = "."
+    split_by: str = "metric_type"  # cluster, metric_type, none
+    filename_prefix: str = ""
+    compress: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'OutputConfig':
+        if not data:
+            return cls()
+
+        split_by = data.get('splitBy', 'metric_type')
+        if split_by not in ('cluster', 'metric_type', 'none'):
+            raise ConfigValidationError(f"无效的 splitBy: {split_by}，必须是 'cluster', 'metric_type' 或 'none'")
+
+        return cls(
+            directory=data.get('directory', '.'),
+            split_by=split_by,
+            filename_prefix=data.get('filenamePrefix', ''),
+            compress=data.get('compress', False)
+        )
+
+
+@dataclass
+class ExecutionConfig:
+    """执行配置"""
+    parallel_metrics: int = 2  # 并行导出的指标类型数
+    parallel_degree: int = 1   # 单个指标内的并行度（预留）
+    batch_size: Optional[int] = None
+    scroll_keepalive: str = "60s"
+    max_retries: int = 3
+    retry_delay: int = 5  # 秒
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'ExecutionConfig':
+        if not data:
+            return cls()
+
+        return cls(
+            parallel_metrics=data.get('parallelMetrics', 2),
+            parallel_degree=data.get('parallelDegree', 1),
+            batch_size=data.get('batchSize'),
+            scroll_keepalive=data.get('scrollKeepalive', '60s'),
+            max_retries=data.get('maxRetries', 3),
+            retry_delay=data.get('retryDelay', 5)
+        )
+
+
+SUPPORTED_TYPES = {
+    "metrics": {"cluster_health", "cluster_stats", "node_stats", "index_stats", "shard_stats"},
+    "alerts": {"alert_rules", "alert_messages", "alert_history"}
+}
+
+
+def _validate_types(name: str, types: list, kind: str) -> None:
+    """验证类型是否在支持列表中"""
+    invalid = set(types) - SUPPORTED_TYPES[kind]
+    if invalid:
+        type_name = "指标" if kind == "metrics" else "告警"
+        raise ConfigValidationError(f"job '{name}' 包含不支持的{type_name}类型: {invalid}")
+
+
+@dataclass
+class MetricsJobConfig:
+    """单个导出任务配置"""
+    name: str
+    enabled: bool = True
+    targets: Optional[TargetsConfig] = None
+    metrics: List[str] = field(default_factory=list)  # 指标类型列表
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    time_range_hours: int = 24
+    max_docs: int = 100000
+    source_fields: Optional[List[str]] = None
+    include_alerts: bool = True
+    alert_types: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'MetricsJobConfig':
+        name = data.get('name')
+        if not name:
+            raise ConfigValidationError("job 必须有 name 字段")
+
+        # 解析指标类型
+        metrics = data.get('metrics', [])
+        if not metrics:
+            raise ConfigValidationError(f"job '{name}' 必须指定至少一个 metric 类型")
+        _validate_types(name, metrics, "metrics")
+
+        # 解析告警类型
+        alert_types = data.get('alertTypes', [])
+        _validate_types(name, alert_types, "alerts")
+
+        return cls(
+            name=name,
+            enabled=data.get('enabled', True),
+            targets=TargetsConfig.from_dict(data.get('targets', {})),
+            metrics=metrics,
+            sampling=SamplingConfig.from_dict(data.get('sampling')),
+            output=OutputConfig.from_dict(data.get('output', {})),
+            execution=ExecutionConfig.from_dict(data.get('execution', {})),
+            time_range_hours=data.get('timeRangeHours', 24),
+            max_docs=data.get('maxDocs', 100000),
+            source_fields=data.get('sourceFields'),
+            include_alerts=data.get('includeAlerts', True),
+            alert_types=alert_types
+        )
+
+
+@dataclass
+class MetricsExporterConfig:
+    """Metrics Exporter 完整配置"""
+    jobs: List[MetricsJobConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'MetricsExporterConfig':
+        jobs_data = data.get('jobs', [])
+        if not jobs_data:
+            raise ConfigValidationError("metricsExporter 需要至少一个 job")
+
+        jobs = [MetricsJobConfig.from_dict(job) for job in jobs_data]
+
+        # 检查 job 名称唯一性
+        names = [j.name for j in jobs]
+        duplicates = [n for n, count in Counter(names).items() if count > 1]
+        if duplicates:
+            raise ConfigValidationError(f"job 名称重复: {set(duplicates)}")
+
+        return cls(jobs=jobs)
+
+
+@dataclass
+class GlobalConfig:
+    """全局配置"""
+    console_url: str = "http://localhost:9000"
+    username: str = ""
+    password: str = ""
+    timeout: int = 60
+    insecure: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'GlobalConfig':
+        auth = data.get('auth', {}) if isinstance(data.get('auth'), dict) else {}
+
+        return cls(
+            console_url=data.get('consoleUrl', 'http://localhost:9000'),
+            username=auth.get('username', ''),
+            password=auth.get('password', ''),
+            timeout=data.get('timeout', 60),
+            insecure=data.get('insecure', False)
+        )
+
+
+@dataclass
+class AppConfig:
+    """应用完整配置"""
+    global_config: GlobalConfig = field(default_factory=GlobalConfig)
+    metrics_exporter: Optional[MetricsExporterConfig] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'AppConfig':
+        global_config = GlobalConfig.from_dict(data)
+
+        metrics_exporter = None
+        if 'metricsExporter' in data:
+            metrics_exporter = MetricsExporterConfig.from_dict(data['metricsExporter'])
+
+        return cls(global_config=global_config, metrics_exporter=metrics_exporter)
+
+    @classmethod
+    def load(cls, config_path: str) -> 'AppConfig':
+        """从文件加载配置"""
+        data = load_config_file(config_path)
+        return cls.from_dict(data)
+
+
 class BaseConfig:
-    """基础配置类"""
-    
+    """基础配置类（向后兼容）"""
+
     def __init__(
         self,
         console_url: str = "http://localhost:9000",
@@ -54,12 +327,12 @@ class BaseConfig:
         self.password = password
         self.timeout = timeout
         self.insecure = insecure
-    
+
     @classmethod
     def from_args_and_config(cls, args: argparse.Namespace, config: Dict[str, Any]):
         """从命令行参数和配置文件创建配置"""
         auth_config = config.get('auth', {}) if isinstance(config.get('auth'), dict) else {}
-        
+
         return cls(
             console_url=get_config_value(
                 getattr(args, 'console', None) or getattr(args, 'host', None),
@@ -91,7 +364,7 @@ class BaseConfig:
 
 def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """添加通用参数到 ArgumentParser"""
-    
+
     # Console 连接参数
     conn_group = parser.add_argument_group('Console 连接参数')
     conn_group.add_argument(
@@ -120,7 +393,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action='store_true',
         help='忽略 SSL 证书验证'
     )
-    
+
     # 配置文件参数
     config_group = parser.add_argument_group('配置参数')
     config_group.add_argument(
@@ -128,7 +401,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default='',
         help='配置文件路径 (JSON 格式)'
     )
-    
+
     # 输出参数
     output_group = parser.add_argument_group('输出参数')
     output_group.add_argument(
@@ -136,18 +409,32 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default='',
         help='输出文件或目录路径'
     )
-    
+
     return parser
 
 
 def load_and_merge_config(args: argparse.Namespace) -> tuple:
     """加载配置文件并合并参数
-    
+
     Returns:
         (merged_config_dict, effective_args)
     """
     config = {}
     if getattr(args, 'config', None) and Path(args.config).exists():
         config = load_config_file(args.config)
-    
+
     return config, args
+
+
+def validate_config(config_path: str) -> List[str]:
+    """验证配置文件，返回错误列表"""
+    errors = []
+    try:
+        AppConfig.load(config_path)
+    except ConfigValidationError as e:
+        errors.append(str(e))
+    except json.JSONDecodeError as e:
+        errors.append(f"JSON 解析错误: {e}")
+    except Exception as e:
+        errors.append(f"配置加载错误: {e}")
+    return errors

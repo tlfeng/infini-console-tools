@@ -177,17 +177,28 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 - 导出告警规则、告警消息、告警历史
 - 支持指定时间范围和集群过滤
 - **流式处理**：使用 Scroll API 分批读取，每批直接写入文件，避免内存溢出
+- **并行导出**：支持多指标类型并行导出，显著提升效率
+- **紧凑输出**：紧凑 JSON 格式，减少 IO 开销
+- **字段筛选**：支持只导出指定字段
+- **抽样模式**：支持时间间隔抽样和比例抽样
+- **Job 配置**：支持配置文件定义多个导出任务
 - 实时进度显示
 
 **参数：**
 ```bash
 --time-range HOURS       导出时间范围(小时)，默认24
 --max-docs N             每种类型最大文档数，默认100000（0=无限制）
---batch-size N           每批次读取的文档数，默认1000。减小此值可降低内存使用
+--batch-size N           每批次读取的文档数，默认自适应 (2000-5000)
+--scroll-keepalive TIME  Scroll 上下文保持时间，默认60s
+--parallel N             并行导出的指标类型数，默认2
 --cluster-id ID          只导出指定集群的数据
 --metric-types TYPES     指定导出的指标类型，逗号分隔
+--fields FIELDS          只导出指定字段，逗号分隔
 --no-alerts              不导出告警数据
 --list-clusters          只列出有监控数据的集群
+--config FILE            配置文件路径
+--job NAME               指定执行的 job 名称
+--list-jobs              列出配置文件中的所有 jobs
 ```
 
 **使用示例：**
@@ -195,13 +206,55 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 # 导出最近24小时数据
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password
 
-# 导出最近7天数据，限制内存使用
+# 导出最近7天数据，并行度4
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
-  --time-range 168 --batch-size 500
+  --time-range 168 --parallel 4
 
-# 导出所有数据（无限制）
+# 只导出关键字段
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
-  --max-docs 0
+  --fields timestamp,metadata.labels.cluster_id,payload.elasticsearch.node_stats.jvm
+
+# 使用配置文件执行 job
+python metrics-exporter/metrics_exporter.py --config config.json --job "全量导出-一周"
+
+# 列出可用的 jobs
+python metrics-exporter/metrics_exporter.py --config config.json --list-jobs
+```
+
+**性能优化建议：**
+- 使用 `--parallel 4` 并行导出，预期提升 2-3x
+- 使用 `--fields` 筛选关键字段，减少数据传输
+- 使用抽样模式减少长时间范围的数据量
+- 适当增大批次大小 (`--batch-size 5000`) 减少请求次数
+
+**配置文件示例 (config.json)：**
+```json
+{
+  "consoleUrl": "http://localhost:9000",
+  "auth": { "username": "admin", "password": "password" },
+  "metricsExporter": {
+    "jobs": [
+      {
+        "name": "全量导出-一周",
+        "enabled": true,
+        "metrics": ["node_stats", "index_stats"],
+        "sampling": { "mode": "full" },
+        "output": { "directory": "./metrics_export_full" },
+        "execution": { "parallelMetrics": 3, "scrollKeepalive": "60s" },
+        "timeRangeHours": 168,
+        "maxDocs": 1000000
+      },
+      {
+        "name": "抽样导出-一周",
+        "enabled": false,
+        "metrics": ["node_stats", "index_stats"],
+        "sampling": { "mode": "sampling", "interval": "1h" },
+        "output": { "directory": "./metrics_export_sampled" },
+        "timeRangeHours": 168
+      }
+    ]
+  }
+}
 ```
 
 **输出文件：**
@@ -213,7 +266,7 @@ python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p
 - `alert_rules.json` - 告警规则
 - `alert_messages.json` - 告警消息
 - `alert_history.json` - 告警历史
-- `export_summary.json` - 导出摘要
+- `export_summary.json` - 导出摘要（包含耗时统计）
 
 **详细文档：** 参见 [metrics-exporter/DATA_GUIDE.md](metrics-exporter/DATA_GUIDE.md)
 

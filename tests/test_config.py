@@ -20,6 +20,18 @@ from common.config import (
     BaseConfig,
     add_common_args,
     load_and_merge_config,
+    # 新增
+    TargetFilter,
+    TargetsConfig,
+    SamplingConfig,
+    OutputConfig,
+    ExecutionConfig,
+    MetricsJobConfig,
+    MetricsExporterConfig,
+    GlobalConfig,
+    AppConfig,
+    ConfigValidationError,
+    validate_config,
 )
 
 
@@ -31,7 +43,7 @@ class TestLoadConfigFile(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump({"consoleUrl": "http://test:9000", "timeout": 30}, f)
             temp_path = f.name
-        
+
         try:
             config = load_config_file(temp_path)
             self.assertEqual(config["consoleUrl"], "http://test:9000")
@@ -49,7 +61,7 @@ class TestLoadConfigFile(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             f.write("invalid json")
             temp_path = f.name
-        
+
         try:
             with self.assertRaises(json.JSONDecodeError):
                 load_config_file(temp_path)
@@ -128,7 +140,7 @@ class TestAddCommonArgs(unittest.TestCase):
         import argparse
         parser = argparse.ArgumentParser()
         parser = add_common_args(parser)
-        
+
         # 测试解析默认参数
         args = parser.parse_args([])
         self.assertEqual(args.console, "http://localhost:9000")
@@ -140,7 +152,7 @@ class TestAddCommonArgs(unittest.TestCase):
         import argparse
         parser = argparse.ArgumentParser()
         parser = add_common_args(parser)
-        
+
         args = parser.parse_args([
             "-c", "http://custom:9000",
             "-u", "testuser",
@@ -163,24 +175,239 @@ class TestLoadAndMergeConfig(unittest.TestCase):
         import argparse
         args = argparse.Namespace()
         args.config = ""
-        
+
         config, merged_args = load_and_merge_config(args)
         self.assertEqual(config, {})
 
     def test_with_config_file(self):
         """测试有配置文件的情况"""
         import argparse
-        
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump({"consoleUrl": "http://test:9000"}, f)
             temp_path = f.name
-        
+
         try:
             args = argparse.Namespace()
             args.config = temp_path
-            
+
             config, merged_args = load_and_merge_config(args)
             self.assertEqual(config["consoleUrl"], "http://test:9000")
+        finally:
+            os.unlink(temp_path)
+
+
+class TestTargetFilter(unittest.TestCase):
+    """测试目标筛选"""
+
+    def test_empty_filter_matches_all(self):
+        """空筛选器匹配所有"""
+        f = TargetFilter()
+        self.assertTrue(f.matches("anything"))
+        self.assertTrue(f.matches("cluster-1"))
+
+    def test_include_only(self):
+        """仅 include 筛选"""
+        f = TargetFilter(include=["cluster-1", "cluster-2"])
+        self.assertTrue(f.matches("cluster-1"))
+        self.assertTrue(f.matches("cluster-2"))
+        self.assertFalse(f.matches("cluster-3"))
+
+    def test_exclude_only(self):
+        """仅 exclude 筛选"""
+        f = TargetFilter(exclude=["test-*"])
+        self.assertFalse(f.matches("test-1"))
+        self.assertFalse(f.matches("test-abc"))
+        self.assertTrue(f.matches("prod-1"))
+
+    def test_include_and_exclude(self):
+        """include 和 exclude 组合"""
+        f = TargetFilter(include=["*-prod-*"], exclude=["*-prod-test"])
+        self.assertTrue(f.matches("us-prod-1"))
+        self.assertFalse(f.matches("us-prod-test"))
+        self.assertFalse(f.matches("us-dev-1"))
+
+    def test_wildcard_match(self):
+        """通配符匹配"""
+        f = TargetFilter(include=["*-cluster"])
+        self.assertTrue(f.matches("test-cluster"))
+        self.assertTrue(f.matches("prod-cluster"))
+        self.assertFalse(f.matches("cluster-test"))
+
+
+class TestSamplingConfig(unittest.TestCase):
+    """测试抽样配置"""
+
+    def test_full_mode(self):
+        """全量模式"""
+        s = SamplingConfig(mode="full")
+        self.assertFalse(s.is_sampling())
+
+    def test_sampling_with_interval(self):
+        """时间间隔抽样"""
+        s = SamplingConfig(mode="sampling", interval="1h")
+        self.assertTrue(s.is_sampling())
+        self.assertEqual(s.interval, "1h")
+
+    def test_sampling_with_ratio(self):
+        """比例抽样"""
+        s = SamplingConfig(mode="sampling", ratio=0.1)
+        self.assertTrue(s.is_sampling())
+        self.assertEqual(s.ratio, 0.1)
+
+    def test_invalid_mode(self):
+        """无效模式"""
+        with self.assertRaises(ConfigValidationError):
+            SamplingConfig.from_dict({"mode": "invalid"})
+
+    def test_sampling_without_interval_or_ratio(self):
+        """抽样模式缺少参数"""
+        with self.assertRaises(ConfigValidationError):
+            SamplingConfig.from_dict({"mode": "sampling"})
+
+    def test_invalid_ratio(self):
+        """无效比例"""
+        with self.assertRaises(ConfigValidationError):
+            SamplingConfig.from_dict({"mode": "sampling", "ratio": 1.5})
+        with self.assertRaises(ConfigValidationError):
+            SamplingConfig.from_dict({"mode": "sampling", "ratio": 0})
+
+
+class TestExecutionConfig(unittest.TestCase):
+    """测试执行配置"""
+
+    def test_default_values(self):
+        """默认值"""
+        e = ExecutionConfig()
+        self.assertEqual(e.parallel_metrics, 2)
+        self.assertEqual(e.scroll_keepalive, "60s")
+        self.assertEqual(e.max_retries, 3)
+
+    def test_from_dict(self):
+        """从字典解析"""
+        e = ExecutionConfig.from_dict({
+            "parallelMetrics": 4,
+            "batchSize": 5000,
+            "scrollKeepalive": "30s"
+        })
+        self.assertEqual(e.parallel_metrics, 4)
+        self.assertEqual(e.batch_size, 5000)
+        self.assertEqual(e.scroll_keepalive, "30s")
+
+
+class TestMetricsJobConfig(unittest.TestCase):
+    """测试 Job 配置"""
+
+    def test_valid_job(self):
+        """有效的 Job 配置"""
+        job = MetricsJobConfig.from_dict({
+            "name": "test-job",
+            "metrics": ["node_stats", "index_stats"],
+            "timeRangeHours": 24
+        })
+        self.assertEqual(job.name, "test-job")
+        self.assertEqual(job.metrics, ["node_stats", "index_stats"])
+        self.assertEqual(job.time_range_hours, 24)
+
+    def test_job_without_name(self):
+        """缺少名称"""
+        with self.assertRaises(ConfigValidationError):
+            MetricsJobConfig.from_dict({"metrics": ["node_stats"]})
+
+    def test_job_without_metrics(self):
+        """缺少指标类型"""
+        with self.assertRaises(ConfigValidationError):
+            MetricsJobConfig.from_dict({"name": "test"})
+
+    def test_job_with_invalid_metric_type(self):
+        """无效的指标类型"""
+        with self.assertRaises(ConfigValidationError):
+            MetricsJobConfig.from_dict({
+                "name": "test",
+                "metrics": ["invalid_type"]
+            })
+
+    def test_job_with_sampling(self):
+        """带抽样配置的 Job"""
+        job = MetricsJobConfig.from_dict({
+            "name": "sampled-job",
+            "metrics": ["node_stats"],
+            "sampling": {"mode": "sampling", "interval": "1h"}
+        })
+        self.assertTrue(job.sampling.is_sampling())
+        self.assertEqual(job.sampling.interval, "1h")
+
+
+class TestAppConfig(unittest.TestCase):
+    """测试完整应用配置"""
+
+    def test_load_valid_config(self):
+        """加载有效配置"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump({
+                "consoleUrl": "http://test:9000",
+                "auth": {"username": "admin", "password": "test"},
+                "metricsExporter": {
+                    "jobs": [
+                        {
+                            "name": "test-job",
+                            "metrics": ["node_stats"],
+                            "timeRangeHours": 24
+                        }
+                    ]
+                }
+            }, f)
+            temp_path = f.name
+
+        try:
+            config = AppConfig.load(temp_path)
+            self.assertEqual(config.global_config.console_url, "http://test:9000")
+            self.assertEqual(config.global_config.username, "admin")
+            self.assertIsNotNone(config.metrics_exporter)
+            self.assertEqual(len(config.metrics_exporter.jobs), 1)
+        finally:
+            os.unlink(temp_path)
+
+    def test_validate_config(self):
+        """验证配置文件"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump({
+                "consoleUrl": "http://test:9000",
+                "metricsExporter": {
+                    "jobs": [
+                        {
+                            "name": "valid-job",
+                            "metrics": ["cluster_health", "node_stats"]
+                        }
+                    ]
+                }
+            }, f)
+            temp_path = f.name
+
+        try:
+            errors = validate_config(temp_path)
+            self.assertEqual(len(errors), 0)
+        finally:
+            os.unlink(temp_path)
+
+    def test_validate_invalid_config(self):
+        """验证无效配置"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump({
+                "metricsExporter": {
+                    "jobs": [
+                        {
+                            "name": "invalid-job",
+                            "metrics": ["invalid_metric"]
+                        }
+                    ]
+                }
+            }, f)
+            temp_path = f.name
+
+        try:
+            errors = validate_config(temp_path)
+            self.assertGreater(len(errors), 0)
         finally:
             os.unlink(temp_path)
 
