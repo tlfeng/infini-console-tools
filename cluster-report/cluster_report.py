@@ -88,8 +88,8 @@ class ClusterReporter:
         results = []
         for cluster in clusters:
             cid = cluster["id"]
-            status_info = all_status.get(cid, {})
-            health = status_info.get("health", {})
+            status_info = all_status.get(cid, {}) or {}
+            health = status_info.get("health") or {}
 
             # 获取 metrics
             try:
