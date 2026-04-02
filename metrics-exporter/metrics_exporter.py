@@ -1498,13 +1498,13 @@ def main():
             print(f"      时间范围: {job.time_range_hours}h")
         return
 
-    # 从配置或命令行获取连接参数
+    # 从配置或命令行获取连接参数（命令行参数优先）
     if app_config:
-        console_url = app_config.global_config.console_url
-        username = app_config.global_config.username
-        password = app_config.global_config.password
-        timeout = app_config.global_config.timeout
-        insecure = app_config.global_config.insecure
+        console_url = args.console if args.console else app_config.global_config.console_url
+        username = args.username if args.username else app_config.global_config.username
+        password = args.password if args.password else app_config.global_config.password
+        timeout = args.timeout if args.timeout else app_config.global_config.timeout
+        insecure = args.insecure or app_config.global_config.insecure
     else:
         config, _ = load_and_merge_config(args)
         console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', 'http://localhost:9000')
