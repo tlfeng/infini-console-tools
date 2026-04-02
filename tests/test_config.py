@@ -302,9 +302,10 @@ class TestMetricsJobConfig(unittest.TestCase):
             MetricsJobConfig.from_dict({"metrics": ["node_stats"]})
 
     def test_job_without_metrics(self):
-        """缺少指标类型"""
-        with self.assertRaises(ConfigValidationError):
-            MetricsJobConfig.from_dict({"name": "test"})
+        """允许缺少指标类型（用于只导出告警数据的场景）"""
+        job = MetricsJobConfig.from_dict({"name": "test"})
+        self.assertEqual(job.metrics, [])
+        self.assertEqual(job.name, "test")
 
     def test_job_with_invalid_metric_type(self):
         """无效的指标类型"""
