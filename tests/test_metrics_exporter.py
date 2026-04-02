@@ -24,64 +24,66 @@ metrics_exporter = importlib.util.module_from_spec(spec)
 sys.modules["metrics_exporter"] = metrics_exporter
 spec.loader.exec_module(metrics_exporter)
 
-CompactJSONWriter = metrics_exporter.CompactJSONWriter
+JSONLinesWriter = metrics_exporter.JSONLinesWriter
+ShardedJSONLinesWriter = metrics_exporter.ShardedJSONLinesWriter
 ExportResult = metrics_exporter.ExportResult
 MetricsExporter = metrics_exporter.MetricsExporter
 METRIC_TYPES = metrics_exporter.METRIC_TYPES
 ALERT_TYPES = metrics_exporter.ALERT_TYPES
 
 
-class TestCompactJSONWriter(unittest.TestCase):
-    """测试紧凑 JSON 写入器"""
+class TestJSONLinesWriter(unittest.TestCase):
+    """测试 JSON Lines 写入器"""
 
     def test_write_empty(self):
         """写入空数据"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             temp_path = f.name
 
         try:
-            with CompactJSONWriter(temp_path):
+            with JSONLinesWriter(temp_path):
                 pass
 
             with open(temp_path, 'r') as f:
                 content = f.read()
-            self.assertEqual(content, "[\n]")
+            self.assertEqual(content, "")
         finally:
             os.unlink(temp_path)
 
     def test_write_single_doc(self):
         """写入单个文档"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             temp_path = f.name
 
         try:
-            with CompactJSONWriter(temp_path) as writer:
+            with JSONLinesWriter(temp_path) as writer:
                 writer.write_doc({"key": "value"})
 
             with open(temp_path, 'r') as f:
                 content = f.read()
             self.assertIn('"key":"value"', content)
             self.assertNotIn('indent', content)  # 紧凑格式，无 indent
+            self.assertFalse(content.startswith("["))  # 不是 JSON 数组
         finally:
             os.unlink(temp_path)
 
     def test_write_multiple_docs(self):
         """写入多个文档"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             temp_path = f.name
 
         try:
-            with CompactJSONWriter(temp_path, buffer_size=2) as writer:
+            with JSONLinesWriter(temp_path, buffer_size=2) as writer:
                 writer.write_doc({"id": 1})
                 writer.write_doc({"id": 2})
                 writer.write_doc({"id": 3})
 
             with open(temp_path, 'r') as f:
-                content = f.read()
+                lines = f.readlines()
 
-            # 验证 JSON 有效
-            data = json.loads(content)
-            self.assertEqual(len(data), 3)
+            # 验证每行是一个独立的 JSON
+            self.assertEqual(len(lines), 3)
+            data = [json.loads(line) for line in lines]
             self.assertEqual(data[0]["id"], 1)
             self.assertEqual(data[2]["id"], 3)
         finally:
@@ -89,11 +91,11 @@ class TestCompactJSONWriter(unittest.TestCase):
 
     def test_compact_format(self):
         """验证紧凑格式"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             temp_path = f.name
 
         try:
-            with CompactJSONWriter(temp_path) as writer:
+            with JSONLinesWriter(temp_path) as writer:
                 writer.write_doc({"nested": {"key": "value"}, "array": [1, 2, 3]})
 
             with open(temp_path, 'r') as f:
@@ -107,11 +109,11 @@ class TestCompactJSONWriter(unittest.TestCase):
 
     def test_flush_makes_buffer_visible(self):
         """flush 应让当前批次内容立即写入文件"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             temp_path = f.name
 
         try:
-            with CompactJSONWriter(temp_path, buffer_size=10) as writer:
+            with JSONLinesWriter(temp_path, buffer_size=10) as writer:
                 writer.write_doc({"id": 1})
                 writer.flush()
 
@@ -119,9 +121,54 @@ class TestCompactJSONWriter(unittest.TestCase):
                     content = f.read()
 
                 self.assertIn('"id":1', content)
-                self.assertTrue(content.startswith("["))
+                self.assertFalse(content.startswith("["))  # JSON Lines 不是数组
         finally:
             os.unlink(temp_path)
+
+
+class TestShardedJSONLinesWriter(unittest.TestCase):
+    """测试分片 JSON Lines 写入器"""
+
+    def test_single_shard(self):
+        """单个分片"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            with ShardedJSONLinesWriter(base_path, shard_size=3) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+
+            # 只有一个文件
+            self.assertEqual(len(writer.get_file_paths()), 1)
+            self.assertEqual(writer.get_file_paths()[0], "test.jsonl")
+
+            with open(f"{base_path}.jsonl", 'r') as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+
+    def test_multiple_shards(self):
+        """多个分片"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            with ShardedJSONLinesWriter(base_path, shard_size=2) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+                writer.write_doc({"id": 3})
+                writer.write_doc({"id": 4})
+                writer.write_doc({"id": 5})
+
+            # 应该有 3 个文件
+            self.assertEqual(len(writer.get_file_paths()), 3)
+            self.assertEqual(writer.total_count, 5)
+
+            # 验证文件内容
+            with open(f"{base_path}.jsonl", 'r') as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_1.jsonl", 'r') as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_2.jsonl", 'r') as f:
+                self.assertEqual(len(f.readlines()), 1)
 
 
 class TestExportResult(unittest.TestCase):
@@ -131,13 +178,13 @@ class TestExportResult(unittest.TestCase):
         """成功的导出结果"""
         result = ExportResult("node_stats", "节点统计指标")
         result.count = 1000
-        result.file_path = "node_stats.json"
+        result.file_paths = ["node_stats.jsonl"]
         result.duration_ms = 5000
 
         d = result.to_dict()
         self.assertEqual(d["name"], "节点统计指标")
         self.assertEqual(d["count"], 1000)
-        self.assertEqual(d["file"], "node_stats.json")
+        self.assertEqual(d["file"], "node_stats.jsonl")
         self.assertIsNone(d["error"])
         self.assertEqual(d["duration_ms"], 5000)
 
@@ -355,16 +402,14 @@ class TestScrollPagination(unittest.TestCase):
 
         mock_client.proxy_request.side_effect = proxy_request
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_path = f.name
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
 
-        try:
-            count = exporter.export_with_scroll(
+            count, file_paths = exporter.export_with_scroll(
                 index_pattern="metrics",
                 query={"query": {"match_all": {}}},
-                output_file=temp_path,
+                output_file=temp_base,
                 batch_size=1,
-                max_docs=0,
             )
 
             self.assertEqual(count, 3)
@@ -372,12 +417,12 @@ class TestScrollPagination(unittest.TestCase):
             scroll_calls = [call for call in calls if call[0] == "POST" and call[1] == "/_search/scroll"]
             self.assertEqual([call[2]["scroll_id"] for call in scroll_calls], ["scroll-1", "scroll-2", "scroll-3"])
 
-            with open(temp_path, 'r') as f:
-                data = json.load(f)
-
+            # 读取生成的 jsonl 文件
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                lines = f.readlines()
+            data = [json.loads(line) for line in lines]
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2", "doc-3"])
-        finally:
-            os.unlink(temp_path)
 
 
 class TestStratifiedSampling(unittest.TestCase):
@@ -394,7 +439,24 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(cluster_id, "system-id")
             calls.append((method, path, body))
 
+            # estimate_export_count 先调用 _count
+            if method == "POST" and path == "/.infini_metrics/_count":
+                return {"count": 100}
+
             if method == "POST" and path == "/.infini_metrics/_search":
+                # 检查是否是 estimate_export_count 的聚合查询（没有 latest 子聚合）
+                sampled_agg = body.get("aggs", {}).get("sampled", {})
+                if "aggs" not in sampled_agg:
+                    # 预估阶段，返回一个 bucket 表示有一条数据
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [{"key": "bucket-1"}]
+                            }
+                        }
+                    }
+
+                # 实际导出的聚合查询（有 latest 子聚合）
                 return {
                     "aggregations": {
                         "sampled": {
@@ -420,24 +482,22 @@ class TestStratifiedSampling(unittest.TestCase):
 
         mock_client.proxy_request.side_effect = proxy_request
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_path = f.name
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
 
-        try:
             result = exporter.export_metric_type(
                 metric_type="cluster_stats",
                 config=METRIC_TYPES["cluster_stats"],
-                output_file=temp_path,
+                output_file=temp_base,
                 time_range_hours=24,
-                max_docs=0,
                 cluster_ids=["cluster-1"],
                 sampling=SamplingConfig(mode="sampling", interval="15m"),
             )
 
             self.assertEqual(result.count, 1)
-            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 1)
-        finally:
-            os.unlink(temp_path)
+            # 1次 _count + 1次 estimate 聚合 + 1次实际导出聚合
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 2)
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
     def test_node_stats_interval_sampling_uses_es_aggregations(self):
         """node_stats interval 抽样应走 ES 聚合而非 scroll 全量拉取"""
@@ -450,8 +510,25 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(cluster_id, "system-id")
             calls.append((method, path, body))
 
+            # estimate_export_count 先调用 _count
+            if method == "POST" and path == "/.infini_metrics/_count":
+                return {"count": 100}
+
             if method == "POST" and path == "/.infini_metrics/_search":
-                after = body.get("aggs", {}).get("sampled", {}).get("composite", {}).get("after")
+                sampled_agg = body.get("aggs", {}).get("sampled", {})
+
+                # 预估阶段只有 composite，没有 aggs 子聚合
+                if "aggs" not in sampled_agg:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": []
+                            }
+                        }
+                    }
+
+                # 实际导出的聚合查询
+                after = sampled_agg.get("composite", {}).get("after")
                 if not after:
                     return {
                         "aggregations": {
@@ -512,31 +589,31 @@ class TestStratifiedSampling(unittest.TestCase):
 
         mock_client.proxy_request.side_effect = proxy_request
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_path = f.name
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
 
-        try:
             result = exporter.export_metric_type(
                 metric_type="node_stats",
                 config=METRIC_TYPES["node_stats"],
-                output_file=temp_path,
+                output_file=temp_base,
                 time_range_hours=24,
-                max_docs=0,
                 cluster_ids=["cluster-1"],
                 sampling=SamplingConfig(mode="sampling", interval="15m"),
             )
 
             self.assertEqual(result.count, 3)
 
+            # 1次 _count + 1次 estimate 聚合 + 2次实际导出聚合（有 after_key）
             search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
-            self.assertEqual(len(search_calls), 2)
+            self.assertEqual(len(search_calls), 3)
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
-            with open(temp_path, 'r') as f:
-                data = json.load(f)
-
+            # 读取生成的 jsonl 文件
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                lines = f.readlines()
+            data = [json.loads(line) for line in lines]
             self.assertEqual([d["_id"] for d in data], ["doc-1", "doc-2", "doc-3"])
-        finally:
-            os.unlink(temp_path)
 
     def test_export_with_scroll_recovers_with_search_after(self):
         """scroll context 过期后应使用 search_after 恢复导出"""
@@ -598,16 +675,14 @@ class TestStratifiedSampling(unittest.TestCase):
 
         mock_client.proxy_request.side_effect = proxy_request
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_path = f.name
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
 
-        try:
-            count = exporter.export_with_scroll(
+            count, file_paths = exporter.export_with_scroll(
                 index_pattern="metrics",
                 query={"query": {"match_all": {}}},
-                output_file=temp_path,
+                output_file=temp_base,
                 batch_size=1,
-                max_docs=0,
             )
 
             self.assertEqual(count, 2)
@@ -626,12 +701,12 @@ class TestStratifiedSampling(unittest.TestCase):
             clear_calls = [call for call in calls if call[0] == "DELETE" and call[1] == "/_search/scroll"]
             self.assertEqual([call[2]["scroll_id"] for call in clear_calls], ["scroll-1", "scroll-3"])
 
-            with open(temp_path, 'r') as f:
-                data = json.load(f)
-
+            # 读取生成的 jsonl 文件
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                lines = f.readlines()
+            data = [json.loads(line) for line in lines]
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2"])
-        finally:
-            os.unlink(temp_path)
 
 
 if __name__ == "__main__":

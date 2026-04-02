@@ -7,7 +7,7 @@ Metrics Exporter - Console 监控数据导出工具 (优化版)
 
 优化特性：
 - 可配置的批次大小和 scroll keepalive
-- 紧凑 JSON 输出，减少 IO 开销
+- JSON Lines 输出格式，支持流式读取
 - 并行导出多种指标类型
 - 支持字段筛选，减少传输量
 - 流式写入，内存占用低
@@ -111,20 +111,18 @@ DEFAULT_SCROLL_KEEPALIVE = "5m"  # 增加到 5 分钟，避免大数据量时 sc
 DEFAULT_PARALLEL_JOBS = 2  # 默认并行导出的指标类型数
 
 
-class CompactJSONWriter:
-    """紧凑 JSON 数组写入器 - 优化版，减少 CPU 和 IO 开销"""
+class JSONLinesWriter:
+    """JSON Lines 写入器 - 每行一个 JSON 对象，支持流式读取"""
 
     def __init__(self, file_path: str, buffer_size: int = 100):
         self.file_path = file_path
         self.file = None
         self.count = 0
-        self.first = True
         self.buffer: List[str] = []
         self.buffer_size = buffer_size
 
     def __enter__(self):
         self.file = open(self.file_path, "w", encoding="utf-8")
-        self.file.write("[")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -132,7 +130,6 @@ class CompactJSONWriter:
         if self.buffer:
             self._flush_buffer()
         if self.file:
-            self.file.write("\n]")
             self.file.close()
         return False
 
@@ -140,11 +137,8 @@ class CompactJSONWriter:
         """刷新缓冲区到文件"""
         if not self.buffer:
             return
-        content = ",\n".join(self.buffer)
-        if not self.first:
-            self.file.write(",\n")
-        else:
-            self.first = False
+        # 每行一个 JSON 对象
+        content = "\n".join(self.buffer) + "\n"
         self.file.write(content)
         self.buffer.clear()
 
@@ -157,11 +151,86 @@ class CompactJSONWriter:
         self.file.flush()
 
     def write_doc(self, doc: Dict):
-        """写入单个文档（紧凑格式，无 indent）"""
+        """写入单个文档（JSON Lines 格式，每行一个紧凑 JSON）"""
         self.buffer.append(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
         self.count += 1
         if len(self.buffer) >= self.buffer_size:
             self._flush_buffer()
+
+
+class ShardedJSONLinesWriter:
+    """分片 JSON Lines 写入器 - 当文档数超过阈值时自动创建新文件"""
+
+    def __init__(
+        self,
+        base_path: str,  # 基础路径，如 "output/node_stats_20260402_143052"（不含 .jsonl）
+        shard_size: int = 100000,  # 每个分片的最大文档数
+        buffer_size: int = 100,
+    ):
+        self.base_path = base_path
+        self.shard_size = shard_size
+        self.buffer_size = buffer_size
+        self.current_writer: Optional[JSONLinesWriter] = None
+        self.current_shard = 0
+        self.total_count = 0
+        self.shard_counts: List[int] = []  # 每个分片的文档数
+        self.file_paths: List[str] = []  # 所有生成的文件路径（完整路径）
+
+    def __enter__(self):
+        self._start_new_shard()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._close_current_shard()
+        return False
+
+    def _start_new_shard(self):
+        """开始新的分片文件"""
+        self._close_current_shard()
+
+        # 文件命名：第一个文件无后缀，后续文件带序号
+        if self.current_shard == 0:
+            file_path = f"{self.base_path}.jsonl"
+        else:
+            file_path = f"{self.base_path}_{self.current_shard}.jsonl"
+
+        self.file_paths.append(file_path)
+        self.current_writer = JSONLinesWriter(file_path, self.buffer_size)
+        self.current_writer.__enter__()
+        self.shard_counts.append(0)
+
+    def _close_current_shard(self):
+        """关闭当前分片"""
+        if self.current_writer:
+            self.current_writer.__exit__(None, None, None)
+            self.current_writer = None
+
+    def write_doc(self, doc: Dict):
+        """写入文档，自动处理分片"""
+        # 检查是否需要切换到新分片
+        if self.shard_counts[self.current_shard] >= self.shard_size:
+            self.current_shard += 1
+            self._start_new_shard()
+
+        self.current_writer.write_doc(doc)
+        self.shard_counts[self.current_shard] += 1
+        self.total_count += 1
+
+    def flush(self):
+        """刷新当前分片的缓冲区"""
+        if self.current_writer:
+            self.current_writer.flush()
+
+    def get_file_paths(self) -> List[str]:
+        """获取所有生成的文件路径（仅文件名）"""
+        return [os.path.basename(p) for p in self.file_paths]
+
+    def get_shard_info(self) -> List[Dict]:
+        """获取分片详细信息"""
+        return [
+            {"file": os.path.basename(self.file_paths[i]), "count": self.shard_counts[i]}
+            for i in range(len(self.file_paths))
+        ]
 
 
 class ExportResult:
@@ -171,18 +240,32 @@ class ExportResult:
         self.metric_type = metric_type
         self.name = name
         self.count = 0
-        self.file_path = ""
+        self.file_path = ""  # 向后兼容：单个文件时的路径
+        self.file_paths: List[str] = []  # 所有文件路径列表
+        self.shard_info: List[Dict] = []  # 分片详情
         self.error: Optional[str] = None
         self.duration_ms = 0
 
     def to_dict(self) -> Dict:
-        return {
+        result = {
             "name": self.name,
             "count": self.count,
-            "file": self.file_path if self.count > 0 else None,
             "error": self.error,
             "duration_ms": self.duration_ms,
         }
+
+        # 多文件情况
+        if len(self.file_paths) > 1:
+            result["files"] = self.shard_info
+            result["sharded"] = True
+        # 单文件情况（向后兼容）
+        elif self.file_paths:
+            result["file"] = self.file_paths[0]
+            result["sharded"] = False
+        elif self.count == 0:
+            result["file"] = None
+
+        return result
 
 
 class MetricsExporter:
@@ -346,7 +429,7 @@ class MetricsExporter:
         except Exception:
             pass
 
-    def _write_docs(self, writer: CompactJSONWriter, docs: List[Dict]) -> None:
+    def _write_docs(self, writer, docs: List[Dict]) -> None:
         """写入文档列表，移除 sort 字段"""
         for doc in docs:
             doc_copy = {k: v for k, v in doc.items() if k != "sort"}
@@ -358,49 +441,52 @@ class MetricsExporter:
         query: Dict,
         output_file: str,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        max_docs: int = 100000,
+        shard_size: int = 100000,
         progress_callback=None,
-    ) -> int:
+    ) -> Tuple[int, List[str]]:
         """
-        使用 scroll API 流式导出数据
+        使用 scroll API 流式导出数据（支持自动分片）
 
         支持自动恢复：如果 scroll context 过期，会自动重新初始化查询继续导出。
 
+        Args:
+            output_file: 基础输出路径（不含 .json 后缀）
+            shard_size: 每个分片文件的最大文档数，默认 100000
+
         Returns:
-            导出的文档总数
+            (导出的文档总数, 文件路径列表)
         """
         total_exported = 0
         scroll_id = None
         last_sort_values = None  # 用于恢复时继续查询
 
-        # 初始化 scroll
+        # 初始化 scroll（不限制文档数）
         first_batch, scroll_id, total_count = self.search_with_scroll(
-            index_pattern, query, batch_size, max_docs
+            index_pattern, query, batch_size, 0
         )
 
         if not first_batch:
             # 创建空文件
-            with CompactJSONWriter(output_file):
+            with JSONLinesWriter(f"{output_file}.jsonl"):
                 pass
-            return 0
+            return 0, [f"{os.path.basename(output_file)}.jsonl"]
 
-        # 流式写入
-        with CompactJSONWriter(output_file) as writer:
+        # 使用分片写入器
+        with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             # 写入第一批
-            docs_to_write = first_batch[:max_docs - total_exported] if max_docs else first_batch
-            self._write_docs(writer, docs_to_write)
+            self._write_docs(writer, first_batch)
             writer.flush()
-            total_exported += len(docs_to_write)
+            total_exported += len(first_batch)
 
             # 记录最后一条记录的排序值（用于恢复）
-            if docs_to_write:
-                last_sort_values = docs_to_write[-1].get("sort")
+            if first_batch:
+                last_sort_values = first_batch[-1].get("sort")
 
             if progress_callback:
                 progress_callback(total_exported, total_count)
 
             # 继续获取后续批次
-            while scroll_id and (max_docs == 0 or total_exported < max_docs):
+            while scroll_id:
                 scroll_result = self.scroll_next(scroll_id)
 
                 # scroll context 过期，尝试恢复
@@ -427,13 +513,6 @@ class MetricsExporter:
                 if not batch:
                     break
 
-                # 限制最大文档数
-                if max_docs:
-                    remaining = max_docs - total_exported
-                    if remaining <= 0:
-                        break
-                    batch = batch[:remaining]
-
                 self._write_docs(writer, batch)
                 writer.flush()
                 total_exported += len(batch)
@@ -445,15 +524,11 @@ class MetricsExporter:
                 if progress_callback:
                     progress_callback(total_exported, total_count)
 
-                # 检查是否达到限制
-                if max_docs and total_exported >= max_docs:
-                    break
-
         # 清理 scroll
         if scroll_id:
             self.clear_scroll(scroll_id)
 
-        return total_exported
+        return total_exported, writer.get_file_paths()
 
     def _resume_with_search_after(
         self,
@@ -510,13 +585,20 @@ class MetricsExporter:
         sampling: SamplingConfig,
         batch_size: int,
         group_fields: List[str],
-        max_docs: int = 100000,
+        shard_size: int = 100000,
         progress_callback=None,
         source_fields: List[str] = None,
-    ) -> int:
+    ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits）
         每个 (维度组合, 时间桶) 只保留最新的一条记录
+
+        Args:
+            output_file: 基础输出路径（不含 .json 后缀）
+            shard_size: 每个分片文件的最大文档数，默认 100000
+
+        Returns:
+            (导出的文档总数, 文件路径列表)
         """
         sampling_interval = sampling.interval
         if not sampling_interval:
@@ -525,7 +607,7 @@ class MetricsExporter:
                 query,
                 output_file,
                 batch_size,
-                max_docs,
+                shard_size,
                 progress_callback,
             )
 
@@ -547,8 +629,8 @@ class MetricsExporter:
             }
         )
 
-        with CompactJSONWriter(output_file) as writer:
-            while max_docs == 0 or total_exported < max_docs:
+        with ShardedJSONLinesWriter(output_file, shard_size) as writer:
+            while True:
                 body = {
                     "size": 0,
                     "track_total_hits": False,
@@ -594,18 +676,15 @@ class MetricsExporter:
                     writer.write_doc({"_id": hit.get("_id"), **hit.get("_source", {})})
                     total_exported += 1
 
-                    if max_docs and total_exported >= max_docs:
-                        break
-
                 writer.flush()
                 if progress_callback:
                     progress_callback(total_exported, 0)
 
                 after_key = sampled.get("after_key")
-                if not after_key or (max_docs and total_exported >= max_docs):
+                if not after_key:
                     break
 
-        return total_exported
+        return total_exported, writer.get_file_paths()
 
     def estimate_export_count(
         self,
@@ -615,12 +694,14 @@ class MetricsExporter:
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         sampling: SamplingConfig = None,
-    ) -> int:
+    ) -> tuple:
         """
         估计要导出的数据条数
 
         Returns:
-            预估的文档数量
+            (原始文档数, 抽样后数据量) 元组
+            如果预估失败，返回 (-1, -1)
+            如果无抽样，两个值相同
         """
         query = self.build_metrics_query(
             config["filter_template"],
@@ -631,21 +712,76 @@ class MetricsExporter:
         )
 
         try:
-            # 使用 count API 获取总数
+            # 先获取原始文档数
             count_body = {"query": query.get("query", {"match_all": {}})}
-            result = self.client.proxy_request(
+            count_result = self.client.proxy_request(
                 self.system_cluster_id,
                 "POST",
                 f"/{config['index_pattern']}/_count",
                 count_body,
             )
-            total = result.get("count", 0)
+            total_docs = count_result.get("count", 0)
 
-            # interval 抽样时，实际数量取决于维度分布，这里返回原始总数作为参考
-            return total
+            # interval 抽样时，使用聚合预估实际写入的数据量
+            if sampling and sampling.interval:
+                group_fields = config.get("group_fields", [])
+                sources = []
+                for i, field in enumerate(group_fields):
+                    sources.append({f"group_{i}": {"terms": {"field": field}}})
+                sources.append(
+                    {
+                        "time_bucket": {
+                            "date_histogram": {
+                                "field": "timestamp",
+                                "fixed_interval": sampling.interval,
+                            }
+                        }
+                    }
+                )
+
+                # 使用 composite aggregation 遍历所有 bucket 来计算总数
+                total_buckets = 0
+                after_key = None
+                composite_page_size = 1000
+
+                while True:
+                    body = {
+                        "size": 0,
+                        "track_total_hits": False,
+                        "query": query.get("query", {"match_all": {}}),
+                        "aggs": {
+                            "sampled": {
+                                "composite": {
+                                    "size": composite_page_size,
+                                    "sources": sources,
+                                }
+                            }
+                        },
+                    }
+                    if after_key:
+                        body["aggs"]["sampled"]["composite"]["after"] = after_key
+
+                    result = self.client.proxy_request(
+                        self.system_cluster_id,
+                        "POST",
+                        f"/{config['index_pattern']}/_search",
+                        body,
+                    )
+
+                    buckets = result.get("aggregations", {}).get("sampled", {}).get("buckets", [])
+                    total_buckets += len(buckets)
+
+                    after_key = result.get("aggregations", {}).get("sampled", {}).get("after_key")
+                    if not after_key or not buckets:
+                        break
+
+                return (total_docs, total_buckets)
+            else:
+                # 无抽样时，两个值相同
+                return (total_docs, total_docs)
         except Exception as e:
             print(f"    预估数据量失败: {e}")
-            return -1
+            return (-1, -1)
 
     def _make_progress_callback(self, metric_type: str):
         """创建进度回调函数"""
@@ -663,14 +799,19 @@ class MetricsExporter:
         config: Dict,
         output_file: str,
         time_range_hours: int,
-        max_docs: int,
+        shard_size: int = 100000,
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         batch_size: int = None,
         source_fields: List[str] = None,
         sampling: SamplingConfig = None,
     ) -> ExportResult:
-        """导出指定类型的监控指标"""
+        """导出指定类型的监控指标（支持自动分片）
+
+        Args:
+            output_file: 基础输出路径（不含 .json 后缀）
+            shard_size: 每个分片文件的最大文档数，默认 100000
+        """
         result = ExportResult(metric_type, config["name"])
         start_time = time.time()
 
@@ -679,11 +820,17 @@ class MetricsExporter:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
 
             # 首先预估数据量
-            estimated_count = self.estimate_export_count(
+            total_docs, sampled_docs = self.estimate_export_count(
                 metric_type, config, time_range_hours, cluster_id_filter, cluster_ids, sampling
             )
-            if estimated_count >= 0:
-                print(f"    预估需要导出约 {estimated_count:,} 条记录")
+            if total_docs >= 0:
+                # 判断是否有抽样
+                if sampling and sampling.interval and total_docs != sampled_docs:
+                    print(f"    原始数据量: {total_docs:,} 条，抽样后: {sampled_docs:,} 条")
+                else:
+                    print(f"    预估需要导出约 {total_docs:,} 条记录")
+                if sampled_docs > shard_size:
+                    print(f"    将自动分文件存储 (每文件最多 {shard_size:,} 条)")
 
             query = self.build_metrics_query(
                 config["filter_template"],
@@ -696,29 +843,36 @@ class MetricsExporter:
             progress_callback = self._make_progress_callback(metric_type)
 
             if self._should_use_es_sampling(sampling):
-                count = self.export_with_es_sampling(
+                count, file_paths = self.export_with_es_sampling(
                     config["index_pattern"],
                     query,
                     output_file,
                     sampling,
                     effective_batch_size,
                     self._get_sampling_group_fields(metric_type, config),
-                    max_docs,
+                    shard_size,
                     progress_callback,
                     source_fields,
                 )
             else:
-                count = self.export_with_scroll(
+                count, file_paths = self.export_with_scroll(
                     config["index_pattern"],
                     query,
                     output_file,
                     effective_batch_size,
-                    max_docs,
+                    shard_size,
                     progress_callback,
                 )
 
             result.count = count
-            result.file_path = os.path.basename(output_file)
+            result.file_paths = file_paths
+            if file_paths:
+                result.file_path = file_paths[0]  # 向后兼容
+                if len(file_paths) > 1:
+                    result.shard_info = [
+                        {"file": f, "count": shard_size if i < len(file_paths) - 1 else count % shard_size or shard_size}
+                        for i, f in enumerate(file_paths)
+                    ]
 
         except Exception as e:
             result.error = str(e)
@@ -731,11 +885,16 @@ class MetricsExporter:
         alert_type: str,
         config: Dict,
         output_file: str,
-        max_docs: int,
+        shard_size: int = 100000,
         batch_size: int = None,
         source_fields: List[str] = None,
     ) -> ExportResult:
-        """导出告警相关数据"""
+        """导出告警相关数据（支持自动分片）
+
+        Args:
+            output_file: 基础输出路径（不含 .json 后缀）
+            shard_size: 每个分片文件的最大文档数，默认 100000
+        """
         result = ExportResult(alert_type, config["name"])
         start_time = time.time()
 
@@ -743,17 +902,24 @@ class MetricsExporter:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
             query = self.build_all_docs_query(source_fields)
 
-            count = self.export_with_scroll(
+            count, file_paths = self.export_with_scroll(
                 config["index_pattern"],
                 query,
                 output_file,
                 effective_batch_size,
-                max_docs,
+                shard_size,
                 self._make_progress_callback(alert_type),
             )
 
             result.count = count
-            result.file_path = os.path.basename(output_file)
+            result.file_paths = file_paths
+            if file_paths:
+                result.file_path = file_paths[0]  # 向后兼容
+                if len(file_paths) > 1:
+                    result.shard_info = [
+                        {"file": f, "count": shard_size if i < len(file_paths) - 1 else count % shard_size or shard_size}
+                        for i, f in enumerate(file_paths)
+                    ]
 
         except Exception as e:
             result.error = str(e)
@@ -821,7 +987,7 @@ class MetricsExporter:
         metric_types: List[str] = None,
         alert_types: List[str] = None,
         time_range_hours: int = 24,
-        max_docs: int = 100000,
+        shard_size: int = 100000,
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         include_alerts: bool = True,
@@ -830,8 +996,15 @@ class MetricsExporter:
         parallel_jobs: int = None,
         sampling: SamplingConfig = None,
     ) -> Dict[str, Any]:
-        """导出所有监控数据（支持并行）"""
+        """导出所有监控数据（支持并行和自动分片）
+
+        Args:
+            shard_size: 每个分片文件的最大文档数，默认 100000
+        """
         os.makedirs(output_dir, exist_ok=True)
+
+        # 生成时间后缀，用于所有输出文件
+        timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # 如果未指定，导出所有类型
         if metric_types is None:
@@ -844,7 +1017,7 @@ class MetricsExporter:
         export_summary = {
             "export_time": datetime.now().isoformat(),
             "time_range_hours": time_range_hours,
-            "max_docs_per_type": max_docs,
+            "shard_size": shard_size,
             "batch_size": batch_size,
             "scroll_keepalive": self.scroll_keepalive,
             "parallel_jobs": effective_parallel,
@@ -884,14 +1057,15 @@ class MetricsExporter:
             futures = {}
             for metric_type in valid_metric_types:
                 config = METRIC_TYPES[metric_type]
-                output_file = os.path.join(output_dir, f"{metric_type}.json")
+                # 基础路径，不含扩展名（由 ShardedJSONLinesWriter 添加）
+                output_file_base = os.path.join(output_dir, f"{metric_type}_{timestamp_suffix}")
                 future = executor.submit(
                     self.export_metric_type,
                     metric_type,
                     config,
-                    output_file,
+                    output_file_base,
                     time_range_hours,
-                    max_docs,
+                    shard_size,
                     cluster_id_filter,
                     cluster_ids,
                     batch_size,
@@ -931,13 +1105,14 @@ class MetricsExporter:
                 futures = {}
                 for alert_type in valid_alert_types:
                     config = ALERT_TYPES[alert_type]
-                    output_file = os.path.join(output_dir, f"{alert_type}.json")
+                    # 基础路径，不含扩展名
+                    output_file_base = os.path.join(output_dir, f"{alert_type}_{timestamp_suffix}")
                     future = executor.submit(
                         self.export_alert_type,
                         alert_type,
                         config,
-                        output_file,
-                        max_docs,
+                        output_file_base,
+                        shard_size,
                         batch_size,
                         source_fields,
                     )
@@ -960,7 +1135,7 @@ class MetricsExporter:
                 export_summary["alert_types"][result.metric_type] = result.to_dict()
 
         # 保存导出摘要
-        summary_file = os.path.join(output_dir, "export_summary.json")
+        summary_file = os.path.join(output_dir, f"export_summary_{timestamp_suffix}.json")
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(export_summary, f, ensure_ascii=False, indent=2)
         print(f"\n导出摘要已保存: {summary_file}")
@@ -993,7 +1168,7 @@ class MetricsExporter:
             metric_types=job.metrics,
             alert_types=job.alert_types if job.include_alerts else [],
             time_range_hours=job.time_range_hours,
-            max_docs=job.max_docs,
+            shard_size=job.shard_size,
             cluster_ids=cluster_ids,
             include_alerts=job.include_alerts,
             batch_size=job.execution.batch_size,
@@ -1009,8 +1184,19 @@ class MetricsExporter:
         for type_key, info in types_data.items():
             duration_s = info.get("duration_ms", 0) / 1000
             status = "✓" if not info.get("error") else "✗"
-            print(f"  - {status} {info['name']}: {info['count']:,} 条记录 ({duration_s:.1f}s)")
-            total_docs += info["count"]
+            count = info["count"]
+
+            # 处理分片显示
+            if info.get("sharded") and info.get("files"):
+                print(f"  - {status} {info['name']}: {count:,} 条记录 ({duration_s:.1f}s)")
+                files_info = ", ".join([f"{f['file']} ({f['count']:,})" for f in info["files"]])
+                print(f"      文件: {files_info}")
+            else:
+                print(f"  - {status} {info['name']}: {count:,} 条记录 ({duration_s:.1f}s)")
+                if info.get("file"):
+                    print(f"      文件: {info['file']}")
+
+            total_docs += count
             total_time += info.get("duration_ms", 0)
         totals[0] += total_docs
         totals[1] += total_time
@@ -1022,7 +1208,7 @@ class MetricsExporter:
         print("=" * 60)
         print(f"导出时间: {summary['export_time']}")
         print(f"时间范围: 最近 {summary['time_range_hours']} 小时")
-        print(f"每类型最大文档数: {summary['max_docs_per_type']:,}")
+        print(f"分片大小: {summary.get('shard_size', 100000):,} 条/文件")
         print(f"批次大小: {summary.get('batch_size', '自适应')}")
         print(f"Scroll Keepalive: {summary.get('scroll_keepalive', DEFAULT_SCROLL_KEEPALIVE)}")
         print(f"并行度: {summary.get('parallel_jobs', 2)}")
@@ -1092,10 +1278,10 @@ Environment Variables:
         help="导出时间范围(小时)，默认24小时",
     )
     parser.add_argument(
-        "--max-docs",
+        "--shard-size",
         type=int,
         default=100000,
-        help="每种类型最大导出文档数，默认100000",
+        help="每个分片文件的最大文档数，超过时自动分文件存储，默认100000",
     )
     parser.add_argument(
         "--batch-size",
@@ -1281,7 +1467,7 @@ def main():
 
     output = args.output or config.get('output') or f"metrics_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     time_range = args.time_range or config.get('timeRangeHours', 24)
-    max_docs = args.max_docs or config.get('maxDocs', 100000)
+    shard_size = args.shard_size or config.get('shardSize', 100000)
     batch_size = args.batch_size or config.get('batchSize')
     scroll_keepalive = args.scroll_keepalive or config.get('scrollKeepalive', DEFAULT_SCROLL_KEEPALIVE)
     parallel = args.parallel or config.get('parallelJobs', 2)
@@ -1306,7 +1492,7 @@ def main():
         output_dir=output,
         metric_types=metric_types,
         time_range_hours=time_range,
-        max_docs=max_docs,
+        shard_size=shard_size,
         cluster_id_filter=cluster_id,
         include_alerts=include_alerts,
         batch_size=batch_size,

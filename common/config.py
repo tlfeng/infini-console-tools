@@ -203,7 +203,7 @@ class MetricsJobConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     time_range_hours: int = 24
-    max_docs: int = 100000
+    shard_size: int = 100000  # 每个分片文件的最大文档数
     source_fields: Optional[List[str]] = None
     include_alerts: bool = True
     alert_types: List[str] = field(default_factory=list)
@@ -233,7 +233,7 @@ class MetricsJobConfig:
             output=OutputConfig.from_dict(data.get('output', {})),
             execution=ExecutionConfig.from_dict(data.get('execution', {})),
             time_range_hours=data.get('timeRangeHours', 24),
-            max_docs=data.get('maxDocs', 100000),
+            shard_size=data.get('shardSize', 100000),
             source_fields=data.get('sourceFields'),
             include_alerts=data.get('includeAlerts', True),
             alert_types=alert_types
