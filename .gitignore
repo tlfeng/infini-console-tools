@@ -51,3 +51,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Export output directories
+exports/
+metrics_export_*/
