@@ -108,7 +108,7 @@ ALERT_TYPES = {
 
 # 默认配置
 DEFAULT_BATCH_SIZE = 3000
-DEFAULT_SCROLL_KEEPALIVE = "60s"
+DEFAULT_SCROLL_KEEPALIVE = "5m"  # 增加到 5 分钟，避免大数据量时 scroll context 过期
 DEFAULT_PARALLEL_JOBS = 2  # 默认并行导出的指标类型数
 
 
@@ -292,6 +292,7 @@ class MetricsExporter:
                 {
                     "_id": hit.get("_id"),
                     **hit.get("_source", {}),
+                    "sort": hit.get("sort"),  # 保留排序值用于恢复
                 }
                 for hit in hits
             ]
@@ -301,8 +302,13 @@ class MetricsExporter:
             print(f"    查询失败: {e}")
             return [], None, 0
 
-    def scroll_next(self, scroll_id: str) -> List[Dict]:
-        """获取下一批 scroll 结果（批次大小由初始 search 请求决定）"""
+    def scroll_next(self, scroll_id: str) -> Optional[List[Dict]]:
+        """
+        获取下一批 scroll 结果（批次大小由初始 search 请求决定）
+
+        Returns:
+            文档列表，如果 scroll context 已过期则返回 None
+        """
         try:
             result = self.client.proxy_request(
                 self.system_cluster_id,
@@ -321,11 +327,20 @@ class MetricsExporter:
                 {
                     "_id": hit.get("_id"),
                     **hit.get("_source", {}),
+                    "sort": hit.get("sort"),  # 保留排序值用于恢复
                 }
                 for hit in hits
             ]
 
             return docs
+        except ConsoleAPIError as e:
+            error_msg = str(e)
+            # 检查是否是 scroll context 过期
+            if "search_context_missing_exception" in error_msg or "No search context found" in error_msg:
+                print(f"\n    Scroll context 已过期，尝试重新初始化...")
+                return None
+            print(f"    Scroll 失败: {e}")
+            return []
         except Exception as e:
             print(f"    Scroll 失败: {e}")
             return []
@@ -355,10 +370,14 @@ class MetricsExporter:
         """
         使用 scroll API 流式导出数据
 
+        支持自动恢复：如果 scroll context 过期，会自动重新初始化查询继续导出。
+
         Returns:
             导出的文档总数
         """
         total_exported = 0
+        scroll_id = None
+        last_sort_values = None  # 用于恢复时继续查询
 
         # 初始化 scroll
         first_batch, scroll_id, total_count = self.search_with_scroll(
@@ -380,8 +399,14 @@ class MetricsExporter:
             # 写入第一批
             docs_to_write = first_batch[:max_docs - total_exported] if max_docs else first_batch
             for doc in docs_to_write:
-                writer.write_doc(doc)
+                # 移除 sort 字段（仅用于恢复）
+                doc_copy = {k: v for k, v in doc.items() if k != "sort"}
+                writer.write_doc(doc_copy)
             total_exported += len(docs_to_write)
+
+            # 记录最后一条记录的排序值（用于恢复）
+            if docs_to_write:
+                last_sort_values = docs_to_write[-1].get("sort")
 
             if progress_callback:
                 progress_callback(total_exported, total_count)
@@ -389,6 +414,23 @@ class MetricsExporter:
             # 继续获取后续批次
             while scroll_id and (max_docs == 0 or total_exported < max_docs):
                 batch = self.scroll_next(scroll_id)
+
+                # scroll context 过期，尝试恢复
+                if batch is None:
+                    print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
+                    # 清理旧的 scroll
+                    self.clear_scroll(scroll_id)
+
+                    # 使用 search_after 恢复查询
+                    batch, scroll_id, _ = self._resume_with_search_after(
+                        index_pattern, query, batch_size, last_sort_values
+                    )
+
+                    if batch is None:
+                        print("    恢复失败，停止导出")
+                        break
+
+                    print(f"    恢复成功，继续导出...")
 
                 if not batch:
                     break
@@ -405,8 +447,14 @@ class MetricsExporter:
                     batch = batch[:remaining]
 
                 for doc in batch:
-                    writer.write_doc(doc)
+                    # 移除 sort 字段（仅用于恢复）
+                    doc_copy = {k: v for k, v in doc.items() if k != "sort"}
+                    writer.write_doc(doc_copy)
                 total_exported += len(batch)
+
+                # 更新最后排序值
+                if batch:
+                    last_sort_values = batch[-1].get("sort")
 
                 if progress_callback:
                     progress_callback(total_exported, total_count)
@@ -420,6 +468,55 @@ class MetricsExporter:
             self.clear_scroll(scroll_id)
 
         return total_exported
+
+    def _resume_with_search_after(
+        self,
+        index_pattern: str,
+        query: Dict,
+        batch_size: int,
+        last_sort_values: List = None,
+    ) -> tuple:
+        """
+        使用 search_after 恢复查询（当 scroll context 过期时）
+
+        Returns:
+            (first_batch, scroll_id, total_count)
+        """
+        try:
+            # 复制查询并添加 search_after
+            resume_query = dict(query)
+            resume_query["size"] = batch_size
+
+            if last_sort_values:
+                resume_query["search_after"] = last_sort_values
+
+            result = self.client.proxy_request(
+                self.system_cluster_id,
+                "POST",
+                f"/{index_pattern}/_search?scroll={self.scroll_keepalive}",
+                resume_query,
+            )
+
+            hits = result.get("hits", {}).get("hits", [])
+            total = result.get("hits", {}).get("total", 0)
+            if isinstance(total, dict):
+                total = total.get("value", 0)
+
+            scroll_id = result.get("_scroll_id")
+
+            docs = [
+                {
+                    "_id": hit.get("_id"),
+                    **hit.get("_source", {}),
+                    "sort": hit.get("sort"),  # 保留排序值用于后续恢复
+                }
+                for hit in hits
+            ]
+
+            return docs, scroll_id, total
+        except Exception as e:
+            print(f"    恢复查询失败: {e}")
+            return None, None, 0
 
     def _apply_sampling(self, docs: List[Dict], sampling: SamplingConfig) -> List[Dict]:
         """应用抽样策略"""
@@ -929,8 +1026,8 @@ Environment Variables:
     parser.add_argument(
         "--scroll-keepalive",
         type=str,
-        default="60s",
-        help="Scroll 上下文保持时间，默认60s",
+        default="5m",
+        help="Scroll 上下文保持时间，默认5m（建议大数据量时使用更长时间）",
     )
     parser.add_argument(
         "--parallel",
