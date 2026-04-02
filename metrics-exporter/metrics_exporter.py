@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
 from common.config import (
     add_common_args, load_and_merge_config, get_config_value,
-    AppConfig, MetricsJobConfig, SamplingConfig, ConfigValidationError
+    AppConfig, MetricsJobConfig, SamplingConfig, SlimConfig, ConfigValidationError
 )
 
 
@@ -271,6 +271,11 @@ class ExportResult:
 class MetricsExporter:
     """监控数据导出器 - 优化版"""
 
+    # 精简模式下要删除的字段
+    SLIM_META_FIELDS = {"_id", "agent"}
+    SLIM_META_PREFIXES = ("category", "datatype", "name")  # metadata 下的字段
+    SLIM_HUMAN_READABLE = {"store", "estimated_size", "limit_size"}
+
     def __init__(
         self,
         client: ConsoleClient,
@@ -282,6 +287,57 @@ class MetricsExporter:
         self.system_cluster_id = system_cluster_id
         self.scroll_keepalive = scroll_keepalive
         self.parallel_jobs = parallel_jobs
+
+    @staticmethod
+    def _slim_doc(doc: Dict, slim_config: SlimConfig) -> Dict:
+        """
+        精简文档，删除不必要的字段
+
+        删除的字段包括：
+        1. 和集群排障无关的字段：_id, agent, metadata.category/datatype/name
+        2. 冗余的人类可读格式字段：store, estimated_size, limit_size（保留 *_in_bytes）
+        """
+        if not slim_config or not slim_config.enabled:
+            return doc
+
+        result = {}
+
+        for key, value in doc.items():
+            # 删除顶层元数据字段
+            if slim_config.remove_meta and key in MetricsExporter.SLIM_META_FIELDS:
+                continue
+
+            # 处理 metadata 字段
+            if key == "metadata" and isinstance(value, dict) and slim_config.remove_meta:
+                slimmed_metadata = {}
+                for mk, mv in value.items():
+                    if mk not in MetricsExporter.SLIM_META_PREFIXES:
+                        slimmed_metadata[mk] = mv
+                result[key] = slimmed_metadata
+            else:
+                # 递归处理嵌套字典，删除人类可读格式字段
+                result[key] = MetricsExporter._remove_human_readable(value, slim_config)
+
+        return result
+
+    @staticmethod
+    def _remove_human_readable(value: Any, slim_config: SlimConfig) -> Any:
+        """递归删除人类可读格式字段"""
+        if not slim_config.remove_human_readable:
+            return value
+
+        if isinstance(value, dict):
+            result = {}
+            for k, v in value.items():
+                # 删除人类可读格式字段（有对应的 *_in_bytes 字段）
+                if k in MetricsExporter.SLIM_HUMAN_READABLE:
+                    continue
+                result[k] = MetricsExporter._remove_human_readable(v, slim_config)
+            return result
+        elif isinstance(value, list):
+            return [MetricsExporter._remove_human_readable(item, slim_config) for item in value]
+        else:
+            return value
 
     def get_system_cluster_id(self) -> Optional[str]:
         """获取系统集群ID"""
@@ -429,10 +485,13 @@ class MetricsExporter:
         except Exception:
             pass
 
-    def _write_docs(self, writer, docs: List[Dict]) -> None:
-        """写入文档列表，移除 sort 字段"""
+    def _write_docs(self, writer, docs: List[Dict], slim_config: SlimConfig = None) -> None:
+        """写入文档列表，移除 sort 字段，可选精简数据"""
         for doc in docs:
             doc_copy = {k: v for k, v in doc.items() if k != "sort"}
+            # 应用精简配置
+            if slim_config and slim_config.enabled:
+                doc_copy = self._slim_doc(doc_copy, slim_config)
             writer.write_doc(doc_copy)
 
     def export_with_scroll(
@@ -443,6 +502,7 @@ class MetricsExporter:
         batch_size: int = DEFAULT_BATCH_SIZE,
         shard_size: int = 100000,
         progress_callback=None,
+        slim_config: SlimConfig = None,
     ) -> Tuple[int, List[str]]:
         """
         使用 scroll API 流式导出数据（支持自动分片）
@@ -452,6 +512,7 @@ class MetricsExporter:
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
+            slim_config: 精简数据配置
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -474,7 +535,7 @@ class MetricsExporter:
         # 使用分片写入器
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             # 写入第一批
-            self._write_docs(writer, first_batch)
+            self._write_docs(writer, first_batch, slim_config)
             writer.flush()
             total_exported += len(first_batch)
 
@@ -513,7 +574,7 @@ class MetricsExporter:
                 if not batch:
                     break
 
-                self._write_docs(writer, batch)
+                self._write_docs(writer, batch, slim_config)
                 writer.flush()
                 total_exported += len(batch)
 
@@ -588,6 +649,7 @@ class MetricsExporter:
         shard_size: int = 100000,
         progress_callback=None,
         source_fields: List[str] = None,
+        slim_config: SlimConfig = None,
     ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits）
@@ -596,6 +658,7 @@ class MetricsExporter:
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
+            slim_config: 精简数据配置
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -609,6 +672,7 @@ class MetricsExporter:
                 batch_size,
                 shard_size,
                 progress_callback,
+                slim_config,
             )
 
         total_exported = 0
@@ -673,7 +737,11 @@ class MetricsExporter:
                     if not hits:
                         continue
                     hit = hits[0]
-                    writer.write_doc({"_id": hit.get("_id"), **hit.get("_source", {})})
+                    doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
+                    # 应用精简配置
+                    if slim_config and slim_config.enabled:
+                        doc = self._slim_doc(doc, slim_config)
+                    writer.write_doc(doc)
                     total_exported += 1
 
                 writer.flush()
@@ -805,12 +873,14 @@ class MetricsExporter:
         batch_size: int = None,
         source_fields: List[str] = None,
         sampling: SamplingConfig = None,
+        slim_config: SlimConfig = None,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
+            slim_config: 精简数据配置
         """
         result = ExportResult(metric_type, config["name"])
         start_time = time.time()
@@ -853,6 +923,7 @@ class MetricsExporter:
                     shard_size,
                     progress_callback,
                     source_fields,
+                    slim_config,
                 )
             else:
                 count, file_paths = self.export_with_scroll(
@@ -862,6 +933,7 @@ class MetricsExporter:
                     effective_batch_size,
                     shard_size,
                     progress_callback,
+                    slim_config,
                 )
 
             result.count = count
@@ -888,12 +960,14 @@ class MetricsExporter:
         shard_size: int = 100000,
         batch_size: int = None,
         source_fields: List[str] = None,
+        slim_config: SlimConfig = None,
     ) -> ExportResult:
         """导出告警相关数据（支持自动分片）
 
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
+            slim_config: 精简数据配置
         """
         result = ExportResult(alert_type, config["name"])
         start_time = time.time()
@@ -909,6 +983,7 @@ class MetricsExporter:
                 effective_batch_size,
                 shard_size,
                 self._make_progress_callback(alert_type),
+                slim_config,
             )
 
             result.count = count
@@ -995,11 +1070,13 @@ class MetricsExporter:
         source_fields: List[str] = None,
         parallel_jobs: int = None,
         sampling: SamplingConfig = None,
+        slim_config: SlimConfig = None,
     ) -> Dict[str, Any]:
         """导出所有监控数据（支持并行和自动分片）
 
         Args:
             shard_size: 每个分片文件的最大文档数，默认 100000
+            slim_config: 精简数据配置
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -1071,6 +1148,7 @@ class MetricsExporter:
                     batch_size,
                     source_fields,
                     sampling,
+                    slim_config,
                 )
                 futures[future] = metric_type
 
@@ -1115,6 +1193,7 @@ class MetricsExporter:
                         shard_size,
                         batch_size,
                         source_fields,
+                        slim_config,
                     )
                     futures[future] = alert_type
 
@@ -1175,6 +1254,7 @@ class MetricsExporter:
             source_fields=job.source_fields,
             parallel_jobs=job.execution.parallel_metrics,
             sampling=job.sampling,
+            slim_config=job.slim,
         )
 
     def _print_type_summary(self, title: str, types_data: Dict, totals: list) -> None:
@@ -1341,6 +1421,11 @@ Environment Variables:
         action="store_true",
         help="列出配置文件中的所有 jobs",
     )
+    parser.add_argument(
+        "--slim",
+        action="store_true",
+        help="精简数据：删除和排障无关的字段（_id, agent, metadata.category/datatype/name）和冗余的人类可读格式字段（store, estimated_size, limit_size）",
+    )
 
     return parser.parse_args()
 
@@ -1487,6 +1572,11 @@ def main():
     exporter.scroll_keepalive = scroll_keepalive
     exporter.parallel_jobs = parallel
 
+    # 解析精简配置
+    slim_config = None
+    if args.slim or config.get('slim', False):
+        slim_config = SlimConfig(enabled=True)
+
     # 导出数据
     summary = exporter.export_all(
         output_dir=output,
@@ -1498,6 +1588,7 @@ def main():
         batch_size=batch_size,
         source_fields=source_fields,
         parallel_jobs=parallel,
+        slim_config=slim_config,
     )
 
     exporter.print_summary(summary)

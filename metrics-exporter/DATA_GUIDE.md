@@ -142,6 +142,46 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
 抽样模式：
 - `interval`: 按时间间隔抽样（如 "1h", "5m", "30s"），每个时间桶保留最新一条记录
 
+### 5. 精简数据
+
+使用 `--slim` 或配置 `slim` 选项删除不必要的字段，减少数据量：
+
+```bash
+# 命令行启用精简
+python metrics_exporter.py --slim
+```
+
+或在配置中启用：
+
+```json
+{
+  "slim": true
+}
+```
+
+或更细粒度控制：
+
+```json
+{
+  "slim": {
+    "enabled": true,
+    "removeMeta": true,
+    "removeHumanReadable": true
+  }
+}
+```
+
+**精简删除的字段：**
+
+| 类别 | 删除的字段 | 说明 |
+|------|-----------|------|
+| 排障无关 | `_id`, `agent`, `metadata.category`, `metadata.datatype`, `metadata.name` | 对集群排障无价值 |
+| 冗余格式 | `store`, `estimated_size`, `limit_size` | 有对应的 `*_in_bytes` 字段可用 |
+
+**预期效果：**
+- 数据量减少 5-15%
+- 保留所有对排障有用的字段
+
 ### 5. Scroll 参数调优
 
 - `scrollKeepalive`: 默认 5m，适合长时间和大批量导出
@@ -178,6 +218,7 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
   "sampling": {
     "mode": "full"
   },
+  "slim": true,
   "output": {
     "directory": "./output",
     "splitBy": "metric_type",
@@ -209,6 +250,7 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
 | `targets.clusters` | object | 集群筛选规则 |
 | `sampling.mode` | string | full 或 sampling |
 | `sampling.interval` | string | 抽样间隔（如 "1h"），sampling 模式必填 |
+| `slim` | bool/object | 精简数据配置，删除不必要的字段 |
 | `output.directory` | string | 输出目录 |
 | `output.splitBy` | string | 分割方式：metric_type/cluster/none |
 | `execution.parallelMetrics` | int | 并行导出数 |
@@ -535,6 +577,7 @@ timestamp       - 时间戳
 | `--cluster-id` | 集群ID过滤 | - |
 | `--metric-types` | 指标类型列表 | 全部 |
 | `--fields` | 字段列表 | 全部 |
+| `--slim` | 精简数据，删除不必要的字段 | false |
 | `--no-alerts` | 不导出告警 | false |
 | `--list-clusters` | 列出集群 | false |
 

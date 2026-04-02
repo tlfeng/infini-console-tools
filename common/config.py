@@ -102,6 +102,50 @@ class TargetsConfig:
 
 
 @dataclass
+class SlimConfig:
+    """精简数据配置 - 删除不必要的字段"""
+    enabled: bool = False
+    # 删除和排障无关的字段
+    remove_meta: bool = True  # _id, agent, metadata.category/datatype/name
+    # 删除冗余的人类可读格式字段（保留 *_in_bytes）
+    remove_human_readable: bool = True
+
+    # 预定义的要删除的字段
+    META_FIELDS = {"_id", "agent"}
+    META_PREFIXES = ("metadata.category", "metadata.datatype", "metadata.name")
+    HUMAN_READABLE_FIELDS = {"store", "estimated_size", "limit_size"}
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'SlimConfig':
+        if not data:
+            return cls()
+
+        # 支持 enabled=True 或直接传 slim: true
+        if isinstance(data, bool):
+            return cls(enabled=data)
+
+        return cls(
+            enabled=data.get('enabled', False),
+            remove_meta=data.get('removeMeta', True),
+            remove_human_readable=data.get('removeHumanReadable', True)
+        )
+
+    def get_fields_to_remove(self) -> tuple:
+        """返回要删除的字段集合"""
+        meta_fields = set()
+        human_readable_fields = set()
+
+        if self.enabled:
+            if self.remove_meta:
+                meta_fields = self.META_FIELDS.copy()
+                # metadata 下的字段需要在处理时特殊处理
+            if self.remove_human_readable:
+                human_readable_fields = self.HUMAN_READABLE_FIELDS.copy()
+
+        return meta_fields, human_readable_fields, self.META_PREFIXES
+
+
+@dataclass
 class SamplingConfig:
     """抽样配置"""
     mode: str = "full"  # full 或 sampling
@@ -200,6 +244,7 @@ class MetricsJobConfig:
     targets: Optional[TargetsConfig] = None
     metrics: List[str] = field(default_factory=list)  # 指标类型列表
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    slim: SlimConfig = field(default_factory=SlimConfig)  # 精简数据配置
     output: OutputConfig = field(default_factory=OutputConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     time_range_hours: int = 24
@@ -230,6 +275,7 @@ class MetricsJobConfig:
             targets=TargetsConfig.from_dict(data.get('targets', {})),
             metrics=metrics,
             sampling=SamplingConfig.from_dict(data.get('sampling')),
+            slim=SlimConfig.from_dict(data.get('slim')),
             output=OutputConfig.from_dict(data.get('output', {})),
             execution=ExecutionConfig.from_dict(data.get('execution', {})),
             time_range_hours=data.get('timeRangeHours', 24),
