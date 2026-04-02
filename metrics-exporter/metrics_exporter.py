@@ -792,7 +792,7 @@ class MetricsExporter:
 
             # interval 抽样时，使用聚合预估实际写入的数据量
             if sampling and sampling.interval:
-                group_fields = config.get("group_fields", [])
+                group_fields = self._get_sampling_group_fields(metric_type, config)
                 sources = []
                 for i, field in enumerate(group_fields):
                     sources.append({f"group_{i}": {"terms": {"field": field}}})
