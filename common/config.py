@@ -259,10 +259,8 @@ class MetricsJobConfig:
         if not name:
             raise ConfigValidationError("job 必须有 name 字段")
 
-        # 解析指标类型
+        # 解析指标类型（允许为空，比如只导出告警数据的场景）
         metrics = data.get('metrics', [])
-        if not metrics:
-            raise ConfigValidationError(f"job '{name}' 必须指定至少一个 metric 类型")
         _validate_types(name, metrics, "metrics")
 
         # 解析告警类型

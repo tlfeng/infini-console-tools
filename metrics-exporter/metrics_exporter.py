@@ -1002,8 +1002,12 @@ class MetricsExporter:
         result.duration_ms = int((time.time() - start_time) * 1000)
         return result
 
-    def get_available_clusters(self) -> List[Dict]:
-        """获取有监控数据的集群列表"""
+    def get_available_clusters(self, time_range_hours: int = 24) -> List[Dict]:
+        """获取有监控数据的集群列表
+
+        Args:
+            time_range_hours: 查询时间范围（小时），默认 24 小时
+        """
         query = {
             "size": 0,
             "aggs": {
@@ -1026,7 +1030,7 @@ class MetricsExporter:
                 "bool": {
                     "must": [
                         {"query_string": {"query": 'metadata.name:"cluster_health"'}},
-                        {"range": {"timestamp": {"gte": "now-24h"}}},
+                        {"range": {"timestamp": {"gte": f"now-{time_range_hours}h"}}},
                     ]
                 }
             },
@@ -1078,6 +1082,27 @@ class MetricsExporter:
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
         """
+        # 如果 cluster_ids 是空列表（不是 None），说明指定了集群但匹配不到
+        # 此时应该返回空结果，而不是导出所有集群的数据
+        if cluster_ids is not None and len(cluster_ids) == 0:
+            print("警告: 指定的集群过滤条件未匹配到任何集群，跳过导出")
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_summary = {
+                "export_time": datetime.now().isoformat(),
+                "time_range_hours": time_range_hours,
+                "cluster_ids": [],
+                "metric_types": {},
+                "alert_types": {},
+                "clusters_with_data": [],
+                "skipped": True,
+                "skip_reason": "指定的集群过滤条件未匹配到任何集群",
+            }
+            summary_file = os.path.join(output_dir, f"export_summary_{timestamp_suffix}.json")
+            with open(summary_file, "w", encoding="utf-8") as f:
+                json.dump(export_summary, f, ensure_ascii=False, indent=2)
+            return export_summary
+
         os.makedirs(output_dir, exist_ok=True)
 
         # 生成时间后缀，用于所有输出文件
@@ -1112,7 +1137,7 @@ class MetricsExporter:
         clusters = []
         if not cluster_ids and not cluster_id_filter:
             print("\n正在获取有监控数据的集群列表...")
-            clusters = self.get_available_clusters()
+            clusters = self.get_available_clusters(time_range_hours)
             export_summary["clusters_with_data"] = clusters
             print(f"找到 {len(clusters)} 个有监控数据的集群")
             if not clusters:
@@ -1229,13 +1254,25 @@ class MetricsExporter:
 
         # 解析集群筛选
         cluster_ids = None
+        cluster_filter_specified = False  # 标记用户是否指定了集群过滤
         if job.targets and job.targets.clusters:
-            all_clusters = self.get_available_clusters()
+            cluster_filter_specified = True
+            all_clusters = self.get_available_clusters(job.time_range_hours)
             cluster_ids = [
                 c['cluster_id'] for c in all_clusters
                 if job.targets.clusters.matches(c['cluster_id']) or
                    job.targets.clusters.matches(c['cluster_name'])
             ]
+
+            # 如果指定了集群但匹配不到，打印警告
+            if not cluster_ids:
+                included = job.targets.clusters.include
+                print(f"警告: 在最近 {job.time_range_hours} 小时内未找到匹配的集群")
+                if included:
+                    print(f"  指定的集群: {included}")
+                print(f"  可用的集群: {[c['cluster_id'] for c in all_clusters][:10]}")
+                # 匹配不到时，设置为空列表以明确"无匹配"
+                # 后续会跳过导出或返回 0 条数据
 
         # 更新执行参数
         self.scroll_keepalive = job.execution.scroll_keepalive
