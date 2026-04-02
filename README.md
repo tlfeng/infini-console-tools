@@ -189,7 +189,7 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 --time-range HOURS       导出时间范围(小时)，默认24
 --max-docs N             每种类型最大文档数，默认100000（0=无限制）
 --batch-size N           每批次读取的文档数，默认自适应 (2000-5000)
---scroll-keepalive TIME  Scroll 上下文保持时间，默认60s
+--scroll-keepalive TIME  Scroll 上下文保持时间，默认5m
 --parallel N             并行导出的指标类型数，默认2
 --cluster-id ID          只导出指定集群的数据
 --metric-types TYPES     指定导出的指标类型，逗号分隔
@@ -240,7 +240,7 @@ python metrics-exporter/metrics_exporter.py --config config.json --list-jobs
         "metrics": ["node_stats", "index_stats"],
         "sampling": { "mode": "full" },
         "output": { "directory": "./metrics_export_full" },
-        "execution": { "parallelMetrics": 3, "scrollKeepalive": "60s" },
+        "execution": { "parallelMetrics": 3, "scrollKeepalive": "5m" },
         "timeRangeHours": 168,
         "maxDocs": 1000000
       },

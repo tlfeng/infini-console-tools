@@ -163,7 +163,7 @@ class ExecutionConfig:
     parallel_metrics: int = 2  # 并行导出的指标类型数
     parallel_degree: int = 1   # 单个指标内的并行度（预留）
     batch_size: Optional[int] = None
-    scroll_keepalive: str = "60s"
+    scroll_keepalive: str = "5m"
     max_retries: int = 3
     retry_delay: int = 5  # 秒
 
@@ -176,7 +176,7 @@ class ExecutionConfig:
             parallel_metrics=data.get('parallelMetrics', 2),
             parallel_degree=data.get('parallelDegree', 1),
             batch_size=data.get('batchSize'),
-            scroll_keepalive=data.get('scrollKeepalive', '60s'),
+            scroll_keepalive=data.get('scrollKeepalive', '5m'),
             max_retries=data.get('maxRetries', 3),
             retry_delay=data.get('retryDelay', 5)
         )

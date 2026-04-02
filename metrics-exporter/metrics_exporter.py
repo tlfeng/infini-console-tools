@@ -30,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
@@ -148,6 +148,14 @@ class CompactJSONWriter:
             self.first = False
         self.file.write(content)
         self.buffer.clear()
+
+    def flush(self):
+        """将当前缓冲内容刷新到文件，确保批次写入及时可见"""
+        if not self.file:
+            return
+        if self.buffer:
+            self._flush_buffer()
+        self.file.flush()
 
     def write_doc(self, doc: Dict):
         """写入单个文档（紧凑格式，无 indent）"""
@@ -302,12 +310,28 @@ class MetricsExporter:
             print(f"    查询失败: {e}")
             return [], None, 0
 
-    def scroll_next(self, scroll_id: str) -> Optional[List[Dict]]:
+    def _parse_scroll_response(self, result: Dict[str, Any]) -> Tuple[List[Dict], Optional[str]]:
+        """解析 scroll 响应，提取文档和最新的 scroll_id"""
+        hits = result.get("hits", {}).get("hits", [])
+        next_scroll_id = result.get("_scroll_id")
+
+        docs = [
+            {
+                "_id": hit.get("_id"),
+                **hit.get("_source", {}),
+                "sort": hit.get("sort"),
+            }
+            for hit in hits
+        ]
+
+        return docs, next_scroll_id
+
+    def scroll_next(self, scroll_id: str) -> Optional[Tuple[List[Dict], Optional[str]]]:
         """
-        获取下一批 scroll 结果（批次大小由初始 search 请求决定）
+        获取下一批 scroll 结果和最新的 scroll_id
 
         Returns:
-            文档列表，如果 scroll context 已过期则返回 None
+            (文档列表, 最新 scroll_id)，如果 scroll context 已过期则返回 None
         """
         try:
             result = self.client.proxy_request(
@@ -320,19 +344,7 @@ class MetricsExporter:
                 },
             )
 
-            hits = result.get("hits", {}).get("hits", [])
-
-            # 注意：不保留 _score，因为监控数据的 _score 恒为 null
-            docs = [
-                {
-                    "_id": hit.get("_id"),
-                    **hit.get("_source", {}),
-                    "sort": hit.get("sort"),  # 保留排序值用于恢复
-                }
-                for hit in hits
-            ]
-
-            return docs
+            return self._parse_scroll_response(result)
         except ConsoleAPIError as e:
             error_msg = str(e)
             # 检查是否是 scroll context 过期
@@ -340,10 +352,10 @@ class MetricsExporter:
                 print(f"\n    Scroll context 已过期，尝试重新初始化...")
                 return None
             print(f"    Scroll 失败: {e}")
-            return []
+            return [], None
         except Exception as e:
             print(f"    Scroll 失败: {e}")
-            return []
+            return [], None
 
     def clear_scroll(self, scroll_id: str):
         """清除 scroll 上下文"""
@@ -402,6 +414,7 @@ class MetricsExporter:
                 # 移除 sort 字段（仅用于恢复）
                 doc_copy = {k: v for k, v in doc.items() if k != "sort"}
                 writer.write_doc(doc_copy)
+            writer.flush()
             total_exported += len(docs_to_write)
 
             # 记录最后一条记录的排序值（用于恢复）
@@ -413,10 +426,10 @@ class MetricsExporter:
 
             # 继续获取后续批次
             while scroll_id and (max_docs == 0 or total_exported < max_docs):
-                batch = self.scroll_next(scroll_id)
+                scroll_result = self.scroll_next(scroll_id)
 
                 # scroll context 过期，尝试恢复
-                if batch is None:
+                if scroll_result is None:
                     print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
                     # 清理旧的 scroll
                     self.clear_scroll(scroll_id)
@@ -431,6 +444,10 @@ class MetricsExporter:
                         break
 
                     print(f"    恢复成功，继续导出...")
+
+                else:
+                    batch, next_scroll_id = scroll_result
+                    scroll_id = next_scroll_id or scroll_id
 
                 if not batch:
                     break
@@ -450,6 +467,7 @@ class MetricsExporter:
                     # 移除 sort 字段（仅用于恢复）
                     doc_copy = {k: v for k, v in doc.items() if k != "sort"}
                     writer.write_doc(doc_copy)
+                writer.flush()
                 total_exported += len(batch)
 
                 # 更新最后排序值
@@ -927,7 +945,7 @@ class MetricsExporter:
         print(f"时间范围: 最近 {summary['time_range_hours']} 小时")
         print(f"每类型最大文档数: {summary['max_docs_per_type']:,}")
         print(f"批次大小: {summary.get('batch_size', '自适应')}")
-        print(f"Scroll Keepalive: {summary.get('scroll_keepalive', '60s')}")
+        print(f"Scroll Keepalive: {summary.get('scroll_keepalive', DEFAULT_SCROLL_KEEPALIVE)}")
         print(f"并行度: {summary.get('parallel_jobs', 2)}")
 
         if summary.get("cluster_filter"):
@@ -1203,7 +1221,7 @@ def main():
     time_range = args.time_range or config.get('timeRangeHours', 24)
     max_docs = args.max_docs or config.get('maxDocs', 100000)
     batch_size = args.batch_size or config.get('batchSize')
-    scroll_keepalive = args.scroll_keepalive or config.get('scrollKeepalive', '60s')
+    scroll_keepalive = args.scroll_keepalive or config.get('scrollKeepalive', DEFAULT_SCROLL_KEEPALIVE)
     parallel = args.parallel or config.get('parallelJobs', 2)
     cluster_id = args.cluster_id or config.get('clusterId')
     include_alerts = not args.no_alerts and not config.get('noAlerts', False)

@@ -280,7 +280,7 @@ class TestExecutionConfig(unittest.TestCase):
         """默认值"""
         e = ExecutionConfig()
         self.assertEqual(e.parallel_metrics, 2)
-        self.assertEqual(e.scroll_keepalive, "60s")
+        self.assertEqual(e.scroll_keepalive, "5m")
         self.assertEqual(e.max_retries, 3)
 
     def test_from_dict(self):

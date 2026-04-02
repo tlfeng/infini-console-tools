@@ -33,7 +33,7 @@
           "parallelMetrics": 3,
           "parallelDegree": 1,
           "batchSize": null,
-          "scrollKeepalive": "60s",
+          "scrollKeepalive": "5m",
           "maxRetries": 3,
           "retryDelay": 5
         },
@@ -66,7 +66,7 @@
         "execution": {
           "parallelMetrics": 4,
           "batchSize": 5000,
-          "scrollKeepalive": "30s"
+          "scrollKeepalive": "5m"
         },
         "timeRangeHours": 168,
         "maxDocs": 500000

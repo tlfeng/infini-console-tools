@@ -105,6 +105,24 @@ class TestCompactJSONWriter(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
+    def test_flush_makes_buffer_visible(self):
+        """flush 应让当前批次内容立即写入文件"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            with CompactJSONWriter(temp_path, buffer_size=10) as writer:
+                writer.write_doc({"id": 1})
+                writer.flush()
+
+                with open(temp_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                self.assertIn('"id":1', content)
+                self.assertTrue(content.startswith("["))
+        finally:
+            os.unlink(temp_path)
+
 
 class TestExportResult(unittest.TestCase):
     """测试导出结果"""
@@ -244,7 +262,7 @@ class TestMetricsExporterInit(unittest.TestCase):
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
-        self.assertEqual(exporter.scroll_keepalive, "60s")
+        self.assertEqual(exporter.scroll_keepalive, "5m")
         self.assertEqual(exporter.parallel_jobs, 2)
 
     def test_custom_parameters(self):
@@ -307,6 +325,231 @@ class TestQueryBuilding(unittest.TestCase):
         )
 
         self.assertEqual(query["_source"], ["timestamp", "metadata.labels.cluster_id"])
+
+
+class TestScrollPagination(unittest.TestCase):
+    """测试 scroll 分页逻辑"""
+
+    def test_scroll_next_returns_latest_scroll_id(self):
+        """scroll_next 应返回 ES 响应中的最新 scroll_id"""
+        mock_client = MagicMock()
+        mock_client.proxy_request.return_value = {
+            "_scroll_id": "scroll-2",
+            "hits": {
+                "hits": [
+                    {
+                        "_id": "doc-1",
+                        "_source": {"value": 1},
+                        "sort": [123, "doc-1"],
+                    }
+                ]
+            },
+        }
+
+        exporter = MetricsExporter(mock_client, "system-id")
+        docs, next_scroll_id = exporter.scroll_next("scroll-1")
+
+        self.assertEqual(next_scroll_id, "scroll-2")
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["_id"], "doc-1")
+        self.assertEqual(docs[0]["sort"], [123, "doc-1"])
+
+    def test_scroll_next_returns_empty_batch_on_non_context_error(self):
+        """非 scroll 过期错误应安全返回空批次而不是破坏调用方协议"""
+        mock_client = MagicMock()
+        mock_client.proxy_request.side_effect = metrics_exporter.ConsoleAPIError("HTTP 500: boom")
+
+        exporter = MetricsExporter(mock_client, "system-id")
+        result = exporter.scroll_next("scroll-1")
+
+        self.assertEqual(result, ([], None))
+
+    def test_export_with_scroll_uses_refreshed_scroll_id(self):
+        """导出循环应使用每一页返回的新 scroll_id"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/metrics/_search?scroll=5m":
+                return {
+                    "_scroll_id": "scroll-1",
+                    "hits": {
+                        "total": {"value": 3},
+                        "hits": [
+                            {
+                                "_id": "doc-1",
+                                "_source": {"value": 1},
+                                "sort": [3, "doc-1"],
+                            }
+                        ],
+                    },
+                }
+
+            if method == "POST" and path == "/_search/scroll":
+                current_scroll_id = body["scroll_id"]
+                if current_scroll_id == "scroll-1":
+                    return {
+                        "_scroll_id": "scroll-2",
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_id": "doc-2",
+                                    "_source": {"value": 2},
+                                    "sort": [2, "doc-2"],
+                                }
+                            ]
+                        },
+                    }
+                if current_scroll_id == "scroll-2":
+                    return {
+                        "_scroll_id": "scroll-3",
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_id": "doc-3",
+                                    "_source": {"value": 3},
+                                    "sort": [1, "doc-3"],
+                                }
+                            ]
+                        },
+                    }
+                if current_scroll_id == "scroll-3":
+                    return {
+                        "_scroll_id": "scroll-4",
+                        "hits": {"hits": []},
+                    }
+
+            if method == "DELETE" and path == "/_search/scroll":
+                self.assertEqual(body, {"scroll_id": "scroll-4"})
+                return {"succeeded": True}
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            count = exporter.export_with_scroll(
+                index_pattern="metrics",
+                query={"query": {"match_all": {}}},
+                output_file=temp_path,
+                batch_size=1,
+                max_docs=0,
+            )
+
+            self.assertEqual(count, 3)
+
+            scroll_calls = [call for call in calls if call[0] == "POST" and call[1] == "/_search/scroll"]
+            self.assertEqual([call[2]["scroll_id"] for call in scroll_calls], ["scroll-1", "scroll-2", "scroll-3"])
+
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+
+            self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2", "doc-3"])
+        finally:
+            os.unlink(temp_path)
+
+    def test_export_with_scroll_recovers_with_search_after(self):
+        """scroll context 过期后应使用 search_after 恢复导出"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/metrics/_search?scroll=5m":
+                if body.get("search_after") == [2, "doc-1"]:
+                    return {
+                        "_scroll_id": "scroll-2",
+                        "hits": {
+                            "total": {"value": 2},
+                            "hits": [
+                                {
+                                    "_id": "doc-2",
+                                    "_source": {"value": 2},
+                                    "sort": [1, "doc-2"],
+                                }
+                            ],
+                        },
+                    }
+
+                return {
+                    "_scroll_id": "scroll-1",
+                    "hits": {
+                        "total": {"value": 2},
+                        "hits": [
+                            {
+                                "_id": "doc-1",
+                                "_source": {"value": 1},
+                                "sort": [2, "doc-1"],
+                            }
+                        ],
+                    },
+                }
+
+            if method == "POST" and path == "/_search/scroll":
+                current_scroll_id = body["scroll_id"]
+                if current_scroll_id == "scroll-1":
+                    raise metrics_exporter.ConsoleAPIError(
+                        'HTTP 404: {"error":{"root_cause":[{"type":"search_context_missing_exception","reason":"No search context found for id [1]"}]}}'
+                    )
+                if current_scroll_id == "scroll-2":
+                    return {
+                        "_scroll_id": "scroll-3",
+                        "hits": {"hits": []},
+                    }
+
+            if method == "DELETE" and path == "/_search/scroll":
+                return {"succeeded": True}
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            count = exporter.export_with_scroll(
+                index_pattern="metrics",
+                query={"query": {"match_all": {}}},
+                output_file=temp_path,
+                batch_size=1,
+                max_docs=0,
+            )
+
+            self.assertEqual(count, 2)
+
+            scroll_calls = [call for call in calls if call[0] == "POST" and call[1] == "/_search/scroll"]
+            self.assertEqual([call[2]["scroll_id"] for call in scroll_calls], ["scroll-1", "scroll-2"])
+
+            resume_calls = [
+                call for call in calls
+                if call[0] == "POST"
+                and call[1] == "/metrics/_search?scroll=5m"
+                and call[2].get("search_after") == [2, "doc-1"]
+            ]
+            self.assertEqual(len(resume_calls), 1)
+
+            clear_calls = [call for call in calls if call[0] == "DELETE" and call[1] == "/_search/scroll"]
+            self.assertEqual([call[2]["scroll_id"] for call in clear_calls], ["scroll-1", "scroll-3"])
+
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+
+            self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2"])
+        finally:
+            os.unlink(temp_path)
 
 
 if __name__ == "__main__":
