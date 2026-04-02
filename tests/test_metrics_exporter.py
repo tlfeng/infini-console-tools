@@ -296,6 +296,39 @@ class TestQueryBuilding(unittest.TestCase):
 
         self.assertEqual(query["_source"], ["timestamp", "metadata.labels.cluster_id"])
 
+    def test_alert_history_query_uses_timestamp_time_range(self):
+        """alert_history 应按 timestamp 应用时间范围"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_alert_query("alert_history", time_range_hours=24)
+
+        must_clauses = query["query"]["bool"]["must"]
+        self.assertEqual(len(must_clauses), 1)
+        self.assertIn("range", must_clauses[0])
+        self.assertIn("timestamp", must_clauses[0]["range"])
+
+    def test_alert_messages_query_uses_created_time_range(self):
+        """alert_messages 应按 created 应用时间范围"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_alert_query("alert_messages", time_range_hours=24)
+
+        must_clauses = query["query"]["bool"]["must"]
+        self.assertEqual(len(must_clauses), 1)
+        self.assertIn("range", must_clauses[0])
+        self.assertIn("created", must_clauses[0]["range"])
+
+    def test_alert_rules_query_remains_match_all(self):
+        """alert_rules 是配置数据，应保持全量导出"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_alert_query("alert_rules", time_range_hours=24)
+
+        self.assertEqual(query["query"], {"match_all": {}})
+
 
 class TestScrollPagination(unittest.TestCase):
     """测试 scroll 分页逻辑"""

@@ -638,6 +638,48 @@ class MetricsExporter:
         """分层抽样分组字段，优先使用指标定义的 key_fields"""
         return config.get("key_fields") or ["metadata.labels.cluster_id"]
 
+    def _detect_valid_group_fields(
+        self, index_pattern: str, query: Dict, group_fields: List[str]
+    ) -> List[str]:
+        """
+        检测哪些分组字段实际存在（有非空值）
+
+        通过查询一条记录来检查字段是否存在且有值
+        """
+        valid_fields = []
+
+        # 查询一条记录来检查字段
+        try:
+            result = self.client.proxy_request(
+                self.system_cluster_id,
+                "POST",
+                f"/{index_pattern}/_search",
+                {"size": 1, "query": query, "_source": group_fields},
+            )
+            hits = result.get("hits", {}).get("hits", [])
+            if hits:
+                doc = hits[0].get("_source", {})
+                for field in group_fields:
+                    # 检查字段是否存在且有值
+                    value = self._get_nested_value(doc, field)
+                    if value is not None:
+                        valid_fields.append(field)
+        except Exception:
+            pass
+
+        return valid_fields
+
+    def _get_nested_value(self, doc: Dict, field_path: str) -> Any:
+        """获取嵌套字段的值"""
+        parts = field_path.split(".")
+        value = doc
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return None
+        return value
+
     def export_with_es_sampling(
         self,
         index_pattern: str,
@@ -679,8 +721,15 @@ class MetricsExporter:
         after_key = None
         composite_page_size = 1000
 
+        # 检测哪些分组字段实际存在（有非空值）
+        effective_group_fields = self._detect_valid_group_fields(
+            index_pattern, query.get("query", {"match_all": {}}), group_fields
+        )
+        if not effective_group_fields:
+            effective_group_fields = group_fields[:1]  # 至少使用第一个字段
+
         sources = []
-        for i, field in enumerate(group_fields):
+        for i, field in enumerate(effective_group_fields):
             sources.append({f"group_{i}": {"terms": {"field": field}}})
         sources.append(
             {
@@ -793,8 +842,15 @@ class MetricsExporter:
             # interval 抽样时，使用聚合预估实际写入的数据量
             if sampling and sampling.interval:
                 group_fields = self._get_sampling_group_fields(metric_type, config)
+                # 检测有效字段
+                effective_group_fields = self._detect_valid_group_fields(
+                    config["index_pattern"], query.get("query", {"match_all": {}}), group_fields
+                )
+                if not effective_group_fields:
+                    effective_group_fields = group_fields[:1]
+
                 sources = []
-                for i, field in enumerate(group_fields):
+                for i, field in enumerate(effective_group_fields):
                     sources.append({f"group_{i}": {"terms": {"field": field}}})
                 sources.append(
                     {
