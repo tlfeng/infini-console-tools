@@ -24,13 +24,12 @@ import argparse
 import getpass
 import json
 import os
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
@@ -216,7 +215,6 @@ class MetricsExporter:
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         source_fields: List[str] = None,
-        sampling: SamplingConfig = None,
     ) -> Dict:
         """构建监控指标查询"""
         now = datetime.now(timezone.utc)
@@ -243,28 +241,27 @@ class MetricsExporter:
             "sort": [{"timestamp": {"order": "desc"}}],
         }
 
-        # 字段筛选
-        if source_fields:
-            query["_source"] = source_fields
-        else:
-            query["_source"] = True
-
+        query["_source"] = source_fields if source_fields else True
         return query
 
     def build_all_docs_query(self, source_fields: List[str] = None) -> Dict:
         """构建查询所有文档的查询"""
-        query = {
+        return {
             "query": {"match_all": {}},
             "sort": [
                 {"created": {"order": "desc", "unmapped_type": "date"}},
                 {"_id": {"order": "asc"}},
             ],
+            "_source": source_fields if source_fields else True,
         }
-        if source_fields:
-            query["_source"] = source_fields
-        else:
-            query["_source"] = True
         return query
+
+    def _parse_hits(self, hits: List[Dict]) -> List[Dict]:
+        """解析 hits 为统一格式文档"""
+        return [
+            {"_id": hit.get("_id"), **hit.get("_source", {}), "sort": hit.get("sort")}
+            for hit in hits
+        ]
 
     def search_with_scroll(
         self,
@@ -295,38 +292,18 @@ class MetricsExporter:
                 total = total.get("value", 0)
 
             scroll_id = result.get("_scroll_id")
-
-            docs = [
-                {
-                    "_id": hit.get("_id"),
-                    **hit.get("_source", {}),
-                    "sort": hit.get("sort"),  # 保留排序值用于恢复
-                }
-                for hit in hits
-            ]
-
-            return docs, scroll_id, total
+            return self._parse_hits(hits), scroll_id, total
         except Exception as e:
             print(f"    查询失败: {e}")
             return [], None, 0
 
-    def _parse_scroll_response(self, result: Dict[str, Any]) -> Tuple[List[Dict], Optional[str]]:
+    def _parse_scroll_response(self, result: Dict[str, Any]) -> tuple:
         """解析 scroll 响应，提取文档和最新的 scroll_id"""
         hits = result.get("hits", {}).get("hits", [])
         next_scroll_id = result.get("_scroll_id")
+        return self._parse_hits(hits), next_scroll_id
 
-        docs = [
-            {
-                "_id": hit.get("_id"),
-                **hit.get("_source", {}),
-                "sort": hit.get("sort"),
-            }
-            for hit in hits
-        ]
-
-        return docs, next_scroll_id
-
-    def scroll_next(self, scroll_id: str) -> Optional[Tuple[List[Dict], Optional[str]]]:
+    def scroll_next(self, scroll_id: str) -> Optional[tuple]:
         """
         获取下一批 scroll 结果和最新的 scroll_id
 
@@ -363,11 +340,17 @@ class MetricsExporter:
             self.client.proxy_request(
                 self.system_cluster_id,
                 "DELETE",
-                f"/_search/scroll",
+                "/_search/scroll",
                 {"scroll_id": scroll_id},
             )
         except Exception:
             pass
+
+    def _write_docs(self, writer: CompactJSONWriter, docs: List[Dict]) -> None:
+        """写入文档列表，移除 sort 字段"""
+        for doc in docs:
+            doc_copy = {k: v for k, v in doc.items() if k != "sort"}
+            writer.write_doc(doc_copy)
 
     def export_with_scroll(
         self,
@@ -405,10 +388,7 @@ class MetricsExporter:
         with CompactJSONWriter(output_file) as writer:
             # 写入第一批
             docs_to_write = first_batch[:max_docs - total_exported] if max_docs else first_batch
-            for doc in docs_to_write:
-                # 移除 sort 字段（仅用于恢复）
-                doc_copy = {k: v for k, v in doc.items() if k != "sort"}
-                writer.write_doc(doc_copy)
+            self._write_docs(writer, docs_to_write)
             writer.flush()
             total_exported += len(docs_to_write)
 
@@ -454,10 +434,7 @@ class MetricsExporter:
                         break
                     batch = batch[:remaining]
 
-                for doc in batch:
-                    # 移除 sort 字段（仅用于恢复）
-                    doc_copy = {k: v for k, v in doc.items() if k != "sort"}
-                    writer.write_doc(doc_copy)
+                self._write_docs(writer, batch)
                 writer.flush()
                 total_exported += len(batch)
 
@@ -512,17 +489,7 @@ class MetricsExporter:
                 total = total.get("value", 0)
 
             scroll_id = result.get("_scroll_id")
-
-            docs = [
-                {
-                    "_id": hit.get("_id"),
-                    **hit.get("_source", {}),
-                    "sort": hit.get("sort"),  # 保留排序值用于后续恢复
-                }
-                for hit in hits
-            ]
-
-            return docs, scroll_id, total
+            return self._parse_hits(hits), scroll_id, total
         except Exception as e:
             print(f"    恢复查询失败: {e}")
             return None, None, 0
@@ -533,10 +500,7 @@ class MetricsExporter:
 
     def _get_sampling_group_fields(self, metric_type: str, config: Dict[str, Any]) -> List[str]:
         """分层抽样分组字段，优先使用指标定义的 key_fields"""
-        key_fields = config.get("key_fields") or []
-        if key_fields:
-            return key_fields
-        return ["metadata.labels.cluster_id"]
+        return config.get("key_fields") or ["metadata.labels.cluster_id"]
 
     def export_with_es_sampling(
         self,
@@ -649,11 +613,7 @@ class MetricsExporter:
                     if not hits:
                         continue
                     hit = hits[0]
-                    doc = {
-                        "_id": hit.get("_id"),
-                        **hit.get("_source", {}),
-                    }
-                    writer.write_doc(doc)
+                    writer.write_doc({"_id": hit.get("_id"), **hit.get("_source", {})})
                     total_exported += 1
 
                     if max_docs and total_exported >= max_docs:
@@ -663,14 +623,69 @@ class MetricsExporter:
                 if progress_callback:
                     progress_callback(total_exported, 0)
 
-                if max_docs and total_exported >= max_docs:
-                    break
-
                 after_key = sampled.get("after_key")
-                if not after_key:
+                if not after_key or (max_docs and total_exported >= max_docs):
                     break
 
         return total_exported
+
+    def estimate_export_count(
+        self,
+        metric_type: str,
+        config: Dict,
+        time_range_hours: int,
+        cluster_id_filter: str = None,
+        cluster_ids: List[str] = None,
+        sampling: SamplingConfig = None,
+    ) -> int:
+        """
+        估计要导出的数据条数
+
+        Returns:
+            预估的文档数量
+        """
+        query = self.build_metrics_query(
+            config["filter_template"],
+            time_range_hours,
+            cluster_id_filter,
+            cluster_ids,
+            None,
+        )
+
+        try:
+            # 使用 count API 获取总数
+            count_body = {"query": query.get("query", {"match_all": {}})}
+            result = self.client.proxy_request(
+                self.system_cluster_id,
+                "POST",
+                f"/{config['index_pattern']}/_count",
+                count_body,
+            )
+            total = result.get("count", 0)
+
+            # 如果有抽样，计算抽样后的预估数量
+            if sampling and sampling.is_sampling():
+                if sampling.ratio:
+                    total = int(total * sampling.ratio)
+                elif sampling.interval:
+                    # interval 抽样时，计算时间桶数量
+                    # 这是一个估算，实际数量取决于维度分布
+                    pass  # 保持原始总数作为参考
+
+            return total
+        except Exception as e:
+            print(f"    预估数据量失败: {e}")
+            return -1
+
+    def _make_progress_callback(self, metric_type: str):
+        """创建进度回调函数"""
+        def callback(current, total):
+            if total > 0:
+                percent = min(100, current * 100 // total)
+                print(f"\r    [{metric_type}] 已导出 {current:,} / {total:,} ({percent}%)", end="", flush=True)
+            else:
+                print(f"\r    [{metric_type}] 已导出 {current:,}", end="", flush=True)
+        return callback
 
     def export_metric_type(
         self,
@@ -693,21 +708,22 @@ class MetricsExporter:
             # 使用配置的批次大小或默认值
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
 
+            # 首先预估数据量
+            estimated_count = self.estimate_export_count(
+                metric_type, config, time_range_hours, cluster_id_filter, cluster_ids, sampling
+            )
+            if estimated_count >= 0:
+                print(f"    预估需要导出约 {estimated_count:,} 条记录")
+
             query = self.build_metrics_query(
                 config["filter_template"],
                 time_range_hours,
                 cluster_id_filter,
                 cluster_ids,
                 source_fields,
-                sampling,
             )
 
-            def progress_callback(current, total):
-                if total > 0:
-                    percent = min(100, current * 100 // total)
-                    print(f"\r    [{metric_type}] 已导出 {current:,} / {total:,} ({percent}%)", end="", flush=True)
-                else:
-                    print(f"\r    [{metric_type}] 已导出 {current:,}", end="", flush=True)
+            progress_callback = self._make_progress_callback(metric_type)
 
             if self._should_use_es_sampling(sampling):
                 count = self.export_with_es_sampling(
@@ -757,18 +773,13 @@ class MetricsExporter:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
             query = self.build_all_docs_query(source_fields)
 
-            def progress_callback(current, total):
-                if total > 0:
-                    percent = min(100, current * 100 // total)
-                    print(f"\r    [{alert_type}] 已导出 {current:,} / {total:,} ({percent}%)", end="", flush=True)
-
             count = self.export_with_scroll(
                 config["index_pattern"],
                 query,
                 output_file,
                 effective_batch_size,
                 max_docs,
-                progress_callback,
+                self._make_progress_callback(alert_type),
             )
 
             result.count = count
@@ -1021,6 +1032,19 @@ class MetricsExporter:
             sampling=job.sampling,
         )
 
+    def _print_type_summary(self, title: str, types_data: Dict, totals: list) -> None:
+        """打印类型摘要，更新 totals [doc_count, duration_ms]"""
+        print(f"\n{title}:")
+        total_docs, total_time = 0, 0
+        for type_key, info in types_data.items():
+            duration_s = info.get("duration_ms", 0) / 1000
+            status = "✓" if not info.get("error") else "✗"
+            print(f"  - {status} {info['name']}: {info['count']:,} 条记录 ({duration_s:.1f}s)")
+            total_docs += info["count"]
+            total_time += info.get("duration_ms", 0)
+        totals[0] += total_docs
+        totals[1] += total_time
+
     def print_summary(self, summary: Dict[str, Any]):
         """打印导出摘要"""
         print("\n" + "=" * 60)
@@ -1045,29 +1069,12 @@ class MetricsExporter:
         if len(summary["clusters_with_data"]) > 10:
             print(f"  ... 还有 {len(summary['clusters_with_data']) - 10} 个集群")
 
-        print("\n监控指标数据:")
-        total_metric_docs = 0
-        total_metric_time = 0
-        for metric_type, info in summary["metric_types"].items():
-            duration_s = info.get("duration_ms", 0) / 1000
-            status = "✓" if not info.get("error") else "✗"
-            print(f"  - {status} {info['name']}: {info['count']:,} 条记录 ({duration_s:.1f}s)")
-            total_metric_docs += info["count"]
-            total_metric_time += info.get("duration_ms", 0)
+        totals = [0, 0]  # [total_docs, total_time_ms]
+        self._print_type_summary("监控指标数据", summary["metric_types"], totals)
+        self._print_type_summary("告警数据", summary["alert_types"], totals)
 
-        print("\n告警数据:")
-        total_alert_docs = 0
-        total_alert_time = 0
-        for alert_type, info in summary["alert_types"].items():
-            duration_s = info.get("duration_ms", 0) / 1000
-            status = "✓" if not info.get("error") else "✗"
-            print(f"  - {status} {info['name']}: {info['count']:,} 条记录 ({duration_s:.1f}s)")
-            total_alert_docs += info["count"]
-            total_alert_time += info.get("duration_ms", 0)
-
-        total_time_s = (total_metric_time + total_alert_time) / 1000
-        print(f"\n总计: {total_metric_docs + total_alert_docs:,} 条记录")
-        print(f"总耗时: {total_time_s:.1f}s")
+        print(f"\n总计: {totals[0]:,} 条记录")
+        print(f"总耗时: {totals[1] / 1000:.1f}s")
         print("=" * 60)
 
 
