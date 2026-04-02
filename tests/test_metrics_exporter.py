@@ -538,61 +538,6 @@ class TestStratifiedSampling(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
-    def test_ratio_sampling_uses_es_random_score(self):
-        """ratio 抽样应使用 ES random_score，而非本地过滤"""
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-id")
-
-        calls = []
-
-        def proxy_request(cluster_id, method, path, body=None):
-            self.assertEqual(cluster_id, "system-id")
-            calls.append((method, path, body))
-
-            if method == "POST" and path == "/.infini_metrics/_search?scroll=5m":
-                self.assertIn("function_score", body["query"])
-                self.assertIn("min_score", body)
-                return {
-                    "_scroll_id": "scroll-1",
-                    "hits": {
-                        "total": {"value": 1},
-                        "hits": [
-                            {
-                                "_id": "doc-1",
-                                "_source": {"timestamp": "2026-04-02T00:00:00Z"},
-                                "sort": [1, "doc-1"],
-                            }
-                        ],
-                    },
-                }
-            if method == "POST" and path == "/_search/scroll":
-                return {"_scroll_id": "scroll-2", "hits": {"hits": []}}
-            if method == "DELETE" and path == "/_search/scroll":
-                return {"succeeded": True}
-            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
-
-        mock_client.proxy_request.side_effect = proxy_request
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_path = f.name
-
-        try:
-            result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
-                output_file=temp_path,
-                time_range_hours=24,
-                max_docs=0,
-                cluster_ids=["cluster-1"],
-                sampling=SamplingConfig(mode="sampling", ratio=0.2),
-            )
-
-            self.assertEqual(result.count, 1)
-            search_calls = [c for c in calls if c[1] == "/.infini_metrics/_search?scroll=5m"]
-            self.assertEqual(len(search_calls), 1)
-        finally:
-            os.unlink(temp_path)
-
     def test_export_with_scroll_recovers_with_search_after(self):
         """scroll context 过期后应使用 search_after 恢复导出"""
         mock_client = MagicMock()

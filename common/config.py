@@ -105,8 +105,7 @@ class TargetsConfig:
 class SamplingConfig:
     """抽样配置"""
     mode: str = "full"  # full 或 sampling
-    interval: Optional[str] = None  # 如 "1h", "5m" 表示 downsampling 间隔
-    ratio: Optional[float] = None  # 0.0-1.0，采样比例
+    interval: Optional[str] = None  # 如 "1h", "5m" 表示时间桶间隔
 
     @classmethod
     def from_dict(cls, data: Optional[Dict]) -> 'SamplingConfig':
@@ -118,15 +117,12 @@ class SamplingConfig:
             raise ConfigValidationError(f"无效的采样模式: {mode}，必须是 'full' 或 'sampling'")
 
         interval = data.get('interval')
-        ratio = data.get('ratio')
 
         if mode == 'sampling':
-            if interval is None and ratio is None:
-                raise ConfigValidationError("sampling 模式需要指定 interval 或 ratio")
-            if ratio is not None and (ratio <= 0 or ratio > 1):
-                raise ConfigValidationError(f"ratio 必须在 (0, 1] 范围内，当前: {ratio}")
+            if interval is None:
+                raise ConfigValidationError("sampling 模式需要指定 interval")
 
-        return cls(mode=mode, interval=interval, ratio=ratio)
+        return cls(mode=mode, interval=interval)
 
     def is_sampling(self) -> bool:
         return self.mode == 'sampling'

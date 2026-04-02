@@ -515,31 +515,9 @@ class MetricsExporter:
         source_fields: List[str] = None,
     ) -> int:
         """
-        统一的 ES 端抽样：
-        - interval: 时间桶 + 维度分层（top_hits）
-        - ratio: random_score + min_score
+        ES 端抽样：时间桶 + 维度分层（top_hits）
+        每个 (维度组合, 时间桶) 只保留最新的一条记录
         """
-        if sampling.ratio and not sampling.interval:
-            # 比例抽样：在 ES 查询阶段随机过滤，减少传输和写入。
-            sampled_query = dict(query)
-            base_query = sampled_query.get("query", {"match_all": {}})
-            sampled_query["query"] = {
-                "function_score": {
-                    "query": base_query,
-                    "random_score": {},
-                    "boost_mode": "replace",
-                }
-            }
-            sampled_query["min_score"] = max(0.0, min(1.0, 1.0 - float(sampling.ratio)))
-            return self.export_with_scroll(
-                index_pattern,
-                sampled_query,
-                output_file,
-                batch_size,
-                max_docs,
-                progress_callback,
-            )
-
         sampling_interval = sampling.interval
         if not sampling_interval:
             return self.export_with_scroll(
@@ -663,15 +641,7 @@ class MetricsExporter:
             )
             total = result.get("count", 0)
 
-            # 如果有抽样，计算抽样后的预估数量
-            if sampling and sampling.is_sampling():
-                if sampling.ratio:
-                    total = int(total * sampling.ratio)
-                elif sampling.interval:
-                    # interval 抽样时，计算时间桶数量
-                    # 这是一个估算，实际数量取决于维度分布
-                    pass  # 保持原始总数作为参考
-
+            # interval 抽样时，实际数量取决于维度分布，这里返回原始总数作为参考
             return total
         except Exception as e:
             print(f"    预估数据量失败: {e}")

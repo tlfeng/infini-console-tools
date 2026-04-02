@@ -249,28 +249,15 @@ class TestSamplingConfig(unittest.TestCase):
         self.assertTrue(s.is_sampling())
         self.assertEqual(s.interval, "1h")
 
-    def test_sampling_with_ratio(self):
-        """比例抽样"""
-        s = SamplingConfig(mode="sampling", ratio=0.1)
-        self.assertTrue(s.is_sampling())
-        self.assertEqual(s.ratio, 0.1)
-
     def test_invalid_mode(self):
         """无效模式"""
         with self.assertRaises(ConfigValidationError):
             SamplingConfig.from_dict({"mode": "invalid"})
 
-    def test_sampling_without_interval_or_ratio(self):
-        """抽样模式缺少参数"""
+    def test_sampling_without_interval(self):
+        """抽样模式缺少 interval 参数"""
         with self.assertRaises(ConfigValidationError):
             SamplingConfig.from_dict({"mode": "sampling"})
-
-    def test_invalid_ratio(self):
-        """无效比例"""
-        with self.assertRaises(ConfigValidationError):
-            SamplingConfig.from_dict({"mode": "sampling", "ratio": 1.5})
-        with self.assertRaises(ConfigValidationError):
-            SamplingConfig.from_dict({"mode": "sampling", "ratio": 0})
 
 
 class TestExecutionConfig(unittest.TestCase):
