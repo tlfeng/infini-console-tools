@@ -151,83 +151,6 @@ class TestExportResult(unittest.TestCase):
         self.assertIsNone(d["file"])
 
 
-class TestSampling(unittest.TestCase):
-    """测试抽样逻辑"""
-
-    def test_interval_sampling_hourly(self):
-        """测试按小时间隔抽样"""
-        # 创建模拟导出器
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-cluster-id")
-
-        # 创建测试数据：每小时一条，共10条
-        now = datetime.now(timezone.utc)
-        docs = []
-        for i in range(10):
-            ts = now - timedelta(hours=i)
-            docs.append({
-                "timestamp": ts.isoformat(),
-                "value": i
-            })
-
-        sampling = SamplingConfig(mode="sampling", interval="1h")
-        sampled = exporter._interval_sampling(docs, "1h")
-
-        # 每5条保留一条（因为间隔足够大）
-        self.assertGreater(len(sampled), 0)
-        self.assertLessEqual(len(sampled), len(docs))
-
-    def test_interval_sampling_minutes(self):
-        """测试按分钟间隔抽样"""
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-cluster-id")
-
-        now = datetime.now(timezone.utc)
-        docs = []
-        for i in range(60):
-            ts = now - timedelta(minutes=i)
-            docs.append({
-                "timestamp": ts.isoformat(),
-                "value": i
-            })
-
-        sampling = SamplingConfig(mode="sampling", interval="5m")
-        sampled = exporter._interval_sampling(docs, "5m")
-
-        # 5分钟间隔应该保留约12条
-        self.assertGreater(len(sampled), 8)
-        self.assertLess(len(sampled), 20)
-
-    def test_ratio_sampling(self):
-        """测试比例抽样"""
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-cluster-id")
-
-        docs = [{"id": i} for i in range(1000)]
-
-        # 设置随机种子以保证可重复性
-        import random
-        random.seed(42)
-
-        sampled = exporter._ratio_sampling(docs, 0.1)
-
-        # 10% 比例应该接近100条
-        self.assertGreater(len(sampled), 50)
-        self.assertLess(len(sampled), 150)
-
-    def test_full_mode_no_sampling(self):
-        """全量模式不抽样"""
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-cluster-id")
-
-        docs = [{"id": i} for i in range(100)]
-
-        sampling = SamplingConfig(mode="full")
-        result = exporter._apply_sampling(docs, sampling)
-
-        self.assertEqual(len(result), 100)
-
-
 class TestMetricTypes(unittest.TestCase):
     """测试指标类型定义"""
 
@@ -453,6 +376,220 @@ class TestScrollPagination(unittest.TestCase):
                 data = json.load(f)
 
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2", "doc-3"])
+        finally:
+            os.unlink(temp_path)
+
+
+class TestStratifiedSampling(unittest.TestCase):
+    """测试 ES 端分层抽样导出"""
+
+    def test_cluster_stats_interval_sampling_uses_es_aggregations(self):
+        """所有指标的 interval 抽样都应走 ES 聚合"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                return {
+                    "aggregations": {
+                        "sampled": {
+                            "buckets": [
+                                {
+                                    "latest": {
+                                        "hits": {
+                                            "hits": [
+                                                {
+                                                    "_id": "doc-1",
+                                                    "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            result = exporter.export_metric_type(
+                metric_type="cluster_stats",
+                config=METRIC_TYPES["cluster_stats"],
+                output_file=temp_path,
+                time_range_hours=24,
+                max_docs=0,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+            )
+
+            self.assertEqual(result.count, 1)
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 1)
+        finally:
+            os.unlink(temp_path)
+
+    def test_node_stats_interval_sampling_uses_es_aggregations(self):
+        """node_stats interval 抽样应走 ES 聚合而非 scroll 全量拉取"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                after = body.get("aggs", {}).get("sampled", {}).get("composite", {}).get("after")
+                if not after:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-1",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-2",
+                                                        "_source": {"timestamp": "2026-04-02T00:15:00Z", "v": 2},
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    },
+                                ],
+                                "after_key": {"group_0": "c1", "group_1": "n2", "time_bucket": 1712016900000},
+                            }
+                        }
+                    }
+
+                return {
+                    "aggregations": {
+                        "sampled": {
+                            "buckets": [
+                                {
+                                    "latest": {
+                                        "hits": {
+                                            "hits": [
+                                                {
+                                                    "_id": "doc-3",
+                                                    "_source": {"timestamp": "2026-04-02T00:30:00Z", "v": 3},
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_path,
+                time_range_hours=24,
+                max_docs=0,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+            )
+
+            self.assertEqual(result.count, 3)
+
+            search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
+            self.assertEqual(len(search_calls), 2)
+
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+
+            self.assertEqual([d["_id"] for d in data], ["doc-1", "doc-2", "doc-3"])
+        finally:
+            os.unlink(temp_path)
+
+    def test_ratio_sampling_uses_es_random_score(self):
+        """ratio 抽样应使用 ES random_score，而非本地过滤"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/.infini_metrics/_search?scroll=5m":
+                self.assertIn("function_score", body["query"])
+                self.assertIn("min_score", body)
+                return {
+                    "_scroll_id": "scroll-1",
+                    "hits": {
+                        "total": {"value": 1},
+                        "hits": [
+                            {
+                                "_id": "doc-1",
+                                "_source": {"timestamp": "2026-04-02T00:00:00Z"},
+                                "sort": [1, "doc-1"],
+                            }
+                        ],
+                    },
+                }
+            if method == "POST" and path == "/_search/scroll":
+                return {"_scroll_id": "scroll-2", "hits": {"hits": []}}
+            if method == "DELETE" and path == "/_search/scroll":
+                return {"succeeded": True}
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_path = f.name
+
+        try:
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_path,
+                time_range_hours=24,
+                max_docs=0,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", ratio=0.2),
+            )
+
+            self.assertEqual(result.count, 1)
+            search_calls = [c for c in calls if c[1] == "/.infini_metrics/_search?scroll=5m"]
+            self.assertEqual(len(search_calls), 1)
         finally:
             os.unlink(temp_path)
 

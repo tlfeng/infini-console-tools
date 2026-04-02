@@ -377,7 +377,6 @@ class MetricsExporter:
         batch_size: int = DEFAULT_BATCH_SIZE,
         max_docs: int = 100000,
         progress_callback=None,
-        sampling: SamplingConfig = None,
     ) -> int:
         """
         使用 scroll API 流式导出数据
@@ -401,10 +400,6 @@ class MetricsExporter:
             with CompactJSONWriter(output_file):
                 pass
             return 0
-
-        # 应用抽样
-        if sampling and sampling.is_sampling():
-            first_batch = self._apply_sampling(first_batch, sampling)
 
         # 流式写入
         with CompactJSONWriter(output_file) as writer:
@@ -451,10 +446,6 @@ class MetricsExporter:
 
                 if not batch:
                     break
-
-                # 应用抽样
-                if sampling and sampling.is_sampling():
-                    batch = self._apply_sampling(batch, sampling)
 
                 # 限制最大文档数
                 if max_docs:
@@ -536,70 +527,150 @@ class MetricsExporter:
             print(f"    恢复查询失败: {e}")
             return None, None, 0
 
-    def _apply_sampling(self, docs: List[Dict], sampling: SamplingConfig) -> List[Dict]:
-        """应用抽样策略"""
-        if not docs or not sampling.is_sampling():
-            return docs
+    def _should_use_es_sampling(self, sampling: SamplingConfig) -> bool:
+        """sampling 模式统一使用 ES 端抽样"""
+        return bool(sampling and sampling.is_sampling())
 
-        # 时间间隔抽样
-        if sampling.interval:
-            return self._interval_sampling(docs, sampling.interval)
+    def _get_sampling_group_fields(self, metric_type: str, config: Dict[str, Any]) -> List[str]:
+        """分层抽样分组字段，优先使用指标定义的 key_fields"""
+        key_fields = config.get("key_fields") or []
+        if key_fields:
+            return key_fields
+        return ["metadata.labels.cluster_id"]
 
-        # 比例抽样
-        if sampling.ratio:
-            return self._ratio_sampling(docs, sampling.ratio)
+    def export_with_es_sampling(
+        self,
+        index_pattern: str,
+        query: Dict,
+        output_file: str,
+        sampling: SamplingConfig,
+        batch_size: int,
+        group_fields: List[str],
+        max_docs: int = 100000,
+        progress_callback=None,
+        source_fields: List[str] = None,
+    ) -> int:
+        """
+        统一的 ES 端抽样：
+        - interval: 时间桶 + 维度分层（top_hits）
+        - ratio: random_score + min_score
+        """
+        if sampling.ratio and not sampling.interval:
+            # 比例抽样：在 ES 查询阶段随机过滤，减少传输和写入。
+            sampled_query = dict(query)
+            base_query = sampled_query.get("query", {"match_all": {}})
+            sampled_query["query"] = {
+                "function_score": {
+                    "query": base_query,
+                    "random_score": {},
+                    "boost_mode": "replace",
+                }
+            }
+            sampled_query["min_score"] = max(0.0, min(1.0, 1.0 - float(sampling.ratio)))
+            return self.export_with_scroll(
+                index_pattern,
+                sampled_query,
+                output_file,
+                batch_size,
+                max_docs,
+                progress_callback,
+            )
 
-        return docs
+        sampling_interval = sampling.interval
+        if not sampling_interval:
+            return self.export_with_scroll(
+                index_pattern,
+                query,
+                output_file,
+                batch_size,
+                max_docs,
+                progress_callback,
+            )
 
-    def _interval_sampling(self, docs: List[Dict], interval: str) -> List[Dict]:
-        """按时间间隔抽样（保留每个时间窗口的第一条记录）"""
-        # 解析间隔（如 "1h", "5m", "30s"）
-        match = re.match(r'(\d+)([hms])', interval)
-        if not match:
-            return docs
+        total_exported = 0
+        after_key = None
+        composite_page_size = 1000
 
-        value = int(match.group(1))
-        unit = match.group(2)
+        sources = []
+        for i, field in enumerate(group_fields):
+            sources.append({f"group_{i}": {"terms": {"field": field}}})
+        sources.append(
+            {
+                "time_bucket": {
+                    "date_histogram": {
+                        "field": "timestamp",
+                        "fixed_interval": sampling_interval,
+                    }
+                }
+            }
+        )
 
-        if unit == 'h':
-            delta = timedelta(hours=value)
-        elif unit == 'm':
-            delta = timedelta(minutes=value)
-        else:  # 's'
-            delta = timedelta(seconds=value)
+        with CompactJSONWriter(output_file) as writer:
+            while max_docs == 0 or total_exported < max_docs:
+                body = {
+                    "size": 0,
+                    "track_total_hits": False,
+                    "query": query.get("query", {"match_all": {}}),
+                    "aggs": {
+                        "sampled": {
+                            "composite": {
+                                "size": composite_page_size,
+                                "sources": sources,
+                            },
+                            "aggs": {
+                                "latest": {
+                                    "top_hits": {
+                                        "size": 1,
+                                        "sort": [{"timestamp": {"order": "desc"}}],
+                                        "_source": source_fields if source_fields else True,
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+                if after_key:
+                    body["aggs"]["sampled"]["composite"]["after"] = after_key
 
-        if delta.total_seconds() == 0:
-            return docs
+                result = self.client.proxy_request(
+                    self.system_cluster_id,
+                    "POST",
+                    f"/{index_pattern}/_search",
+                    body,
+                )
 
-        sampled = []
-        last_time = None
+                sampled = result.get("aggregations", {}).get("sampled", {})
+                buckets = sampled.get("buckets", [])
+                if not buckets:
+                    break
 
-        for doc in docs:
-            ts_str = doc.get('timestamp')
-            if not ts_str:
-                sampled.append(doc)
-                continue
+                for bucket in buckets:
+                    hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
+                    if not hits:
+                        continue
+                    hit = hits[0]
+                    doc = {
+                        "_id": hit.get("_id"),
+                        **hit.get("_source", {}),
+                    }
+                    writer.write_doc(doc)
+                    total_exported += 1
 
-            try:
-                # 解析 ISO 格式时间
-                if isinstance(ts_str, str):
-                    ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                else:
-                    sampled.append(doc)
-                    continue
+                    if max_docs and total_exported >= max_docs:
+                        break
 
-                if last_time is None or (last_time - ts) >= delta:
-                    sampled.append(doc)
-                    last_time = ts
-            except Exception:
-                sampled.append(doc)
+                writer.flush()
+                if progress_callback:
+                    progress_callback(total_exported, 0)
 
-        return sampled
+                if max_docs and total_exported >= max_docs:
+                    break
 
-    def _ratio_sampling(self, docs: List[Dict], ratio: float) -> List[Dict]:
-        """按比例随机抽样"""
-        import random
-        return [doc for doc in docs if random.random() < ratio]
+                after_key = sampled.get("after_key")
+                if not after_key:
+                    break
+
+        return total_exported
 
     def export_metric_type(
         self,
@@ -635,16 +706,30 @@ class MetricsExporter:
                 if total > 0:
                     percent = min(100, current * 100 // total)
                     print(f"\r    [{metric_type}] 已导出 {current:,} / {total:,} ({percent}%)", end="", flush=True)
+                else:
+                    print(f"\r    [{metric_type}] 已导出 {current:,}", end="", flush=True)
 
-            count = self.export_with_scroll(
-                config["index_pattern"],
-                query,
-                output_file,
-                effective_batch_size,
-                max_docs,
-                progress_callback,
-                sampling,
-            )
+            if self._should_use_es_sampling(sampling):
+                count = self.export_with_es_sampling(
+                    config["index_pattern"],
+                    query,
+                    output_file,
+                    sampling,
+                    effective_batch_size,
+                    self._get_sampling_group_fields(metric_type, config),
+                    max_docs,
+                    progress_callback,
+                    source_fields,
+                )
+            else:
+                count = self.export_with_scroll(
+                    config["index_pattern"],
+                    query,
+                    output_file,
+                    effective_batch_size,
+                    max_docs,
+                    progress_callback,
+                )
 
             result.count = count
             result.file_path = os.path.basename(output_file)
