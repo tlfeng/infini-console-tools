@@ -47,6 +47,7 @@ Thumbs.db
 !config/*.md
 !README.md
 !LICENSE
+!metrics-exporter/DATA_GUIDE.md
 
 # Logs
 *.log
