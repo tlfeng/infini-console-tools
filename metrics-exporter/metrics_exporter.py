@@ -395,6 +395,49 @@ class MetricsExporter:
         }
         return query
 
+    def build_alert_query(
+        self,
+        alert_type: str,
+        time_range_hours: int,
+        source_fields: List[str] = None,
+    ) -> Dict:
+        """构建告警数据查询。
+
+        alert_history 使用 timestamp，alert_messages 使用 created 作为时间范围过滤。
+        alert_rules 不属于时序日志，保持全量导出。
+        """
+        # 告警规则是配置数据，不是时序事件，不做时间过滤
+        if alert_type == "alert_rules":
+            return self.build_all_docs_query(source_fields)
+
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(hours=time_range_hours)
+
+        # 优先使用不同告警类型的主时间字段
+        time_field = "timestamp" if alert_type == "alert_history" else "created"
+
+        return {
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "range": {
+                                time_field: {
+                                    "gte": start_time.isoformat(),
+                                    "lte": now.isoformat(),
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "sort": [
+                {time_field: {"order": "desc", "unmapped_type": "date"}},
+                {"_id": {"order": "asc"}},
+            ],
+            "_source": source_fields if source_fields else True,
+        }
+
     def _parse_hits(self, hits: List[Dict]) -> List[Dict]:
         """解析 hits 为统一格式文档"""
         return [
@@ -842,7 +885,7 @@ class MetricsExporter:
             # interval 抽样时，使用聚合预估实际写入的数据量
             if sampling and sampling.interval:
                 group_fields = self._get_sampling_group_fields(metric_type, config)
-                # 检测有效字段
+                # 检测有效字段（与 export_with_es_sampling 保持一致）
                 effective_group_fields = self._detect_valid_group_fields(
                     config["index_pattern"], query.get("query", {"match_all": {}}), group_fields
                 )
@@ -1013,6 +1056,7 @@ class MetricsExporter:
         alert_type: str,
         config: Dict,
         output_file: str,
+        time_range_hours: int,
         shard_size: int = 100000,
         batch_size: int = None,
         source_fields: List[str] = None,
@@ -1030,7 +1074,7 @@ class MetricsExporter:
 
         try:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
-            query = self.build_all_docs_query(source_fields)
+            query = self.build_alert_query(alert_type, time_range_hours, source_fields)
 
             count, file_paths = self.export_with_scroll(
                 config["index_pattern"],
@@ -1271,6 +1315,7 @@ class MetricsExporter:
                         alert_type,
                         config,
                         output_file_base,
+                        time_range_hours,
                         shard_size,
                         batch_size,
                         source_fields,
@@ -1554,13 +1599,13 @@ def main():
             print(f"      时间范围: {job.time_range_hours}h")
         return
 
-    # 从配置或命令行获取连接参数（命令行参数优先）
+    # 从配置或命令行获取连接参数
     if app_config:
-        console_url = args.console if args.console else app_config.global_config.console_url
-        username = args.username if args.username else app_config.global_config.username
-        password = args.password if args.password else app_config.global_config.password
-        timeout = args.timeout if args.timeout else app_config.global_config.timeout
-        insecure = args.insecure or app_config.global_config.insecure
+        console_url = app_config.global_config.console_url
+        username = app_config.global_config.username
+        password = app_config.global_config.password
+        timeout = app_config.global_config.timeout
+        insecure = app_config.global_config.insecure
     else:
         config, _ = load_and_merge_config(args)
         console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', 'http://localhost:9000')
