@@ -289,6 +289,25 @@ class MetricsExporter:
         self.parallel_jobs = parallel_jobs
 
     @staticmethod
+    def _mask_doc(value: Any) -> Any:
+        """递归脱敏文档中的IP地址，隐藏前两个octet (如 192.168.1.1 -> *.*.1.1)"""
+        import re
+        
+        if isinstance(value, str):
+            # 匹配并替换IPv4地址
+            ipv4_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+            def replace_ipv4(match):
+                parts = match.group(0).split('.')
+                return f"*.*.{parts[2]}.{parts[3]}" if len(parts) == 4 else match.group(0)
+            return re.sub(ipv4_pattern, replace_ipv4, value)
+        elif isinstance(value, dict):
+            return {k: MetricsExporter._mask_doc(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [MetricsExporter._mask_doc(item) for item in value]
+        else:
+            return value
+
+    @staticmethod
     def _slim_doc(doc: Dict, slim_config: SlimConfig) -> Dict:
         """
         精简文档，删除不必要的字段
@@ -528,10 +547,13 @@ class MetricsExporter:
         except Exception:
             pass
 
-    def _write_docs(self, writer, docs: List[Dict], slim_config: SlimConfig = None) -> None:
-        """写入文档列表，移除 sort 字段，可选精简数据"""
+    def _write_docs(self, writer, docs: List[Dict], slim_config: SlimConfig = None, mask_ip: bool = False) -> None:
+        """写入文档列表，移除 sort 字段，可选精简数据和脱敏IP"""
         for doc in docs:
             doc_copy = {k: v for k, v in doc.items() if k != "sort"}
+            # 应用IP脱敏
+            if mask_ip:
+                doc_copy = self._mask_doc(doc_copy)
             # 应用精简配置
             if slim_config and slim_config.enabled:
                 doc_copy = self._slim_doc(doc_copy, slim_config)
@@ -546,6 +568,7 @@ class MetricsExporter:
         shard_size: int = 100000,
         progress_callback=None,
         slim_config: SlimConfig = None,
+        mask_ip: bool = False,
     ) -> Tuple[int, List[str]]:
         """
         使用 scroll API 流式导出数据（支持自动分片）
@@ -556,6 +579,7 @@ class MetricsExporter:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
+            mask_ip: 是否脱敏IP地址
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -578,7 +602,7 @@ class MetricsExporter:
         # 使用分片写入器
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             # 写入第一批
-            self._write_docs(writer, first_batch, slim_config)
+            self._write_docs(writer, first_batch, slim_config, mask_ip)
             writer.flush()
             total_exported += len(first_batch)
 
@@ -617,7 +641,7 @@ class MetricsExporter:
                 if not batch:
                     break
 
-                self._write_docs(writer, batch, slim_config)
+                self._write_docs(writer, batch, slim_config, mask_ip)
                 writer.flush()
                 total_exported += len(batch)
 
@@ -735,6 +759,7 @@ class MetricsExporter:
         progress_callback=None,
         source_fields: List[str] = None,
         slim_config: SlimConfig = None,
+        mask_ip: bool = False,
     ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits）
@@ -744,6 +769,7 @@ class MetricsExporter:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
+            mask_ip: 是否脱敏IP地址
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -758,6 +784,7 @@ class MetricsExporter:
                 shard_size,
                 progress_callback,
                 slim_config,
+                mask_ip,
             )
 
         total_exported = 0
@@ -830,6 +857,9 @@ class MetricsExporter:
                         continue
                     hit = hits[0]
                     doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
+                    # 应用IP脱敏
+                    if mask_ip:
+                        doc = self._mask_doc(doc)
                     # 应用精简配置
                     if slim_config and slim_config.enabled:
                         doc = self._slim_doc(doc, slim_config)
@@ -973,6 +1003,7 @@ class MetricsExporter:
         source_fields: List[str] = None,
         sampling: SamplingConfig = None,
         slim_config: SlimConfig = None,
+        mask_ip: bool = False,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -980,6 +1011,7 @@ class MetricsExporter:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
+            mask_ip: 是否脱敏IP地址
         """
         result = ExportResult(metric_type, config["name"])
         start_time = time.time()
@@ -1023,6 +1055,7 @@ class MetricsExporter:
                     progress_callback,
                     source_fields,
                     slim_config,
+                    mask_ip,
                 )
             else:
                 count, file_paths = self.export_with_scroll(
@@ -1033,6 +1066,7 @@ class MetricsExporter:
                     shard_size,
                     progress_callback,
                     slim_config,
+                    mask_ip,
                 )
 
             result.count = count
@@ -1061,6 +1095,7 @@ class MetricsExporter:
         batch_size: int = None,
         source_fields: List[str] = None,
         slim_config: SlimConfig = None,
+        mask_ip: bool = False,
     ) -> ExportResult:
         """导出告警相关数据（支持自动分片）
 
@@ -1068,6 +1103,7 @@ class MetricsExporter:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
+            mask_ip: 是否脱敏IP地址
         """
         result = ExportResult(alert_type, config["name"])
         start_time = time.time()
@@ -1084,6 +1120,7 @@ class MetricsExporter:
                 shard_size,
                 self._make_progress_callback(alert_type),
                 slim_config,
+                mask_ip,
             )
 
             result.count = count
@@ -1175,12 +1212,14 @@ class MetricsExporter:
         parallel_jobs: int = None,
         sampling: SamplingConfig = None,
         slim_config: SlimConfig = None,
+        mask_ip: bool = False,
     ) -> Dict[str, Any]:
         """导出所有监控数据（支持并行和自动分片）
 
         Args:
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
+            mask_ip: 是否脱敏IP地址
         """
         # 如果 cluster_ids 是空列表（不是 None），说明指定了集群但匹配不到
         # 此时应该返回空结果，而不是导出所有集群的数据
@@ -1274,6 +1313,7 @@ class MetricsExporter:
                     source_fields,
                     sampling,
                     slim_config,
+                    mask_ip,
                 )
                 futures[future] = metric_type
 
@@ -1320,6 +1360,7 @@ class MetricsExporter:
                         batch_size,
                         source_fields,
                         slim_config,
+                        mask_ip,
                     )
                     futures[future] = alert_type
 
@@ -1564,6 +1605,11 @@ Environment Variables:
         action="store_true",
         help="精简数据：删除和排障无关的字段（_id, agent, metadata.category/datatype/name）和冗余的人类可读格式字段（store, estimated_size, limit_size）",
     )
+    parser.add_argument(
+        "--mask-ip",
+        action="store_true",
+        help="脱敏IP地址：隐藏前两个octet，例如 192.168.1.1 变为 *.*.1.1（适用于数据对外分享的隐私保护）",
+    )
 
     return parser.parse_args()
 
@@ -1715,6 +1761,9 @@ def main():
     if args.slim or config.get('slim', False):
         slim_config = SlimConfig(enabled=True)
 
+    # 解析IP脱敏配置
+    mask_ip = args.mask_ip or config.get('maskIp', False)
+
     # 导出数据
     summary = exporter.export_all(
         output_dir=output,
@@ -1727,6 +1776,7 @@ def main():
         source_fields=source_fields,
         parallel_jobs=parallel,
         slim_config=slim_config,
+        mask_ip=mask_ip,
     )
 
     exporter.print_summary(summary)

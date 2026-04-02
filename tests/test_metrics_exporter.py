@@ -742,5 +742,148 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2"])
 
 
+class TestIPMasking(unittest.TestCase):
+    """测试IP地址脱敏功能"""
+
+    def test_mask_simple_ipv4(self):
+        """脱敏简单IPv4地址"""
+        test_cases = [
+            ("192.168.1.1", "*.*.1.1"),
+            ("10.0.0.1", "*.*.0.1"),
+            ("172.16.254.1", "*.*.254.1"),
+            ("127.0.0.1", "*.*.0.1"),
+            ("8.8.8.8", "*.*.8.8"),
+            ("255.255.255.255", "*.*.255.255"),
+        ]
+        
+        for ip_input, expected in test_cases:
+            result = MetricsExporter._mask_doc(ip_input)
+            self.assertEqual(result, expected, f"脱敏 {ip_input} 失败")
+
+    def test_mask_multiple_ips_in_string(self):
+        """脱敏字符串中的多个IP地址"""
+        input_str = "IP is 192.168.1.1 and 10.0.0.1"
+        expected = "IP is *.*.1.1 and *.*.0.1"
+        result = MetricsExporter._mask_doc(input_str)
+        self.assertEqual(result, expected)
+
+    def test_mask_no_ip(self):
+        """对无IP的字符串不做改动"""
+        input_str = "No IP here, just text"
+        result = MetricsExporter._mask_doc(input_str)
+        self.assertEqual(result, input_str)
+
+    def test_mask_doc_with_nested_ips(self):
+        """脱敏嵌套文档中的IP地址"""
+        doc = {
+            "timestamp": "2026-04-02T10:00:00Z",
+            "node": {
+                "id": "node-1",
+                "ip": "192.168.1.1",
+                "name": "es-node-1"
+            },
+            "cluster": {
+                "id": "cluster-1",
+                "master": "10.0.0.1"
+            }
+        }
+        
+        result = MetricsExporter._mask_doc(doc)
+        
+        # 验证脱敏结果
+        self.assertEqual(result["node"]["ip"], "*.*.1.1")
+        self.assertEqual(result["cluster"]["master"], "*.*.0.1")
+        # 非IP字段不变
+        self.assertEqual(result["node"]["id"], "node-1")
+        self.assertEqual(result["timestamp"], "2026-04-02T10:00:00Z")
+
+    def test_mask_doc_with_array(self):
+        """脱敏数组中的IP地址"""
+        doc = {
+            "peers": ["192.168.1.1", "10.0.0.1", "172.16.0.1"],
+            "tags": ["ip:192.168.1.1", "host:es-node-1"]
+        }
+        
+        result = MetricsExporter._mask_doc(doc)
+        
+        # 验证数组元素被脱敏
+        self.assertEqual(result["peers"], ["*.*.1.1", "*.*.0.1", "*.*.0.1"])
+        self.assertEqual(result["tags"], ["ip:*.*.1.1", "host:es-node-1"])
+
+    def test_mask_doc_with_mixed_types(self):
+        """脱敏混合类型的文档"""
+        doc = {
+            "string_ip": "192.168.1.1",
+            "number": 42,
+            "float": 3.14,
+            "boolean": True,
+            "null_value": None,
+            "nested": {
+                "ip": "10.0.0.1",
+                "count": 100
+            },
+            "array": [1, 2, "192.168.100.200"]
+        }
+        
+        result = MetricsExporter._mask_doc(doc)
+        
+        # 访问IP字段的脱敏
+        self.assertEqual(result["string_ip"], "*.*.1.1")
+        self.assertEqual(result["nested"]["ip"], "*.*.0.1")
+        self.assertEqual(result["array"][2], "*.*.100.200")
+        
+        # 非string类型不变
+        self.assertEqual(result["number"], 42)
+        self.assertEqual(result["float"], 3.14)
+        self.assertEqual(result["boolean"], True)
+        self.assertIsNone(result["null_value"])
+        self.assertEqual(result["nested"]["count"], 100)
+
+    def test_mask_empty_string(self):
+        """脱敏空字符串"""
+        result = MetricsExporter._mask_doc("")
+        self.assertEqual(result, "")
+
+    def test_mask_empty_dict(self):
+        """脱敏空字典"""
+        result = MetricsExporter._mask_doc({})
+        self.assertEqual(result, {})
+
+    def test_mask_empty_list(self):
+        """脱敏空列表"""
+        result = MetricsExporter._mask_doc([])
+        self.assertEqual(result, [])
+
+    def test_mask_ip_in_json_string(self):
+        """脱敏JSON字符串中的IP（以字符串形式）"""
+        # 这个测试验证当JSON内容本身是字符串时的行为
+        doc = {
+            "config": '{"server": "192.168.1.1"}'
+        }
+        
+        result = MetricsExporter._mask_doc(doc)
+        
+        # 验证JSON字符串中的IP被脱敏
+        self.assertIn("*.*.1.1", result["config"])
+
+    def test_deeply_nested_structure(self):
+        """脱敏深层嵌套结构"""
+        doc = {
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "ip": "192.168.1.1",
+                        "peers": ["10.0.0.1", "10.0.0.2"]
+                    }
+                }
+            }
+        }
+        
+        result = MetricsExporter._mask_doc(doc)
+        
+        self.assertEqual(result["level1"]["level2"]["level3"]["ip"], "*.*.1.1")
+        self.assertEqual(result["level1"]["level2"]["level3"]["peers"], ["*.*.0.1", "*.*.0.2"])
+
+
 if __name__ == "__main__":
     unittest.main()

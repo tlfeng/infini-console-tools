@@ -181,6 +181,7 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 - **紧凑输出**：紧凑 JSON 格式，减少 IO 开销
 - **字段筛选**：支持只导出指定字段
 - **抽样模式**：支持时间间隔抽样和比例抽样
+- **数据脱敏**：支持 IP 地址脱敏保护隐私（隐藏前两个 octet）
 - **Job 配置**：支持配置文件定义多个导出任务
 - 实时进度显示
 
@@ -199,6 +200,8 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 --config FILE            配置文件路径
 --job NAME               指定执行的 job 名称
 --list-jobs              列出配置文件中的所有 jobs
+--slim                   精简数据：删除不必要的字段以减少数据量
+--mask-ip                脱敏IP地址：隐藏前两个octet，如 192.168.1.1 变为 *.*.1.1
 ```
 
 **使用示例：**
@@ -213,6 +216,10 @@ python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p
 # 只导出关键字段
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
   --fields timestamp,metadata.labels.cluster_id,payload.elasticsearch.node_stats.jvm
+
+# 导出数据并脱敏IP地址（用于数据对外分享）
+python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
+  --mask-ip --slim
 
 # 使用配置文件执行 job
 python metrics-exporter/metrics_exporter.py --config config.json --job "全量导出-一周"
