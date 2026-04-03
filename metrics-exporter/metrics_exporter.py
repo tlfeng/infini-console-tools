@@ -1052,90 +1052,81 @@ class MetricsExporter:
 
             return queries
 
-        def bucket_key_tuple(bucket_key: Dict[str, Any]) -> tuple:
-            return tuple(bucket_key.get(f"group_{i}") for i in range(len(effective_group_fields))) + (
-                bucket_key.get("time_bucket"),
-            )
-
-        # 并行路径：按时间窗口拆分查询并发拉取，再按 bucket key 合并，避免重复时间桶
+        # 并行路径：每个 worker 独立写文件，避免全局去重 map 长时间占用内存
         if parallel_degree and parallel_degree > 1:
             effective_slices = max(1, parallel_degree)
             worker_queries = _split_sampling_queries(query, effective_slices)
             if len(worker_queries) == 1 and effective_slices > 1:
                 print("    sampling 并行降级为单线程：未识别到可拆分的 timestamp 范围")
 
-            merge_lock = threading.Lock()
-            # key -> (sort_tuple, hit_id, hit)
-            merged_docs: Dict[tuple, tuple] = {}
+            progress_lock = threading.Lock()
+            per_worker_exported = [0] * len(worker_queries)
+            all_file_paths: List[str] = []
 
-            def run_sampling_slice(worker_query: Dict) -> None:
+            def _report_worker_progress(worker_id: int, current_count: int) -> None:
+                if not progress_callback:
+                    return
+                with progress_lock:
+                    per_worker_exported[worker_id] = current_count
+                    progress_callback(sum(per_worker_exported), 0)
+
+            def run_sampling_slice(worker_id: int, worker_query: Dict) -> Tuple[int, List[str]]:
                 local_after = None
+                local_count = 0
+                worker_output = f"{output_file}_worker{worker_id}"
 
-                while True:
-                    body = build_sampling_body(worker_query, local_after)
-                    result = self.client.proxy_request(
-                        self.system_cluster_id,
-                        "POST",
-                        f"/{index_pattern}/_search",
-                        body,
-                    )
+                with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
+                    while True:
+                        body = build_sampling_body(worker_query, local_after)
+                        result = self.client.proxy_request(
+                            self.system_cluster_id,
+                            "POST",
+                            f"/{index_pattern}/_search",
+                            body,
+                        )
 
-                    sampled = result.get("aggregations", {}).get("sampled", {})
-                    buckets = sampled.get("buckets", [])
-                    if not buckets:
-                        break
+                        sampled = result.get("aggregations", {}).get("sampled", {})
+                        buckets = sampled.get("buckets", [])
+                        if not buckets:
+                            break
 
-                    page_best: Dict[tuple, tuple] = {}
-                    for bucket in buckets:
-                        key_tuple = bucket_key_tuple(bucket.get("key", {}))
-                        hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
-                        if not hits:
-                            continue
-                        hit = hits[0]
+                        for bucket in buckets:
+                            hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
+                            if not hits:
+                                continue
+                            hit = hits[0]
+                            doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
+                            if mask_ip:
+                                doc = self._mask_doc(doc)
+                            if slim_config and slim_config.enabled:
+                                doc = self._slim_doc(doc, slim_config)
+                            writer.write_doc(doc)
+                            local_count += 1
 
-                        # 以 sort 为主键，_id 为兜底，确保冲突时有稳定决策
-                        sort_tuple = tuple(hit.get("sort") or [])
-                        hit_id = str(hit.get("_id") or "")
-                        existing = page_best.get(key_tuple)
-                        if existing is None or (sort_tuple, hit_id) > (existing[0], existing[1]):
-                            page_best[key_tuple] = (sort_tuple, hit_id, hit)
-                    unique_total = 0
-                    with merge_lock:
-                        for key_tuple, (sort_tuple, hit_id, hit) in page_best.items():
-                            current = merged_docs.get(key_tuple)
-                            if current is None or (sort_tuple, hit_id) > (current[0], current[1]):
-                                merged_docs[key_tuple] = (sort_tuple, hit_id, hit)
-                        unique_total = len(merged_docs)
+                        writer.flush()
+                        _report_worker_progress(worker_id, local_count)
 
-                    if progress_callback:
-                        # 并行 sampling 的进度口径统一为去重后的唯一 bucket 数
-                        progress_callback(unique_total, 0)
-                    local_after = sampled.get("after_key")
-                    if not local_after:
-                        break
+                        local_after = sampled.get("after_key")
+                        if not local_after:
+                            break
+
+                return local_count, writer.get_file_paths()
 
             with ThreadPoolExecutor(max_workers=len(worker_queries)) as executor:
-                futures = [executor.submit(run_sampling_slice, q) for q in worker_queries]
+                futures = {
+                    executor.submit(run_sampling_slice, worker_id, worker_query): worker_id
+                    for worker_id, worker_query in enumerate(worker_queries)
+                }
+
                 for future in as_completed(futures):
-                    future.result()
-
-            with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-                for key_tuple in sorted(merged_docs.keys()):
-                    _, _, hit = merged_docs[key_tuple]
-                    doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
-                    if mask_ip:
-                        doc = self._mask_doc(doc)
-                    if slim_config and slim_config.enabled:
-                        doc = self._slim_doc(doc, slim_config)
-                    writer.write_doc(doc)
-                    total_exported += 1
-
-                writer.flush()
+                    worker_count, worker_files = future.result()
+                    total_exported += worker_count
+                    all_file_paths.extend(worker_files)
 
             if progress_callback:
                 progress_callback(total_exported, 0)
 
-            return total_exported, writer.get_file_paths()
+            return total_exported, sorted(all_file_paths)
 
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             while True:

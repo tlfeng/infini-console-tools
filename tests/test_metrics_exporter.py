@@ -555,12 +555,10 @@ class TestScrollPagination(unittest.TestCase):
 class TestStratifiedSampling(unittest.TestCase):
     """测试 ES 端分层抽样导出"""
 
-    def test_sampling_parallel_deduplicates_same_bucket_with_equal_sort_by_id(self):
-        """同 bucket 且 sort 相同，使用 _id 稳定决策，仅保留一条"""
+    def test_sampling_parallel_writes_per_worker_files(self):
+        """sampling 并行应按 worker 分别写文件"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
-
-        agg_call_index = {"value": 0}
 
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
@@ -586,26 +584,29 @@ class TestStratifiedSampling(unittest.TestCase):
 
                 self.assertNotIn("slice", body)
 
-                same_bucket_key = {
-                    "group_0": "c1",
-                    "group_1": "n1",
-                    "time_bucket": 1712016000000,
-                }
+                # 根据拆分后的 timestamp 范围区分 worker 请求
+                ts_range = None
+                for c in body.get("query", {}).get("bool", {}).get("must", []):
+                    if "range" in c and "timestamp" in c["range"]:
+                        ts_range = c["range"]["timestamp"]
+                        break
 
-                # sort 完全一致，仅 _id 不同
-                agg_call_index["value"] += 1
-                if agg_call_index["value"] == 1:
+                if ts_range and "lt" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
                                 "buckets": [
                                     {
-                                        "key": same_bucket_key,
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016000000,
+                                        },
                                         "latest": {
                                             "hits": {
                                                 "hits": [
                                                     {
-                                                        "_id": "a-doc",
+                                                        "_id": "worker0-doc",
                                                         "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
                                                         "sort": [1712016000000],
                                                     }
@@ -618,18 +619,22 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if agg_call_index["value"] == 2:
+                if ts_range and "lte" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
                                 "buckets": [
                                     {
-                                        "key": same_bucket_key,
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016000000,
+                                        },
                                         "latest": {
                                             "hits": {
                                                 "hits": [
                                                     {
-                                                        "_id": "z-doc",
+                                                        "_id": "worker1-doc",
                                                         "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 2},
                                                         "sort": [1712016000000],
                                                     }
@@ -660,21 +665,22 @@ class TestStratifiedSampling(unittest.TestCase):
                 parallel_degree=2,
             )
 
-            self.assertEqual(result.count, 1)
+            self.assertEqual(result.count, 2)
+            self.assertTrue(any(f.startswith("test_worker0") for f in result.file_paths))
+            self.assertTrue(any(f.startswith("test_worker1") for f in result.file_paths))
 
-            output_file = f"{temp_base}.jsonl"
-            with open(output_file, 'r') as f:
-                data = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_worker0.jsonl", 'r') as f:
+                data0 = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_worker1.jsonl", 'r') as f:
+                data1 = [json.loads(line) for line in f.readlines()]
 
-            self.assertEqual(len(data), 1)
-            self.assertEqual(data[0]["_id"], "z-doc")
+            self.assertEqual([d["_id"] for d in data0], ["worker0-doc"])
+            self.assertEqual([d["_id"] for d in data1], ["worker1-doc"])
 
-    def test_sampling_parallel_deduplicates_same_bucket(self):
-        """并发 sampling 下若不同 slice 返回同一 bucket，应只保留最新一条"""
+    def test_sampling_parallel_same_bucket_keeps_worker_outputs(self):
+        """并发 sampling 下即便 bucket 相同，也按 worker 独立写文件"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
-
-        agg_call_index = {"value": 0}
 
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
@@ -700,15 +706,19 @@ class TestStratifiedSampling(unittest.TestCase):
 
                 self.assertNotIn("slice", body)
 
-                # 两个 slice 都返回同一个 bucket key，但 sort 不同
+                ts_range = None
+                for c in body.get("query", {}).get("bool", {}).get("must", []):
+                    if "range" in c and "timestamp" in c["range"]:
+                        ts_range = c["range"]["timestamp"]
+                        break
+
                 same_bucket_key = {
                     "group_0": "c1",
                     "group_1": "n1",
                     "time_bucket": 1712016000000,
                 }
 
-                agg_call_index["value"] += 1
-                if agg_call_index["value"] == 1:
+                if ts_range and "lt" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -732,7 +742,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if agg_call_index["value"] == 2:
+                if ts_range and "lte" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -774,14 +784,15 @@ class TestStratifiedSampling(unittest.TestCase):
                 parallel_degree=2,
             )
 
-            self.assertEqual(result.count, 1)
+            self.assertEqual(result.count, 2)
 
-            output_file = f"{temp_base}.jsonl"
-            with open(output_file, 'r') as f:
-                data = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_worker0.jsonl", 'r') as f:
+                data0 = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_worker1.jsonl", 'r') as f:
+                data1 = [json.loads(line) for line in f.readlines()]
 
-            self.assertEqual(len(data), 1)
-            self.assertEqual(data[0]["_id"], "newer-doc")
+            self.assertEqual([d["_id"] for d in data0], ["older-doc"])
+            self.assertEqual([d["_id"] for d in data1], ["newer-doc"])
 
     def test_sampling_path_supports_parallel_degree(self):
         """sampling 模式在 parallel_degree>1 时应走 sliced 查询并汇总"""
@@ -789,8 +800,6 @@ class TestStratifiedSampling(unittest.TestCase):
         exporter = MetricsExporter(mock_client, "system-id")
 
         calls = []
-
-        agg_call_index = {"value": 0}
 
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
@@ -822,9 +831,14 @@ class TestStratifiedSampling(unittest.TestCase):
 
                 self.assertNotIn("slice", body)
 
-                # 每个 slice 返回一个桶
-                agg_call_index["value"] += 1
-                if agg_call_index["value"] == 1:
+                ts_range = None
+                for c in body.get("query", {}).get("bool", {}).get("must", []):
+                    if "range" in c and "timestamp" in c["range"]:
+                        ts_range = c["range"]["timestamp"]
+                        break
+
+                # 每个 worker 返回一个桶
+                if ts_range and "lt" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -852,7 +866,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if agg_call_index["value"] == 2:
+                if ts_range and "lte" in ts_range:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -905,10 +919,15 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(len(sampled_calls), 2)
             self.assertTrue(all("slice" not in c[2] for c in sampled_calls))
 
-            output_file = f"{temp_base}.jsonl"
-            with open(output_file, 'r') as f:
-                data = [json.loads(line) for line in f.readlines()]
-            self.assertEqual(sorted([d["_id"] for d in data]), ["doc-s0", "doc-s1"])
+            self.assertTrue(any(f.startswith("test_worker0") for f in result.file_paths))
+            self.assertTrue(any(f.startswith("test_worker1") for f in result.file_paths))
+
+            with open(f"{temp_base}_worker0.jsonl", 'r') as f:
+                data0 = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_worker1.jsonl", 'r') as f:
+                data1 = [json.loads(line) for line in f.readlines()]
+            self.assertEqual([d["_id"] for d in data0], ["doc-s0"])
+            self.assertEqual([d["_id"] for d in data1], ["doc-s1"])
 
     def test_cluster_stats_interval_sampling_uses_es_aggregations(self):
         """所有指标的 interval 抽样都应走 ES 聚合"""
