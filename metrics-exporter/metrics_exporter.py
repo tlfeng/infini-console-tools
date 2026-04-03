@@ -903,6 +903,7 @@ class MetricsExporter:
 
         try:
             # 先获取原始文档数
+            print(f"    正在查询原始数据量...")
             count_body = {"query": query.get("query", {"match_all": {}})}
             count_result = self.client.proxy_request(
                 self.system_cluster_id,
@@ -911,9 +912,11 @@ class MetricsExporter:
                 count_body,
             )
             total_docs = count_result.get("count", 0)
+            print(f"    原始数据量: {total_docs:,} 条")
 
             # interval 抽样时，使用聚合预估实际写入的数据量
             if sampling and sampling.interval:
+                print(f"    正在预估抽样数据量 (interval={sampling.interval})...")
                 group_fields = self._get_sampling_group_fields(metric_type, config)
                 # 检测有效字段（与 export_with_es_sampling 保持一致）
                 effective_group_fields = self._detect_valid_group_fields(
@@ -940,6 +943,7 @@ class MetricsExporter:
                 total_buckets = 0
                 after_key = None
                 composite_page_size = 1000
+                page_count = 0
 
                 while True:
                     body = {
@@ -967,10 +971,19 @@ class MetricsExporter:
 
                     buckets = result.get("aggregations", {}).get("sampled", {}).get("buckets", [])
                     total_buckets += len(buckets)
+                    page_count += 1
+
+                    # 每处理 10 页显示一次进度
+                    if page_count % 10 == 0:
+                        print(f"\r    已遍历 {total_buckets:,} 个时间桶...", end="", flush=True)
 
                     after_key = result.get("aggregations", {}).get("sampled", {}).get("after_key")
                     if not after_key or not buckets:
                         break
+
+                # 换行，避免进度信息被覆盖
+                if page_count >= 10:
+                    print()
 
                 return (total_docs, total_buckets)
             else:
@@ -1004,6 +1017,7 @@ class MetricsExporter:
         sampling: SamplingConfig = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        skip_estimation: bool = False,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -1012,6 +1026,7 @@ class MetricsExporter:
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
+            skip_estimation: 跳过数据量预估，加速启动
         """
         result = ExportResult(metric_type, config["name"])
         start_time = time.time()
@@ -1020,18 +1035,22 @@ class MetricsExporter:
             # 使用配置的批次大小或默认值
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
 
-            # 首先预估数据量
-            total_docs, sampled_docs = self.estimate_export_count(
-                metric_type, config, time_range_hours, cluster_id_filter, cluster_ids, sampling
-            )
-            if total_docs >= 0:
-                # 判断是否有抽样
-                if sampling and sampling.interval and total_docs != sampled_docs:
-                    print(f"    原始数据量: {total_docs:,} 条，抽样后: {sampled_docs:,} 条")
-                else:
-                    print(f"    预估需要导出约 {total_docs:,} 条记录")
-                if sampled_docs > shard_size:
-                    print(f"    将自动分文件存储 (每文件最多 {shard_size:,} 条)")
+            # 预估数据量（可选）
+            total_docs, sampled_docs = -1, -1
+            if not skip_estimation:
+                total_docs, sampled_docs = self.estimate_export_count(
+                    metric_type, config, time_range_hours, cluster_id_filter, cluster_ids, sampling
+                )
+                if total_docs >= 0:
+                    # 判断是否有抽样
+                    if sampling and sampling.interval and total_docs != sampled_docs:
+                        print(f"    原始数据量: {total_docs:,} 条，抽样后: {sampled_docs:,} 条")
+                    else:
+                        print(f"    预估需要导出约 {total_docs:,} 条记录")
+                    if sampled_docs > shard_size:
+                        print(f"    将自动分文件存储 (每文件最多 {shard_size:,} 条)")
+            else:
+                print(f"    已跳过数据量预估，直接开始导出...")
 
             query = self.build_metrics_query(
                 config["filter_template"],
@@ -1213,6 +1232,7 @@ class MetricsExporter:
         sampling: SamplingConfig = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        skip_estimation: bool = False,
     ) -> Dict[str, Any]:
         """导出所有监控数据（支持并行和自动分片）
 
@@ -1314,6 +1334,7 @@ class MetricsExporter:
                     sampling,
                     slim_config,
                     mask_ip,
+                    skip_estimation,
                 )
                 futures[future] = metric_type
 
@@ -1435,6 +1456,7 @@ class MetricsExporter:
             sampling=job.sampling,
             slim_config=job.slim,
             mask_ip=job.mask_ip,
+            skip_estimation=job.execution.skip_estimation,
         )
 
     def _print_type_summary(self, title: str, types_data: Dict, totals: list) -> None:

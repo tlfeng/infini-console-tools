@@ -477,6 +477,24 @@ class TestStratifiedSampling(unittest.TestCase):
                 return {"count": 100}
 
             if method == "POST" and path == "/.infini_metrics/_search":
+                # _detect_valid_group_fields 会调用 _search（size=1，无聚合）
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
                 # 检查是否是 estimate_export_count 的聚合查询（没有 latest 子聚合）
                 sampled_agg = body.get("aggs", {}).get("sampled", {})
                 if "aggs" not in sampled_agg:
@@ -528,8 +546,8 @@ class TestStratifiedSampling(unittest.TestCase):
             )
 
             self.assertEqual(result.count, 1)
-            # 1次 _count + 1次 estimate 聚合 + 1次实际导出聚合
-            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 2)
+            # 1次 _count + 1次 _detect_valid_group_fields(预估) + 1次 estimate 聚合 + 1次 _detect_valid_group_fields(导出) + 1次实际导出聚合
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 4)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
     def test_node_stats_interval_sampling_uses_es_aggregations(self):
@@ -548,6 +566,25 @@ class TestStratifiedSampling(unittest.TestCase):
                 return {"count": 100}
 
             if method == "POST" and path == "/.infini_metrics/_search":
+                # _detect_valid_group_fields 会调用 _search（size=1，无聚合）
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
                 sampled_agg = body.get("aggs", {}).get("sampled", {})
 
                 # 预估阶段只有 composite，没有 aggs 子聚合
@@ -636,9 +673,9 @@ class TestStratifiedSampling(unittest.TestCase):
 
             self.assertEqual(result.count, 3)
 
-            # 1次 _count + 1次 estimate 聚合 + 2次实际导出聚合（有 after_key）
+            # 1次 _count + 1次 _detect_valid_group_fields(预估) + 1次 estimate 聚合 + 1次 _detect_valid_group_fields(导出) + 2次实际导出聚合（有 after_key）
             search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
-            self.assertEqual(len(search_calls), 3)
+            self.assertEqual(len(search_calls), 5)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
             # 读取生成的 jsonl 文件
@@ -740,6 +777,189 @@ class TestStratifiedSampling(unittest.TestCase):
                 lines = f.readlines()
             data = [json.loads(line) for line in lines]
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2"])
+
+
+class TestSkipEstimation(unittest.TestCase):
+    """测试跳过预估功能"""
+
+    def test_skip_estimation_skips_count_query(self):
+        """skip_estimation=True 时跳过 _count 查询"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            calls.append((method, path))
+            if method == "POST" and path == "/.infini_metrics/_search?scroll=5m":
+                return {
+                    "_scroll_id": "scroll-1",
+                    "hits": {
+                        "total": {"value": 1},
+                        "hits": [
+                            {
+                                "_id": "doc-1",
+                                "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                "sort": [1, "doc-1"],
+                            }
+                        ],
+                    },
+                }
+            if method == "POST" and path == "/_search/scroll":
+                return {"_scroll_id": "scroll-2", "hits": {"hits": []}}
+            if method == "DELETE":
+                return {"succeeded": True}
+            self.fail(f"Unexpected call: {method} {path}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                skip_estimation=True,
+            )
+
+            self.assertEqual(result.count, 1)
+            # 不应该有 _count 调用
+            self.assertFalse(any(c[1] == "/.infini_metrics/_count" for c in calls))
+
+    def test_skip_estimation_false_calls_count_query(self):
+        """skip_estimation=False 时执行 _count 查询"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            calls.append((method, path))
+            if method == "POST" and path == "/.infini_metrics/_count":
+                return {"count": 100}
+            if method == "POST" and path == "/.infini_metrics/_search?scroll=5m":
+                return {
+                    "_scroll_id": "scroll-1",
+                    "hits": {
+                        "total": {"value": 1},
+                        "hits": [
+                            {
+                                "_id": "doc-1",
+                                "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                "sort": [1, "doc-1"],
+                            }
+                        ],
+                    },
+                }
+            if method == "POST" and path == "/_search/scroll":
+                return {"_scroll_id": "scroll-2", "hits": {"hits": []}}
+            if method == "DELETE":
+                return {"succeeded": True}
+            self.fail(f"Unexpected call: {method} {path}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                skip_estimation=False,
+            )
+
+            self.assertEqual(result.count, 1)
+            # 应该有 _count 调用
+            self.assertTrue(any(c[1] == "/.infini_metrics/_count" for c in calls))
+
+    def test_skip_estimation_with_sampling_skips_composite_aggregation(self):
+        """skip_estimation=True 时跳过抽样预估的 composite aggregation"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                sampled_agg = body.get("aggs", {}).get("sampled", {})
+
+                # _detect_valid_group_fields 会调用 _search（size=1，无聚合）
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                # 实际导出的聚合（有 latest 子聚合）
+                if "aggs" in sampled_agg:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-1",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                ],
+                                "after_key": None,
+                            }
+                        }
+                    }
+
+                # 预估阶段的 composite aggregation（不应该被调用）
+                self.fail("预估阶段的 composite aggregation 不应该被调用")
+
+            if method == "POST" and path == "/.infini_metrics/_count":
+                self.fail("_count 查询不应该被调用")
+
+            self.fail(f"Unexpected call: {method} {path}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+            )
+
+            self.assertEqual(result.count, 1)
+            # 不应该有 _count 调用
+            self.assertFalse(any(c[1] == "/.infini_metrics/_count" for c in calls))
+            # 应该有两次 _search：一次是 _detect_valid_group_fields，一次是实际导出
+            search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
+            self.assertEqual(len(search_calls), 2)
 
 
 class TestIPMasking(unittest.TestCase):

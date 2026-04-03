@@ -206,6 +206,7 @@ class ExecutionConfig:
     scroll_keepalive: str = "5m"
     max_retries: int = 3
     retry_delay: int = 5  # 秒
+    skip_estimation: bool = False  # 跳过数据量预估（加速启动）
 
     @classmethod
     def from_dict(cls, data: Optional[Dict]) -> 'ExecutionConfig':
@@ -218,7 +219,8 @@ class ExecutionConfig:
             batch_size=data.get('batchSize'),
             scroll_keepalive=data.get('scrollKeepalive', '5m'),
             max_retries=data.get('maxRetries', 3),
-            retry_delay=data.get('retryDelay', 5)
+            retry_delay=data.get('retryDelay', 5),
+            skip_estimation=data.get('skipEstimation', False)
         )
 
 

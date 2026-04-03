@@ -269,6 +269,7 @@ class TestExecutionConfig(unittest.TestCase):
         self.assertEqual(e.parallel_metrics, 2)
         self.assertEqual(e.scroll_keepalive, "5m")
         self.assertEqual(e.max_retries, 3)
+        self.assertFalse(e.skip_estimation)
 
     def test_from_dict(self):
         """从字典解析"""
@@ -280,6 +281,21 @@ class TestExecutionConfig(unittest.TestCase):
         self.assertEqual(e.parallel_metrics, 4)
         self.assertEqual(e.batch_size, 5000)
         self.assertEqual(e.scroll_keepalive, "30s")
+
+    def test_skip_estimation_default(self):
+        """skip_estimation 默认为 False"""
+        e = ExecutionConfig.from_dict({})
+        self.assertFalse(e.skip_estimation)
+
+    def test_skip_estimation_true(self):
+        """skip_estimation 设为 True"""
+        e = ExecutionConfig.from_dict({"skipEstimation": True})
+        self.assertTrue(e.skip_estimation)
+
+    def test_skip_estimation_false(self):
+        """skip_estimation 显式设为 False"""
+        e = ExecutionConfig.from_dict({"skipEstimation": False})
+        self.assertFalse(e.skip_estimation)
 
 
 class TestMetricsJobConfig(unittest.TestCase):
