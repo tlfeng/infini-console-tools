@@ -555,6 +555,92 @@ class TestScrollPagination(unittest.TestCase):
 class TestStratifiedSampling(unittest.TestCase):
     """测试 ES 端分层抽样导出"""
 
+    def test_sampling_parallel_splits_on_interval_boundaries(self):
+        """并行 sampling 的 worker 时间范围应对齐到 fixed_interval 桶边界"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        sampled_ranges = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                ts_range = None
+                for clause in body.get("query", {}).get("bool", {}).get("must", []):
+                    if "range" in clause and "timestamp" in clause["range"]:
+                        ts_range = clause["range"]["timestamp"]
+                        break
+
+                self.assertIsNotNone(ts_range)
+                sampled_ranges.append(ts_range)
+
+                return {"aggregations": {"sampled": {"buckets": []}}}
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        exporter.export_with_es_sampling(
+            index_pattern=".infini_metrics",
+            query={
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"query_string": {"query": 'metadata.name:"node_stats"'}},
+                            {
+                                "range": {
+                                    "timestamp": {
+                                        "gte": "2026-04-02T00:07:30+00:00",
+                                        "lte": "2026-04-02T00:52:30+00:00",
+                                    }
+                                }
+                            },
+                        ]
+                    }
+                },
+                "sort": [{"timestamp": {"order": "desc"}}],
+                "_source": True,
+            },
+            output_file="/tmp/unused-test-output",
+            sampling=SamplingConfig(mode="sampling", interval="15m"),
+            batch_size=3000,
+            group_fields=["metadata.labels.cluster_id", "metadata.labels.node_id"],
+            parallel_degree=2,
+        )
+
+        # 第一次是探测字段，后面两个是 worker 查询
+        worker_ranges = sampled_ranges[-2:]
+        self.assertEqual(len(worker_ranges), 2)
+
+        actual_ranges = {
+            tuple(sorted(r.items()))
+            for r in worker_ranges
+        }
+        expected_ranges = {
+            tuple(sorted({"gte": "2026-04-02T00:07:30+00:00", "lt": "2026-04-02T00:30:00+00:00"}.items())),
+            tuple(sorted({"gte": "2026-04-02T00:30:00+00:00", "lte": "2026-04-02T00:52:30+00:00"}.items())),
+        }
+        self.assertEqual(actual_ranges, expected_ranges)
+
     def test_sampling_parallel_writes_per_worker_files(self):
         """sampling 并行应按 worker 分别写文件"""
         mock_client = MagicMock()

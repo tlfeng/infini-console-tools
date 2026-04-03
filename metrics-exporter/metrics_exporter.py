@@ -25,19 +25,21 @@ import copy
 import getpass
 import json
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
 from common.config import (
     add_common_args, get_config_value,
-    AppConfig, MetricsJobConfig, ConfigValidationError
+    AppConfig, MetricsJobConfig, ConfigValidationError,
+    SamplingConfig, SlimConfig,
 )
 
 
@@ -997,8 +999,24 @@ class MetricsExporter:
                 body["aggs"]["sampled"]["composite"]["after"] = after
             return body
 
+        def _parse_fixed_interval_to_ms(interval: str) -> Optional[int]:
+            match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
+            if not match:
+                return None
+
+            value = int(match.group(1))
+            unit = match.group(2)
+            multipliers = {
+                "ms": 1,
+                "s": 1000,
+                "m": 60 * 1000,
+                "h": 60 * 60 * 1000,
+                "d": 24 * 60 * 60 * 1000,
+            }
+            return value * multipliers[unit]
+
         def _split_sampling_queries(base_query: Dict, parts: int) -> List[Dict]:
-            """按 timestamp 时间窗口拆分查询，用于 sampling 并行。"""
+            """按 fixed_interval 桶边界拆分时间范围，避免跨 worker 重复 time_bucket。"""
             if parts <= 1:
                 return [base_query]
 
@@ -1023,14 +1041,36 @@ class MetricsExporter:
             except Exception:
                 return [base_query]
 
-            total_seconds = (end_dt - start_dt).total_seconds()
-            if total_seconds <= 0:
+            start_ms = int(start_dt.timestamp() * 1000)
+            end_ms = int(end_dt.timestamp() * 1000)
+            if end_ms < start_ms:
                 return [base_query]
 
+            interval_ms = _parse_fixed_interval_to_ms(sampling_interval)
+            if not interval_ms or interval_ms <= 0:
+                return [base_query]
+
+            first_bucket_ms = (start_ms // interval_ms) * interval_ms
+            last_bucket_ms = (end_ms // interval_ms) * interval_ms
+            bucket_count = ((last_bucket_ms - first_bucket_ms) // interval_ms) + 1
+            if bucket_count <= 1:
+                return [base_query]
+
+            worker_count = min(parts, bucket_count)
+            base_buckets_per_worker = bucket_count // worker_count
+            remainder = bucket_count % worker_count
+
             queries: List[Dict] = []
-            for i in range(parts):
-                part_start = start_dt + (end_dt - start_dt) * (i / parts)
-                part_end = start_dt + (end_dt - start_dt) * ((i + 1) / parts)
+            bucket_offset = 0
+            for i in range(worker_count):
+                worker_bucket_count = base_buckets_per_worker + (1 if i < remainder else 0)
+                worker_bucket_start_ms = first_bucket_ms + bucket_offset * interval_ms
+                worker_bucket_end_ms = worker_bucket_start_ms + worker_bucket_count * interval_ms
+                bucket_offset += worker_bucket_count
+
+                worker_start_ms = start_ms if i == 0 else worker_bucket_start_ms
+                worker_end_exclusive_ms = worker_bucket_end_ms
+                worker_end_inclusive_ms = end_ms if i == worker_count - 1 else None
 
                 q = copy.deepcopy(base_query)
                 q_must = q.get("query", {}).get("bool", {}).get("must", [])
@@ -1038,12 +1078,12 @@ class MetricsExporter:
                     if isinstance(clause, dict) and "range" in clause and "timestamp" in clause["range"]:
                         original = clause["range"]["timestamp"]
                         new_range = dict(original)
-                        new_range["gte"] = part_start.isoformat()
-                        if i == parts - 1:
-                            new_range["lte"] = part_end.isoformat()
+                        new_range["gte"] = datetime.fromtimestamp(worker_start_ms / 1000, timezone.utc).isoformat()
+                        if i == worker_count - 1:
+                            new_range["lte"] = datetime.fromtimestamp(worker_end_inclusive_ms / 1000, timezone.utc).isoformat()
                             new_range.pop("lt", None)
                         else:
-                            new_range["lt"] = part_end.isoformat()
+                            new_range["lt"] = datetime.fromtimestamp(worker_end_exclusive_ms / 1000, timezone.utc).isoformat()
                             new_range.pop("lte", None)
                         clause["range"]["timestamp"] = new_range
                         break
