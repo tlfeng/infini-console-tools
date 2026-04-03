@@ -863,6 +863,7 @@ class MetricsExporter:
         source_fields: List[str] = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        parallel_degree: int = 1,
     ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits）
@@ -888,6 +889,7 @@ class MetricsExporter:
                 progress_callback,
                 slim_config,
                 mask_ip,
+                parallel_degree,
             )
 
         total_exported = 0
@@ -915,33 +917,131 @@ class MetricsExporter:
             }
         )
 
+        def build_sampling_body(after: Dict = None, slice_id: int = None, total_slices: int = 1) -> Dict[str, Any]:
+            body = {
+                "size": 0,
+                "track_total_hits": False,
+                "query": query.get("query", {"match_all": {}}),
+                "aggs": {
+                    "sampled": {
+                        "composite": {
+                            "size": composite_page_size,
+                            "sources": sources,
+                        },
+                        "aggs": {
+                            "latest": {
+                                "top_hits": {
+                                    "size": 1,
+                                    "sort": [
+                                        {"timestamp": {"order": "desc"}},
+                                        {"_id": {"order": "desc"}},
+                                    ],
+                                    "_source": source_fields if source_fields else True,
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+            if after:
+                body["aggs"]["sampled"]["composite"]["after"] = after
+            if total_slices > 1 and slice_id is not None:
+                body["slice"] = {"id": slice_id, "max": total_slices}
+            return body
+
+        def bucket_key_tuple(bucket_key: Dict[str, Any]) -> tuple:
+            return tuple(bucket_key.get(f"group_{i}") for i in range(len(effective_group_fields))) + (
+                bucket_key.get("time_bucket"),
+            )
+
+        # 并行路径：按 sliced query 并发拉取后按 bucket key 合并，避免重复时间桶
+        if parallel_degree and parallel_degree > 1:
+            effective_slices = max(1, parallel_degree)
+            merge_lock = threading.Lock()
+            progress_lock = threading.Lock()
+            per_slice_progress = [0] * effective_slices
+            # key -> (sort_tuple, hit_id, hit)
+            merged_docs: Dict[tuple, tuple] = {}
+
+            def update_progress(slice_id: int, delta_count: int):
+                if delta_count <= 0:
+                    return
+                with progress_lock:
+                    per_slice_progress[slice_id] += delta_count
+                    if progress_callback:
+                        progress_callback(sum(per_slice_progress), 0)
+
+            def run_sampling_slice(slice_id: int) -> None:
+                local_after = None
+
+                while True:
+                    body = build_sampling_body(local_after, slice_id, effective_slices)
+                    result = self.client.proxy_request(
+                        self.system_cluster_id,
+                        "POST",
+                        f"/{index_pattern}/_search",
+                        body,
+                    )
+
+                    sampled = result.get("aggregations", {}).get("sampled", {})
+                    buckets = sampled.get("buckets", [])
+                    if not buckets:
+                        break
+
+                    page_docs = 0
+                    page_best: Dict[tuple, tuple] = {}
+                    for bucket in buckets:
+                        key_tuple = bucket_key_tuple(bucket.get("key", {}))
+                        hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
+                        if not hits:
+                            continue
+                        hit = hits[0]
+
+                        # 以 sort 为主键，_id 为兜底，确保冲突时有稳定决策
+                        sort_tuple = tuple(hit.get("sort") or [])
+                        hit_id = str(hit.get("_id") or "")
+                        existing = page_best.get(key_tuple)
+                        if existing is None or (sort_tuple, hit_id) > (existing[0], existing[1]):
+                            page_best[key_tuple] = (sort_tuple, hit_id, hit)
+                        page_docs += 1
+
+                    with merge_lock:
+                        for key_tuple, (sort_tuple, hit_id, hit) in page_best.items():
+                            current = merged_docs.get(key_tuple)
+                            if current is None or (sort_tuple, hit_id) > (current[0], current[1]):
+                                merged_docs[key_tuple] = (sort_tuple, hit_id, hit)
+
+                    update_progress(slice_id, page_docs)
+                    local_after = sampled.get("after_key")
+                    if not local_after:
+                        break
+
+            with ThreadPoolExecutor(max_workers=effective_slices) as executor:
+                futures = [executor.submit(run_sampling_slice, i) for i in range(effective_slices)]
+                for future in as_completed(futures):
+                    future.result()
+
+            with ShardedJSONLinesWriter(output_file, shard_size) as writer:
+                for key_tuple in sorted(merged_docs.keys()):
+                    _, _, hit = merged_docs[key_tuple]
+                    doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
+                    if mask_ip:
+                        doc = self._mask_doc(doc)
+                    if slim_config and slim_config.enabled:
+                        doc = self._slim_doc(doc, slim_config)
+                    writer.write_doc(doc)
+                    total_exported += 1
+
+                writer.flush()
+
+            if progress_callback:
+                progress_callback(total_exported, 0)
+
+            return total_exported, writer.get_file_paths()
+
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             while True:
-                body = {
-                    "size": 0,
-                    "track_total_hits": False,
-                    "query": query.get("query", {"match_all": {}}),
-                    "aggs": {
-                        "sampled": {
-                            "composite": {
-                                "size": composite_page_size,
-                                "sources": sources,
-                            },
-                            "aggs": {
-                                "latest": {
-                                    "top_hits": {
-                                        "size": 1,
-                                        "sort": [{"timestamp": {"order": "desc"}}],
-                                        "_source": source_fields if source_fields else True,
-                                    }
-                                }
-                            },
-                        }
-                    },
-                }
-                if after_key:
-                    body["aggs"]["sampled"]["composite"]["after"] = after_key
-
+                body = build_sampling_body(after_key)
                 result = self.client.proxy_request(
                     self.system_cluster_id,
                     "POST",
@@ -1165,6 +1265,11 @@ class MetricsExporter:
             )
 
             progress_callback = self._make_progress_callback(metric_type)
+            metric_parallel_degree = (
+                max(1, parallel_degree)
+                if metric_type in {"node_stats", "index_stats", "shard_stats"}
+                else 1
+            )
 
             if self._should_use_es_sampling(sampling):
                 count, file_paths = self.export_with_es_sampling(
@@ -1179,14 +1284,9 @@ class MetricsExporter:
                     source_fields,
                     slim_config,
                     mask_ip,
+                    metric_parallel_degree,
                 )
             else:
-                # 单指标并行仅对大体量 stats 指标开启，避免小指标引入额外调度开销
-                metric_parallel_degree = (
-                    max(1, parallel_degree)
-                    if metric_type in {"node_stats", "index_stats", "shard_stats"}
-                    else 1
-                )
                 count, file_paths = self.export_with_scroll(
                     config["index_pattern"],
                     query,

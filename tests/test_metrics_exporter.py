@@ -539,6 +539,356 @@ class TestScrollPagination(unittest.TestCase):
 class TestStratifiedSampling(unittest.TestCase):
     """测试 ES 端分层抽样导出"""
 
+    def test_sampling_parallel_deduplicates_same_bucket_with_equal_sort_by_id(self):
+        """同 bucket 且 sort 相同，使用 _id 稳定决策，仅保留一条"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                slice_info = body.get("slice")
+                self.assertIsNotNone(slice_info)
+
+                same_bucket_key = {
+                    "group_0": "c1",
+                    "group_1": "n1",
+                    "time_bucket": 1712016000000,
+                }
+
+                # sort 完全一致，仅 _id 不同
+                if slice_info.get("id") == 0:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": same_bucket_key,
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "a-doc",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                        "sort": [1712016000000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+                if slice_info.get("id") == 1:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": same_bucket_key,
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "z-doc",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 2},
+                                                        "sort": [1712016000000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+                parallel_degree=2,
+            )
+
+            self.assertEqual(result.count, 1)
+
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                data = [json.loads(line) for line in f.readlines()]
+
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["_id"], "z-doc")
+
+    def test_sampling_parallel_deduplicates_same_bucket(self):
+        """并发 sampling 下若不同 slice 返回同一 bucket，应只保留最新一条"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                slice_info = body.get("slice")
+                self.assertIsNotNone(slice_info)
+                self.assertEqual(slice_info.get("max"), 2)
+
+                # 两个 slice 都返回同一个 bucket key，但 sort 不同
+                same_bucket_key = {
+                    "group_0": "c1",
+                    "group_1": "n1",
+                    "time_bucket": 1712016000000,
+                }
+
+                if slice_info.get("id") == 0:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": same_bucket_key,
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "older-doc",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                        "sort": [1712016000000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+                if slice_info.get("id") == 1:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": same_bucket_key,
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "newer-doc",
+                                                        "_source": {"timestamp": "2026-04-02T00:05:00Z", "v": 2},
+                                                        "sort": [1712016300000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+                parallel_degree=2,
+            )
+
+            self.assertEqual(result.count, 1)
+
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                data = [json.loads(line) for line in f.readlines()]
+
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["_id"], "newer-doc")
+
+    def test_sampling_path_supports_parallel_degree(self):
+        """sampling 模式在 parallel_degree>1 时应走 sliced 查询并汇总"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        calls = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            calls.append((method, path, body))
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                # _detect_valid_group_fields
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                sampled_agg = body.get("aggs", {}).get("sampled", {})
+                if not sampled_agg:
+                    self.fail(f"Unexpected _search body: {body}")
+
+                slice_info = body.get("slice")
+                self.assertIsNotNone(slice_info)
+                self.assertEqual(slice_info.get("max"), 2)
+
+                # 每个 slice 返回一个桶
+                if slice_info.get("id") == 0:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016000000,
+                                        },
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-s0",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
+                                                        "sort": [1712016000000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+                if slice_info.get("id") == 1:
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n2",
+                                            "time_bucket": 1712016000000,
+                                        },
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-s1",
+                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 2},
+                                                        "sort": [1712016000000],
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+                parallel_degree=2,
+            )
+
+            self.assertEqual(result.count, 2)
+
+            search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
+            slice_calls = [c for c in search_calls if c[2].get("slice")]
+            self.assertEqual(len(slice_calls), 2)
+
+            output_file = f"{temp_base}.jsonl"
+            with open(output_file, 'r') as f:
+                data = [json.loads(line) for line in f.readlines()]
+            self.assertEqual(sorted([d["_id"] for d in data]), ["doc-s0", "doc-s1"])
+
     def test_cluster_stats_interval_sampling_uses_es_aggregations(self):
         """所有指标的 interval 抽样都应走 ES 聚合"""
         mock_client = MagicMock()
