@@ -4,8 +4,7 @@
 es_query_report.py 单元测试
 """
 
-import json
-import pytest
+import unittest
 from pathlib import Path
 import sys
 
@@ -25,24 +24,24 @@ from es_query_report import (
 )
 
 
-class TestIsMsearchPath:
+class TestIsMsearchPath(unittest.TestCase):
     """测试 is_msearch_path 函数"""
 
     def test_msearch_path(self):
-        assert is_msearch_path("/_msearch") is True
-        assert is_msearch_path("_msearch") is True
-        assert is_msearch_path("index/_msearch") is True
+        self.assertTrue(is_msearch_path("/_msearch"))
+        self.assertTrue(is_msearch_path("_msearch"))
+        self.assertTrue(is_msearch_path("index/_msearch"))
 
     def test_non_msearch_path(self):
-        assert is_msearch_path("/_search") is False
-        assert is_msearch_path("index/_search") is False
-        assert is_msearch_path("_cluster/health") is False
+        self.assertFalse(is_msearch_path("/_search"))
+        self.assertFalse(is_msearch_path("index/_search"))
+        self.assertFalse(is_msearch_path("_cluster/health"))
 
     def test_msearch_with_params(self):
-        assert is_msearch_path("/_msearch?timeout=1s") is True
+        self.assertTrue(is_msearch_path("/_msearch?timeout=1s"))
 
 
-class TestParseRequests:
+class TestParseRequests(unittest.TestCase):
     """测试 parse_requests 函数"""
 
     def test_single_request(self):
@@ -51,11 +50,11 @@ GET index/_search
 {"query": {"match_all": {}}}
 """
         cases = parse_requests(text)
-        assert len(cases) == 1
-        assert cases[0].title == "1 test query"
-        assert cases[0].method == "GET"
-        assert cases[0].path == "index/_search"
-        assert cases[0].body == {"query": {"match_all": {}}}
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].title, "1 test query")
+        self.assertEqual(cases[0].method, "GET")
+        self.assertEqual(cases[0].path, "index/_search")
+        self.assertEqual(cases[0].body, {"query": {"match_all": {}}})
 
     def test_multiple_requests(self):
         text = """#1 first query
@@ -67,17 +66,17 @@ GET index2/_search
 {"query": {"match": {"title": "test"}}}
 """
         cases = parse_requests(text)
-        assert len(cases) == 2
-        assert cases[0].title == "1 first query"
-        assert cases[1].title == "2 second query"
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(cases[0].title, "1 first query")
+        self.assertEqual(cases[1].title, "2 second query")
 
     def test_request_without_body(self):
         text = """#1 no body
 GET _cluster/health
 """
         cases = parse_requests(text)
-        assert len(cases) == 1
-        assert cases[0].body is None
+        self.assertEqual(len(cases), 1)
+        self.assertIsNone(cases[0].body)
 
     def test_msearch_request(self):
         text = """#1 msearch
@@ -86,9 +85,9 @@ GET _msearch
 {"query": {"match_all": {}}}
 """
         cases = parse_requests(text)
-        assert len(cases) == 1
-        assert cases[0].body_is_ndjson is True
-        assert cases[0].body.endswith("\n")
+        self.assertEqual(len(cases), 1)
+        self.assertTrue(cases[0].body_is_ndjson)
+        self.assertTrue(cases[0].body.endswith("\n"))
 
     def test_different_methods(self):
         text = """#1 get request
@@ -102,22 +101,21 @@ POST index/_search
 DELETE index/_doc/1
 """
         cases = parse_requests(text)
-        assert cases[0].method == "GET"
-        assert cases[1].method == "POST"
-        assert cases[2].method == "DELETE"
+        self.assertEqual(cases[0].method, "GET")
+        self.assertEqual(cases[1].method, "POST")
+        self.assertEqual(cases[2].method, "DELETE")
 
     def test_empty_title(self):
         text = """#
 GET index/_search
 """
         cases = parse_requests(text)
-        assert cases[0].title == "Query 1"
+        self.assertEqual(cases[0].title, "Query 1")
 
     def test_invalid_format_no_method(self):
-        # 只有标题没有方法行
         text = """#1 invalid
 """
-        with pytest.raises(ValueError, match="缺少方法行"):
+        with self.assertRaisesRegex(ValueError, "缺少方法行"):
             parse_requests(text)
 
     def test_invalid_json_body(self):
@@ -125,98 +123,98 @@ GET index/_search
 GET index/_search
 {invalid json}
 """
-        with pytest.raises(ValueError, match="JSON body 解析失败"):
+        with self.assertRaisesRegex(ValueError, "JSON body 解析失败"):
             parse_requests(text)
 
 
-class TestExtractTargetNames:
+class TestExtractTargetNames(unittest.TestCase):
     """测试 extract_target_names 函数"""
 
     def test_single_index(self):
-        assert extract_target_names("movies/_search") == ["movies"]
+        self.assertEqual(extract_target_names("movies/_search"), ["movies"])
 
     def test_multiple_indices(self):
-        assert extract_target_names("index1,index2/_search") == ["index1", "index2"]
+        self.assertEqual(extract_target_names("index1,index2/_search"), ["index1", "index2"])
 
     def test_system_api(self):
-        assert extract_target_names("_cluster/health") == []
-        assert extract_target_names("/_cat/indices") == []
+        self.assertEqual(extract_target_names("_cluster/health"), [])
+        self.assertEqual(extract_target_names("/_cat/indices"), [])
 
     def test_with_query_params(self):
-        assert extract_target_names("movies/_search?size=10") == ["movies"]
+        self.assertEqual(extract_target_names("movies/_search?size=10"), ["movies"])
 
     def test_empty_path(self):
-        assert extract_target_names("") == []
-        assert extract_target_names("/") == []
+        self.assertEqual(extract_target_names(""), [])
+        self.assertEqual(extract_target_names("/"), [])
 
 
-class TestFlattenDictWithPrefix:
+class TestFlattenDictWithPrefix(unittest.TestCase):
     """测试 flatten_dict_with_prefix 函数"""
 
     def test_simple_dict(self):
         data = {"key": "value"}
         result = flatten_dict_with_prefix(data)
-        assert result == {"key": "value"}
+        self.assertEqual(result, {"key": "value"})
 
     def test_nested_dict(self):
         data = {"index": {"number_of_shards": "1", "number_of_replicas": "0"}}
         result = flatten_dict_with_prefix(data)
-        assert result == {
+        self.assertEqual(result, {
             "index.number_of_shards": "1",
             "index.number_of_replicas": "0"
-        }
+        })
 
     def test_deeply_nested(self):
         data = {"a": {"b": {"c": "value"}}}
         result = flatten_dict_with_prefix(data)
-        assert result == {"a.b.c": "value"}
+        self.assertEqual(result, {"a.b.c": "value"})
 
     def test_with_prefix(self):
         data = {"key": "value"}
         result = flatten_dict_with_prefix(data, "prefix")
-        assert result == {"prefix.key": "value"}
+        self.assertEqual(result, {"prefix.key": "value"})
 
 
-class TestFormatCount:
+class TestFormatCount(unittest.TestCase):
     """测试 format_count 函数"""
 
     def test_positive_integer(self):
-        assert format_count(8516) == "8,516"
+        self.assertEqual(format_count(8516), "8,516")
 
     def test_negative_integer(self):
-        assert format_count(-1000) == "-1,000"
+        self.assertEqual(format_count(-1000), "-1,000")
 
     def test_none_value(self):
-        assert format_count(None) == "-"
+        self.assertEqual(format_count(None), "-")
 
     def test_string_number(self):
-        assert format_count("12345") == "12,345"
+        self.assertEqual(format_count("12345"), "12,345")
 
     def test_non_numeric_string(self):
-        assert format_count("abc") == "abc"
+        self.assertEqual(format_count("abc"), "abc")
 
 
-class TestJsonPretty:
+class TestJsonPretty(unittest.TestCase):
     """测试 json_pretty 函数"""
 
     def test_dict(self):
         data = {"key": "value"}
         result = json_pretty(data)
-        assert '"key": "value"' in result
+        self.assertIn('"key": "value"', result)
 
     def test_list(self):
         data = [1, 2, 3]
         result = json_pretty(data)
-        assert "[\n  1,\n  2,\n  3\n]" == result
+        self.assertEqual("[\n  1,\n  2,\n  3\n]", result)
 
     def test_unicode(self):
         data = {"中文": "测试"}
         result = json_pretty(data)
-        assert "中文" in result
-        assert "测试" in result
+        self.assertIn("中文", result)
+        self.assertIn("测试", result)
 
 
-class TestBodyPretty:
+class TestBodyPretty(unittest.TestCase):
     """测试 body_pretty 函数"""
 
     def test_none_body(self):
@@ -224,7 +222,7 @@ class TestBodyPretty:
             seq=1, title="test", method="GET", path="test",
             body_raw="", body=None, body_is_ndjson=False
         )
-        assert body_pretty(case) == ""
+        self.assertEqual(body_pretty(case), "")
 
     def test_dict_body(self):
         case = RequestCase(
@@ -232,7 +230,7 @@ class TestBodyPretty:
             body_raw='{"key": "value"}', body={"key": "value"}, body_is_ndjson=False
         )
         result = body_pretty(case)
-        assert '"key": "value"' in result
+        self.assertIn('"key": "value"', result)
 
     def test_ndjson_body(self):
         case = RequestCase(
@@ -241,10 +239,10 @@ class TestBodyPretty:
             body='{"index": "test"}\n{"query": {}}\n', body_is_ndjson=True
         )
         result = body_pretty(case)
-        assert result == '{"index": "test"}\n{"query": {}}'
+        self.assertEqual(result, '{"index": "test"}\n{"query": {}}')
 
 
-class TestBodyCompact:
+class TestBodyCompact(unittest.TestCase):
     """测试 body_compact 函数"""
 
     def test_dict_body_compact(self):
@@ -253,7 +251,7 @@ class TestBodyCompact:
             body_raw='{"key": "value"}', body={"key": "value"}, body_is_ndjson=False
         )
         result = body_compact(case)
-        assert result == '{"key":"value"}'
+        self.assertEqual(result, '{"key":"value"}')
 
     def test_ndjson_body_compact(self):
         case = RequestCase(
@@ -262,8 +260,8 @@ class TestBodyCompact:
             body='{"index": "test"}\n{"query": {}}\n', body_is_ndjson=True
         )
         result = body_compact(case)
-        assert result == '{"index": "test"}\\n{"query": {}}'
+        self.assertEqual(result, '{"index": "test"}\\n{"query": {}}')
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    unittest.main()
