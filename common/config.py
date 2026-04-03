@@ -245,6 +245,7 @@ class MetricsJobConfig:
     metrics: List[str] = field(default_factory=list)  # 指标类型列表
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     slim: SlimConfig = field(default_factory=SlimConfig)  # 精简数据配置
+    mask_ip: bool = False  # IP 地址脱敏
     output: OutputConfig = field(default_factory=OutputConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     time_range_hours: int = 24
@@ -274,6 +275,7 @@ class MetricsJobConfig:
             metrics=metrics,
             sampling=SamplingConfig.from_dict(data.get('sampling')),
             slim=SlimConfig.from_dict(data.get('slim')),
+            mask_ip=data.get('maskIp', False),
             output=OutputConfig.from_dict(data.get('output', {})),
             execution=ExecutionConfig.from_dict(data.get('execution', {})),
             time_range_hours=data.get('timeRangeHours', 24),

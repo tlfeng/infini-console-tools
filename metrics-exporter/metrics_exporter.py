@@ -34,8 +34,8 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
 from common.config import (
-    add_common_args, load_and_merge_config, get_config_value,
-    AppConfig, MetricsJobConfig, SamplingConfig, SlimConfig, ConfigValidationError
+    add_common_args, get_config_value,
+    AppConfig, MetricsJobConfig, ConfigValidationError
 )
 
 
@@ -1434,6 +1434,7 @@ class MetricsExporter:
             parallel_jobs=job.execution.parallel_metrics,
             sampling=job.sampling,
             slim_config=job.slim,
+            mask_ip=job.mask_ip,
         )
 
     def _print_type_summary(self, title: str, types_data: Dict, totals: list) -> None:
@@ -1496,40 +1497,31 @@ class MetricsExporter:
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="Metrics Exporter - 从 Console 系统集群导出监控数据（优化版）",
+        description="Metrics Exporter - 从 Console 系统集群导出监控数据",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 导出最近24小时的监控数据
+  # 使用命令行参数导出最近24小时的监控数据
   python metrics_exporter.py -c http://localhost:9000 -u admin -p password
 
-  # 导出最近7天的监控数据，并行度4
-  python metrics_exporter.py -c http://localhost:9000 -u admin -p password --time-range 168 --parallel 4
+  # 导出最近7天的数据，启用精简和IP脱敏
+  python metrics_exporter.py -c http://localhost:9000 -u admin -p password --time-range 168 --slim --mask-ip
 
-  # 只导出特定集群的数据，使用大批次
-  python metrics_exporter.py -c http://localhost:9000 -u admin -p password --cluster-id xxx --batch-size 5000
-
-  # 只导出特定字段，减少数据量
-  python metrics_exporter.py -c http://localhost:9000 -u admin -p password --fields timestamp,metadata,.payload.elasticsearch.node_stats.os
-
-  # 使用配置文件执行指定 job
-  python metrics_exporter.py --config config.json --job "全量导出-一周"
+  # 只导出特定集群的数据
+  python metrics_exporter.py -c http://localhost:9000 -u admin -p password --cluster-id xxx
 
   # 使用配置文件执行所有启用的 jobs
   python metrics_exporter.py --config config.json
 
-Environment Variables:
-  CONSOLE_URL       Console URL (默认: http://localhost:9000)
-  CONSOLE_USERNAME  用户名
-  CONSOLE_PASSWORD  密码
-  CONSOLE_TIMEOUT   超时时间(秒)
+  # 使用配置文件执行指定 job
+  python metrics_exporter.py --config config.json --job "全量导出-一周"
         """,
     )
 
     # 添加通用参数
     parser = add_common_args(parser)
 
-    # 添加本工具特有参数
+    # 命令行模式参数
     parser.add_argument(
         "--time-range",
         type=int,
@@ -1540,19 +1532,19 @@ Environment Variables:
         "--shard-size",
         type=int,
         default=100000,
-        help="每个分片文件的最大文档数，超过时自动分文件存储，默认100000",
+        help="每个分片文件的最大文档数，默认100000",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=None,
-        help="每批次读取的文档数，默认根据指标类型自适应 (2000-5000)",
+        help="每批次读取的文档数",
     )
     parser.add_argument(
         "--scroll-keepalive",
         type=str,
         default="5m",
-        help="Scroll 上下文保持时间，默认5m（建议大数据量时使用更长时间）",
+        help="Scroll 上下文保持时间，默认5m",
     )
     parser.add_argument(
         "--parallel",
@@ -1576,7 +1568,7 @@ Environment Variables:
         "--fields",
         type=str,
         default=None,
-        help="只导出指定字段，逗号分隔，如: timestamp,metadata.labels.cluster_id",
+        help="只导出指定字段，逗号分隔",
     )
     parser.add_argument(
         "--no-alerts",
@@ -1584,11 +1576,23 @@ Environment Variables:
         help="不导出告警数据",
     )
     parser.add_argument(
-        "--list-clusters",
+        "--slim",
         action="store_true",
-        help="只列出有监控数据的集群，不导出数据",
+        help="精简数据：删除和排障无关的字段",
     )
-    # 新增 job 参数
+    parser.add_argument(
+        "--mask-ip",
+        action="store_true",
+        help="脱敏IP地址：隐藏前两个octet，例如 192.168.1.1 -> *.*.1.1",
+    )
+    parser.add_argument(
+        "--sampling-interval",
+        type=str,
+        default=None,
+        help="抽样时间间隔，如 1h, 5m（不指定则为全量导出）",
+    )
+
+    # 配置文件模式参数
     parser.add_argument(
         "--job",
         type=str,
@@ -1601,14 +1605,9 @@ Environment Variables:
         help="列出配置文件中的所有 jobs",
     )
     parser.add_argument(
-        "--slim",
+        "--list-clusters",
         action="store_true",
-        help="精简数据：删除和排障无关的字段（_id, agent, metadata.category/datatype/name）和冗余的人类可读格式字段（store, estimated_size, limit_size）",
-    )
-    parser.add_argument(
-        "--mask-ip",
-        action="store_true",
-        help="脱敏IP地址：隐藏前两个octet，例如 192.168.1.1 变为 *.*.1.1（适用于数据对外分享的隐私保护）",
+        help="只列出有监控数据的集群，不导出数据",
     )
 
     return parser.parse_args()
@@ -1617,9 +1616,11 @@ Environment Variables:
 def main():
     args = parse_args()
 
-    # 尝试加载新格式配置
-    app_config = None
-    if args.config and Path(args.config).exists():
+    # 判断是否使用配置文件模式
+    use_config_mode = args.config and Path(args.config).exists()
+
+    # 配置文件模式：提前处理不需要连接的操作
+    if use_config_mode:
         try:
             app_config = AppConfig.load(args.config)
         except ConfigValidationError as e:
@@ -1629,47 +1630,68 @@ def main():
             print(f"加载配置文件失败: {e}")
             sys.exit(1)
 
-    # 如果是列出 jobs
-    if args.list_jobs:
-        if not app_config or not app_config.metrics_exporter:
-            print("配置文件中没有定义 metricsExporter.jobs")
-            sys.exit(1)
-        print("\n可用的导出任务:")
-        for job in app_config.metrics_exporter.jobs:
-            status = "✓" if job.enabled else "✗"
-            sampling_str = f" (抽样: {job.sampling.mode}" + (
-                f" {job.sampling.interval}" if job.sampling.interval else ""
-            ) + ")" if job.sampling.is_sampling() else " (全量)"
-            print(f"  {status} {job.name}{sampling_str}")
-            print(f"      指标: {', '.join(job.metrics)}")
-            print(f"      时间范围: {job.time_range_hours}h")
-        return
+        # --list-jobs 不需要连接 Console
+        if args.list_jobs:
+            _list_jobs(app_config)
+            return
 
-    # 从配置或命令行获取连接参数
-    if app_config:
+        # 获取连接参数
         console_url = app_config.global_config.console_url
         username = app_config.global_config.username
         password = app_config.global_config.password
         timeout = app_config.global_config.timeout
         insecure = app_config.global_config.insecure
     else:
-        config, _ = load_and_merge_config(args)
-        console_url = get_config_value(args.console, config.get('consoleUrl'), 'CONSOLE_URL', 'http://localhost:9000')
-        username = get_config_value(args.username, config.get('auth', {}).get('username'), 'CONSOLE_USERNAME', '')
-        password = get_config_value(args.password, config.get('auth', {}).get('password'), 'CONSOLE_PASSWORD', '')
-        timeout = int(get_config_value(str(args.timeout), str(config.get('timeout')), 'CONSOLE_TIMEOUT', '60'))
-        insecure = args.insecure or config.get('insecure', False)
+        # 命令行模式：从环境变量或参数获取连接信息
+        console_url = get_config_value(args.console, None, 'CONSOLE_URL', 'http://localhost:9000')
+        username = get_config_value(args.username, None, 'CONSOLE_USERNAME', '')
+        password = get_config_value(args.password, None, 'CONSOLE_PASSWORD', '')
+        timeout = int(get_config_value(str(args.timeout), None, 'CONSOLE_TIMEOUT', '60'))
+        insecure = args.insecure
+        app_config = None
 
-    # 如果需要认证但未提供密码，提示输入
+    # 连接 Console
+    client = _connect_console(console_url, username, password, timeout, insecure)
+
+    # 获取系统集群
+    exporter = _get_exporter(client)
+
+    # --list-clusters
+    if args.list_clusters:
+        _list_clusters(exporter)
+        return
+
+    # 执行导出
+    if use_config_mode:
+        _run_config_mode(exporter, app_config, args)
+    else:
+        _run_cli_mode(exporter, args)
+
+
+def _list_jobs(app_config: AppConfig) -> None:
+    """列出配置文件中的 jobs"""
+    if not app_config.metrics_exporter:
+        print("配置文件中没有定义 metricsExporter.jobs")
+        sys.exit(1)
+    print("\n可用的导出任务:")
+    for job in app_config.metrics_exporter.jobs:
+        status = "✓" if job.enabled else "✗"
+        sampling_str = f" (抽样: {job.sampling.mode}" + (
+            f" {job.sampling.interval}" if job.sampling.interval else ""
+        ) + ")" if job.sampling.is_sampling() else " (全量)"
+        print(f"  {status} {job.name}{sampling_str}")
+        print(f"      指标: {', '.join(job.metrics)}")
+        print(f"      时间范围: {job.time_range_hours}h")
+
+
+def _connect_console(console_url: str, username: str, password: str, timeout: int, insecure: bool) -> ConsoleClient:
+    """连接并登录 Console"""
     if username and not password:
         password = getpass.getpass(f"请输入 {username} 的密码: ")
 
     print(f"连接到 Console: {console_url}")
-
-    # 创建客户端
     client = ConsoleClient(console_url, username, password, timeout=timeout, verify_ssl=not insecure)
 
-    # 登录
     if username and password:
         print("正在登录...")
         try:
@@ -1681,7 +1703,11 @@ def main():
             print(f"登录失败: {e}")
             sys.exit(1)
 
-    # 获取系统集群ID
+    return client
+
+
+def _get_exporter(client: ConsoleClient) -> 'MetricsExporter':
+    """获取初始化的 MetricsExporter"""
     print("正在获取系统集群...")
     exporter = MetricsExporter(client, "")
     system_cluster_id = exporter.get_system_cluster_id()
@@ -1692,95 +1718,84 @@ def main():
 
     print(f"系统集群ID: {system_cluster_id}")
     exporter.system_cluster_id = system_cluster_id
+    return exporter
 
-    # 只列出集群
-    if args.list_clusters:
-        clusters = exporter.get_available_clusters()
-        print("\n有监控数据的集群:")
-        for cluster in clusters:
-            print(f"  {cluster['cluster_name']} ({cluster['cluster_id']}): {cluster['doc_count']:,} 条记录")
-        return
 
-    # 如果有 jobs 配置，使用 job 模式
-    if app_config and app_config.metrics_exporter:
-        jobs_to_run = []
+def _list_clusters(exporter: 'MetricsExporter') -> None:
+    """列出有监控数据的集群"""
+    clusters = exporter.get_available_clusters()
+    print("\n有监控数据的集群:")
+    for cluster in clusters:
+        print(f"  {cluster['cluster_name']} ({cluster['cluster_id']}): {cluster['doc_count']:,} 条记录")
 
-        if args.job:
-            # 执行指定的 job
-            for job in app_config.metrics_exporter.jobs:
-                if job.name == args.job:
-                    jobs_to_run.append(job)
-                    break
-            if not jobs_to_run:
-                print(f"未找到名为 '{args.job}' 的 job")
-                sys.exit(1)
-        else:
-            # 执行所有启用的 jobs
-            jobs_to_run = [job for job in app_config.metrics_exporter.jobs if job.enabled]
 
+def _run_config_mode(exporter: 'MetricsExporter', app_config: AppConfig, args) -> None:
+    """配置文件模式：执行 jobs"""
+    if not app_config.metrics_exporter:
+        print("配置文件中没有定义 metricsExporter.jobs")
+        sys.exit(1)
+
+    if args.job:
+        jobs_to_run = [j for j in app_config.metrics_exporter.jobs if j.name == args.job]
         if not jobs_to_run:
-            print("没有启用的导出任务")
-            sys.exit(0)
+            print(f"未找到名为 '{args.job}' 的 job")
+            sys.exit(1)
+    else:
+        jobs_to_run = [j for j in app_config.metrics_exporter.jobs if j.enabled]
 
-        print(f"\n将执行 {len(jobs_to_run)} 个导出任务")
+    if not jobs_to_run:
+        print("没有启用的导出任务")
+        sys.exit(0)
 
-        for job in jobs_to_run:
-            summary = exporter.execute_job(job)
-            exporter.print_summary(summary)
-            print(f"\n数据已导出到: {job.output.directory}")
+    print(f"\n将执行 {len(jobs_to_run)} 个导出任务")
 
-        return
+    for job in jobs_to_run:
+        summary = exporter.execute_job(job)
+        exporter.print_summary(summary)
+        print(f"\n数据已导出到: {job.output.directory}")
 
-    # 回退到传统命令行模式
-    config, _ = load_and_merge_config(args)
 
-    output = args.output or config.get('output') or f"metrics_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    time_range = args.time_range or config.get('timeRangeHours', 24)
-    shard_size = args.shard_size or config.get('shardSize', 100000)
-    batch_size = args.batch_size or config.get('batchSize')
-    scroll_keepalive = args.scroll_keepalive or config.get('scrollKeepalive', DEFAULT_SCROLL_KEEPALIVE)
-    parallel = args.parallel or config.get('parallelJobs', 2)
-    cluster_id = args.cluster_id or config.get('clusterId')
-    include_alerts = not args.no_alerts and not config.get('noAlerts', False)
+def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
+    """命令行模式：构建 job 并执行"""
+    output_dir = args.output or f"metrics_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # 解析字段筛选
-    source_fields = None
-    if args.fields:
-        source_fields = [f.strip() for f in args.fields.split(",")]
+    # 构建 job 配置
+    job_config = {
+        "name": "命令行导出",
+        "enabled": True,
+        "timeRangeHours": args.time_range,
+        "shardSize": args.shard_size,
+        "includeAlerts": not args.no_alerts,
+        "maskIp": args.mask_ip,
+        "output": {"directory": output_dir},
+        "execution": {
+            "parallelMetrics": args.parallel,
+            "batchSize": args.batch_size,
+            "scrollKeepalive": args.scroll_keepalive,
+        },
+    }
 
-    # 解析指标类型
-    metric_types = None
     if args.metric_types:
-        metric_types = [t.strip() for t in args.metric_types.split(",")]
+        job_config["metrics"] = [t.strip() for t in args.metric_types.split(",")]
 
-    exporter.scroll_keepalive = scroll_keepalive
-    exporter.parallel_jobs = parallel
+    if args.fields:
+        job_config["sourceFields"] = [f.strip() for f in args.fields.split(",")]
 
-    # 解析精简配置
-    slim_config = None
-    if args.slim or config.get('slim', False):
-        slim_config = SlimConfig(enabled=True)
+    if args.slim:
+        job_config["slim"] = True
 
-    # 解析IP脱敏配置
-    mask_ip = args.mask_ip or config.get('maskIp', False)
+    if args.sampling_interval:
+        job_config["sampling"] = {"mode": "sampling", "interval": args.sampling_interval}
 
-    # 导出数据
-    summary = exporter.export_all(
-        output_dir=output,
-        metric_types=metric_types,
-        time_range_hours=time_range,
-        shard_size=shard_size,
-        cluster_id_filter=cluster_id,
-        include_alerts=include_alerts,
-        batch_size=batch_size,
-        source_fields=source_fields,
-        parallel_jobs=parallel,
-        slim_config=slim_config,
-        mask_ip=mask_ip,
-    )
+    if args.cluster_id:
+        job_config["targets"] = {"clusters": {"include": [args.cluster_id]}}
 
+    job = MetricsJobConfig.from_dict(job_config)
+
+    # 执行导出
+    summary = exporter.execute_job(job)
     exporter.print_summary(summary)
-    print(f"\n数据已导出到: {output}")
+    print(f"\n数据已导出到: {output_dir}")
 
 
 if __name__ == "__main__":
