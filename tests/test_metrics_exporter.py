@@ -329,6 +329,22 @@ class TestQueryBuilding(unittest.TestCase):
 
         self.assertEqual(query["query"], {"match_all": {}})
 
+    def test_sampling_group_fields_for_node_stats(self):
+        """node_stats 抽样应固定按 cluster_id + node_id 分组"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        fields = exporter._get_sampling_group_fields("node_stats", METRIC_TYPES["node_stats"])
+        self.assertEqual(fields, ["metadata.labels.cluster_id", "metadata.labels.node_id"])
+
+    def test_sampling_group_fields_for_index_stats(self):
+        """index_stats 抽样应固定按 cluster_id + index_name 分组"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        fields = exporter._get_sampling_group_fields("index_stats", METRIC_TYPES["index_stats"])
+        self.assertEqual(fields, ["metadata.labels.cluster_id", "metadata.labels.index_name"])
+
 
 class TestScrollPagination(unittest.TestCase):
     """测试 scroll 分页逻辑"""
@@ -544,6 +560,8 @@ class TestStratifiedSampling(unittest.TestCase):
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
+        agg_call_index = {"value": 0}
+
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
 
@@ -566,8 +584,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                slice_info = body.get("slice")
-                self.assertIsNotNone(slice_info)
+                self.assertNotIn("slice", body)
 
                 same_bucket_key = {
                     "group_0": "c1",
@@ -576,7 +593,8 @@ class TestStratifiedSampling(unittest.TestCase):
                 }
 
                 # sort 完全一致，仅 _id 不同
-                if slice_info.get("id") == 0:
+                agg_call_index["value"] += 1
+                if agg_call_index["value"] == 1:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -600,7 +618,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if slice_info.get("id") == 1:
+                if agg_call_index["value"] == 2:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -656,6 +674,8 @@ class TestStratifiedSampling(unittest.TestCase):
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
+        agg_call_index = {"value": 0}
+
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
 
@@ -678,9 +698,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                slice_info = body.get("slice")
-                self.assertIsNotNone(slice_info)
-                self.assertEqual(slice_info.get("max"), 2)
+                self.assertNotIn("slice", body)
 
                 # 两个 slice 都返回同一个 bucket key，但 sort 不同
                 same_bucket_key = {
@@ -689,7 +707,8 @@ class TestStratifiedSampling(unittest.TestCase):
                     "time_bucket": 1712016000000,
                 }
 
-                if slice_info.get("id") == 0:
+                agg_call_index["value"] += 1
+                if agg_call_index["value"] == 1:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -713,7 +732,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if slice_info.get("id") == 1:
+                if agg_call_index["value"] == 2:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -771,6 +790,8 @@ class TestStratifiedSampling(unittest.TestCase):
 
         calls = []
 
+        agg_call_index = {"value": 0}
+
         def proxy_request(cluster_id, method, path, body=None):
             self.assertEqual(cluster_id, "system-id")
             calls.append((method, path, body))
@@ -799,12 +820,11 @@ class TestStratifiedSampling(unittest.TestCase):
                 if not sampled_agg:
                     self.fail(f"Unexpected _search body: {body}")
 
-                slice_info = body.get("slice")
-                self.assertIsNotNone(slice_info)
-                self.assertEqual(slice_info.get("max"), 2)
+                self.assertNotIn("slice", body)
 
                 # 每个 slice 返回一个桶
-                if slice_info.get("id") == 0:
+                agg_call_index["value"] += 1
+                if agg_call_index["value"] == 1:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -832,7 +852,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                if slice_info.get("id") == 1:
+                if agg_call_index["value"] == 2:
                     return {
                         "aggregations": {
                             "sampled": {
@@ -881,8 +901,9 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(result.count, 2)
 
             search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
-            slice_calls = [c for c in search_calls if c[2].get("slice")]
-            self.assertEqual(len(slice_calls), 2)
+            sampled_calls = [c for c in search_calls if c[2].get("aggs")]
+            self.assertEqual(len(sampled_calls), 2)
+            self.assertTrue(all("slice" not in c[2] for c in sampled_calls))
 
             output_file = f"{temp_base}.jsonl"
             with open(output_file, 'r') as f:

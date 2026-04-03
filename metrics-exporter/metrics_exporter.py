@@ -64,7 +64,8 @@ METRIC_TYPES = {
         "description": "节点级别的详细统计，包括CPU、内存、JVM、磁盘IO、网络、索引操作等",
         "index_pattern": ".infini_metrics",
         "filter_template": 'metadata.name:"node_stats"',
-        "key_fields": ["metadata.labels.cluster_id", "metadata.labels.node_id", "metadata.labels.node_name"],
+        # 抽样分层按 cluster + node 维度，避免 node_name 变更导致同节点被拆分
+        "key_fields": ["metadata.labels.cluster_id", "metadata.labels.node_id"],
         "default_batch_size": 3000,  # 数据量大，中等批次
     },
     "index_stats": {
@@ -846,6 +847,12 @@ class MetricsExporter:
 
     def _get_sampling_group_fields(self, metric_type: str, config: Dict[str, Any]) -> List[str]:
         """分层抽样分组字段，优先使用指标定义的 key_fields"""
+        # 明确约束关键指标的分组维度，确保采样语义稳定
+        if metric_type == "node_stats":
+            return ["metadata.labels.cluster_id", "metadata.labels.node_id"]
+        if metric_type == "index_stats":
+            return ["metadata.labels.cluster_id", "metadata.labels.index_name"]
+
         return config.get("key_fields") or ["metadata.labels.cluster_id"]
 
     def _detect_valid_group_fields(
@@ -940,6 +947,9 @@ class MetricsExporter:
         effective_group_fields = self._detect_valid_group_fields(
             index_pattern, query.get("query", {"match_all": {}}), group_fields
         )
+        if any(f in group_fields for f in ("metadata.labels.node_id", "metadata.labels.index_name")):
+            # 对 node/index 抽样强制保留完整分组维度，避免因探测样本偶然缺失导致降维
+            effective_group_fields = group_fields
         if not effective_group_fields:
             effective_group_fields = group_fields[:1]  # 至少使用第一个字段
 
@@ -957,11 +967,11 @@ class MetricsExporter:
             }
         )
 
-        def build_sampling_body(after: Dict = None, slice_id: int = None, total_slices: int = 1) -> Dict[str, Any]:
+        def build_sampling_body(search_query: Dict, after: Dict = None) -> Dict[str, Any]:
             body = {
                 "size": 0,
                 "track_total_hits": False,
-                "query": query.get("query", {"match_all": {}}),
+                "query": search_query.get("query", {"match_all": {}}),
                 "aggs": {
                     "sampled": {
                         "composite": {
@@ -985,27 +995,84 @@ class MetricsExporter:
             }
             if after:
                 body["aggs"]["sampled"]["composite"]["after"] = after
-            if total_slices > 1 and slice_id is not None:
-                body["slice"] = {"id": slice_id, "max": total_slices}
             return body
+
+        def _split_sampling_queries(base_query: Dict, parts: int) -> List[Dict]:
+            """按 timestamp 时间窗口拆分查询，用于 sampling 并行。"""
+            if parts <= 1:
+                return [base_query]
+
+            must_clauses = base_query.get("query", {}).get("bool", {}).get("must", [])
+            ts_range = None
+            for clause in must_clauses:
+                if isinstance(clause, dict) and "range" in clause and "timestamp" in clause["range"]:
+                    ts_range = clause["range"]["timestamp"]
+                    break
+
+            if not ts_range:
+                return [base_query]
+
+            start_raw = ts_range.get("gte")
+            end_raw = ts_range.get("lte")
+            if not start_raw or not end_raw:
+                return [base_query]
+
+            try:
+                start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            except Exception:
+                return [base_query]
+
+            total_seconds = (end_dt - start_dt).total_seconds()
+            if total_seconds <= 0:
+                return [base_query]
+
+            queries: List[Dict] = []
+            for i in range(parts):
+                part_start = start_dt + (end_dt - start_dt) * (i / parts)
+                part_end = start_dt + (end_dt - start_dt) * ((i + 1) / parts)
+
+                q = copy.deepcopy(base_query)
+                q_must = q.get("query", {}).get("bool", {}).get("must", [])
+                for clause in q_must:
+                    if isinstance(clause, dict) and "range" in clause and "timestamp" in clause["range"]:
+                        original = clause["range"]["timestamp"]
+                        new_range = dict(original)
+                        new_range["gte"] = part_start.isoformat()
+                        if i == parts - 1:
+                            new_range["lte"] = part_end.isoformat()
+                            new_range.pop("lt", None)
+                        else:
+                            new_range["lt"] = part_end.isoformat()
+                            new_range.pop("lte", None)
+                        clause["range"]["timestamp"] = new_range
+                        break
+
+                queries.append(q)
+
+            return queries
 
         def bucket_key_tuple(bucket_key: Dict[str, Any]) -> tuple:
             return tuple(bucket_key.get(f"group_{i}") for i in range(len(effective_group_fields))) + (
                 bucket_key.get("time_bucket"),
             )
 
-        # 并行路径：按 sliced query 并发拉取后按 bucket key 合并，避免重复时间桶
+        # 并行路径：按时间窗口拆分查询并发拉取，再按 bucket key 合并，避免重复时间桶
         if parallel_degree and parallel_degree > 1:
             effective_slices = max(1, parallel_degree)
+            worker_queries = _split_sampling_queries(query, effective_slices)
+            if len(worker_queries) == 1 and effective_slices > 1:
+                print("    sampling 并行降级为单线程：未识别到可拆分的 timestamp 范围")
+
             merge_lock = threading.Lock()
             # key -> (sort_tuple, hit_id, hit)
             merged_docs: Dict[tuple, tuple] = {}
 
-            def run_sampling_slice(slice_id: int) -> None:
+            def run_sampling_slice(worker_query: Dict) -> None:
                 local_after = None
 
                 while True:
-                    body = build_sampling_body(local_after, slice_id, effective_slices)
+                    body = build_sampling_body(worker_query, local_after)
                     result = self.client.proxy_request(
                         self.system_cluster_id,
                         "POST",
@@ -1047,8 +1114,8 @@ class MetricsExporter:
                     if not local_after:
                         break
 
-            with ThreadPoolExecutor(max_workers=effective_slices) as executor:
-                futures = [executor.submit(run_sampling_slice, i) for i in range(effective_slices)]
+            with ThreadPoolExecutor(max_workers=len(worker_queries)) as executor:
+                futures = [executor.submit(run_sampling_slice, q) for q in worker_queries]
                 for future in as_completed(futures):
                     future.result()
 
@@ -1072,7 +1139,7 @@ class MetricsExporter:
 
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
             while True:
-                body = build_sampling_body(after_key)
+                body = build_sampling_body(query, after_key)
                 result = self.client.proxy_request(
                     self.system_cluster_id,
                     "POST",
@@ -1156,6 +1223,9 @@ class MetricsExporter:
                 effective_group_fields = self._detect_valid_group_fields(
                     config["index_pattern"], query.get("query", {"match_all": {}}), group_fields
                 )
+                if metric_type in {"node_stats", "index_stats"}:
+                    # 确保 node/index 抽样固定按目标维度分组
+                    effective_group_fields = group_fields
                 if not effective_group_fields:
                     effective_group_fields = group_fields[:1]
 
