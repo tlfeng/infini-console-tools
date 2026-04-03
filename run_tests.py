@@ -12,6 +12,7 @@
   python run_tests.py console      # 只运行 console_client 测试
   python run_tests.py sampler      # 只运行 index_sampler 测试
   python run_tests.py cluster      # 只运行 cluster_report 测试
+  python run_tests.py query        # 只运行 query_report 测试
 """
 
 import sys
@@ -28,6 +29,7 @@ from tests import (
     test_console_client,
     test_index_sampler,
     test_cluster_report,
+    test_query_report,
 )
 
 
@@ -44,6 +46,7 @@ def run_all_tests(verbosity=1):
     suite.addTests(loader.loadTestsFromModule(test_console_client))
     suite.addTests(loader.loadTestsFromModule(test_index_sampler))
     suite.addTests(loader.loadTestsFromModule(test_cluster_report))
+    suite.addTests(loader.loadTestsFromModule(test_query_report))
     
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -62,6 +65,7 @@ def run_specific_test(test_name, verbosity=1):
         "console": test_console_client,
         "sampler": test_index_sampler,
         "cluster": test_cluster_report,
+        "query": test_query_report,
     }
     
     if test_name in test_map:
