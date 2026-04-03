@@ -271,6 +271,46 @@ class ExportResult:
         return result
 
 
+class ConsoleProgressReporter:
+    """线程安全的控制台进度输出器，避免并行任务输出相互覆盖。"""
+
+    def __init__(self, min_interval_sec: float = 0.8):
+        self._lock = threading.Lock()
+        self._min_interval_sec = min_interval_sec
+        self._last_emit_ts: Dict[str, float] = {}
+
+    def stage(self, message: str) -> None:
+        with self._lock:
+            print(message)
+
+    def start(self, task_name: str) -> None:
+        with self._lock:
+            print(f"  [{task_name}] 已启动")
+
+    def update(self, task_name: str, current: int, total: int = 0, force: bool = False) -> None:
+        now = time.time()
+        with self._lock:
+            last_ts = self._last_emit_ts.get(task_name, 0)
+            should_emit = force or (now - last_ts >= self._min_interval_sec)
+            if not should_emit:
+                return
+
+            if total > 0:
+                percent = min(100, current * 100 // total)
+                print(f"    [{task_name}] 进度 {current:,}/{total:,} ({percent}%)")
+            else:
+                print(f"    [{task_name}] 进度 {current:,}")
+
+            self._last_emit_ts[task_name] = now
+
+    def finish(self, task_name: str, count: int, error: Optional[str] = None) -> None:
+        with self._lock:
+            if error:
+                print(f"  [{task_name}] 失败: {error}")
+            else:
+                print(f"  [{task_name}] 完成，已保存 {count:,} 条记录")
+
+
 class MetricsExporter:
     """监控数据导出器 - 优化版"""
 
@@ -958,18 +998,8 @@ class MetricsExporter:
         if parallel_degree and parallel_degree > 1:
             effective_slices = max(1, parallel_degree)
             merge_lock = threading.Lock()
-            progress_lock = threading.Lock()
-            per_slice_progress = [0] * effective_slices
             # key -> (sort_tuple, hit_id, hit)
             merged_docs: Dict[tuple, tuple] = {}
-
-            def update_progress(slice_id: int, delta_count: int):
-                if delta_count <= 0:
-                    return
-                with progress_lock:
-                    per_slice_progress[slice_id] += delta_count
-                    if progress_callback:
-                        progress_callback(sum(per_slice_progress), 0)
 
             def run_sampling_slice(slice_id: int) -> None:
                 local_after = None
@@ -988,7 +1018,6 @@ class MetricsExporter:
                     if not buckets:
                         break
 
-                    page_docs = 0
                     page_best: Dict[tuple, tuple] = {}
                     for bucket in buckets:
                         key_tuple = bucket_key_tuple(bucket.get("key", {}))
@@ -1003,15 +1032,17 @@ class MetricsExporter:
                         existing = page_best.get(key_tuple)
                         if existing is None or (sort_tuple, hit_id) > (existing[0], existing[1]):
                             page_best[key_tuple] = (sort_tuple, hit_id, hit)
-                        page_docs += 1
-
+                    unique_total = 0
                     with merge_lock:
                         for key_tuple, (sort_tuple, hit_id, hit) in page_best.items():
                             current = merged_docs.get(key_tuple)
                             if current is None or (sort_tuple, hit_id) > (current[0], current[1]):
                                 merged_docs[key_tuple] = (sort_tuple, hit_id, hit)
+                        unique_total = len(merged_docs)
 
-                    update_progress(slice_id, page_docs)
+                    if progress_callback:
+                        # 并行 sampling 的进度口径统一为去重后的唯一 bucket 数
+                        progress_callback(unique_total, 0)
                     local_after = sampled.get("after_key")
                     if not local_after:
                         break
@@ -1196,9 +1227,13 @@ class MetricsExporter:
             print(f"    预估数据量失败: {e}")
             return (-1, -1)
 
-    def _make_progress_callback(self, metric_type: str):
+    def _make_progress_callback(self, metric_type: str, reporter: Optional[ConsoleProgressReporter] = None):
         """创建进度回调函数"""
         def callback(current, total):
+            if reporter:
+                reporter.update(metric_type, current, total)
+                return
+
             if total > 0:
                 percent = min(100, current * 100 // total)
                 print(f"\r    [{metric_type}] 已导出 {current:,} / {total:,} ({percent}%)", end="", flush=True)
@@ -1222,6 +1257,7 @@ class MetricsExporter:
         mask_ip: bool = False,
         skip_estimation: bool = False,
         parallel_degree: int = 1,
+        progress_reporter: Optional[ConsoleProgressReporter] = None,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -1264,7 +1300,7 @@ class MetricsExporter:
                 source_fields,
             )
 
-            progress_callback = self._make_progress_callback(metric_type)
+            progress_callback = self._make_progress_callback(metric_type, progress_reporter)
             metric_parallel_degree = (
                 max(1, parallel_degree)
                 if metric_type in {"node_stats", "index_stats", "shard_stats"}
@@ -1326,6 +1362,7 @@ class MetricsExporter:
         source_fields: List[str] = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        progress_reporter: Optional[ConsoleProgressReporter] = None,
     ) -> ExportResult:
         """导出告警相关数据（支持自动分片）
 
@@ -1348,7 +1385,7 @@ class MetricsExporter:
                 output_file,
                 effective_batch_size,
                 shard_size,
-                self._make_progress_callback(alert_type),
+                self._make_progress_callback(alert_type, progress_reporter),
                 slim_config,
                 mask_ip,
             )
@@ -1486,6 +1523,7 @@ class MetricsExporter:
             alert_types = list(ALERT_TYPES.keys())
 
         effective_parallel = parallel_jobs or self.parallel_jobs
+        progress_reporter = ConsoleProgressReporter()
 
         export_summary = {
             "export_time": datetime.now().isoformat(),
@@ -1508,15 +1546,15 @@ class MetricsExporter:
         # 如果已指定 cluster_ids 或 cluster_id_filter，则跳过此步骤避免额外网络请求
         clusters = []
         if not cluster_ids and not cluster_id_filter:
-            print("\n正在获取有监控数据的集群列表...")
+            progress_reporter.stage("\n正在获取有监控数据的集群列表...")
             clusters = self.get_available_clusters(time_range_hours)
             export_summary["clusters_with_data"] = clusters
-            print(f"找到 {len(clusters)} 个有监控数据的集群")
+            progress_reporter.stage(f"找到 {len(clusters)} 个有监控数据的集群")
             if not clusters:
-                print("警告: 未找到有监控数据的集群，导出可能为空")
+                progress_reporter.stage("警告: 未找到有监控数据的集群，导出可能为空")
 
         # 导出监控指标（并行）
-        print(f"\n正在导出监控指标数据 (并行度: {effective_parallel})...")
+        progress_reporter.stage(f"\n正在导出监控指标数据 (并行度: {effective_parallel})...")
 
         metric_results: List[ExportResult] = []
         valid_metric_types = [t for t in metric_types if t in METRIC_TYPES]
@@ -1531,6 +1569,7 @@ class MetricsExporter:
             futures = {}
             for metric_type in valid_metric_types:
                 config = METRIC_TYPES[metric_type]
+                progress_reporter.start(metric_type)
                 # 基础路径，不含扩展名（由 ShardedJSONLinesWriter 添加）
                 output_file_base = os.path.join(output_dir, f"{metric_type}_{timestamp_suffix}")
                 future = executor.submit(
@@ -1549,6 +1588,7 @@ class MetricsExporter:
                     mask_ip,
                     skip_estimation,
                     parallel_degree,
+                    progress_reporter,
                 )
                 futures[future] = metric_type
 
@@ -1557,12 +1597,10 @@ class MetricsExporter:
                 try:
                     result = future.result()
                     metric_results.append(result)
-                    if result.error:
-                        print(f"\n  [{metric_type}] 导出失败: {result.error}")
-                    else:
-                        print(f"\n  [{metric_type}] 已保存 {result.count:,} 条记录")
+                    progress_reporter.update(metric_type, result.count, 0, force=True)
+                    progress_reporter.finish(metric_type, result.count, result.error)
                 except Exception as e:
-                    print(f"\n  [{metric_type}] 导出异常: {e}")
+                    progress_reporter.finish(metric_type, 0, str(e))
 
         # 汇总 metric 结果
         for result in metric_results:
@@ -1570,7 +1608,7 @@ class MetricsExporter:
 
         # 导出告警数据（并行）
         if include_alerts:
-            print(f"\n正在导出告警数据 (并行度: {effective_parallel})...")
+            progress_reporter.stage(f"\n正在导出告警数据 (并行度: {effective_parallel})...")
 
             alert_results: List[ExportResult] = []
             valid_alert_types = [t for t in alert_types if t in ALERT_TYPES]
@@ -1583,6 +1621,7 @@ class MetricsExporter:
                 futures = {}
                 for alert_type in valid_alert_types:
                     config = ALERT_TYPES[alert_type]
+                    progress_reporter.start(alert_type)
                     # 基础路径，不含扩展名
                     output_file_base = os.path.join(output_dir, f"{alert_type}_{timestamp_suffix}")
                     future = executor.submit(
@@ -1596,6 +1635,7 @@ class MetricsExporter:
                         source_fields,
                         slim_config,
                         mask_ip,
+                        progress_reporter,
                     )
                     futures[future] = alert_type
 
@@ -1604,12 +1644,10 @@ class MetricsExporter:
                     try:
                         result = future.result()
                         alert_results.append(result)
-                        if result.error:
-                            print(f"\n  [{alert_type}] 导出失败: {result.error}")
-                        else:
-                            print(f"\n  [{alert_type}] 已保存 {result.count:,} 条记录")
+                        progress_reporter.update(alert_type, result.count, 0, force=True)
+                        progress_reporter.finish(alert_type, result.count, result.error)
                     except Exception as e:
-                        print(f"\n  [{alert_type}] 导出异常: {e}")
+                        progress_reporter.finish(alert_type, 0, str(e))
 
             # 汇总 alert 结果
             for result in alert_results:
@@ -1619,7 +1657,7 @@ class MetricsExporter:
         summary_file = os.path.join(output_dir, f"export_summary_{timestamp_suffix}.json")
         with open(summary_file, "w", encoding="utf-8") as f:
             json.dump(export_summary, f, ensure_ascii=False, indent=2)
-        print(f"\n导出摘要已保存: {summary_file}")
+        progress_reporter.stage(f"\n导出摘要已保存: {summary_file}")
 
         return export_summary
 

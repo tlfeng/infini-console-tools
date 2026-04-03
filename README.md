@@ -178,12 +178,13 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 - 支持指定时间范围和集群过滤
 - **流式处理**：使用 Scroll API 分批读取，每批直接写入文件，避免内存溢出
 - **并行导出**：支持多指标类型并行导出，显著提升效率
+- **单指标并行**：支持 `--parallel-degree` 在单个大体量指标内并行导出（full/sampling 均可）
 - **紧凑输出**：紧凑 JSON 格式，减少 IO 开销
 - **字段筛选**：支持只导出指定字段
 - **抽样模式**：支持时间间隔抽样和比例抽样
 - **数据脱敏**：支持 IP 地址脱敏保护隐私（隐藏前两个 octet）
 - **Job 配置**：支持配置文件定义多个导出任务
-- 实时进度显示
+- **实时进度显示**：线程安全的任务级进度输出，避免并发日志互相覆盖
 
 **参数：**
 ```bash
@@ -231,6 +232,7 @@ python metrics-exporter/metrics_exporter.py --config config.json --list-jobs
 
 **性能优化建议：**
 - 使用 `--parallel 4` 并行导出，预期提升 2-3x
+- 对 `node_stats`/`index_stats` 建议配合 `--parallel-degree 2~4`，提升单指标吞吐
 - 使用 `--fields` 筛选关键字段，减少数据传输
 - 使用抽样模式减少长时间范围的数据量
 - 适当增大批次大小 (`--batch-size 5000`) 减少请求次数

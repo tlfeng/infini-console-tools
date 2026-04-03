@@ -50,6 +50,7 @@ python metrics_exporter.py --config config.json --job "全量导出-一周"
         "output": { "directory": "./metrics_export_full" },
         "execution": {
           "parallelMetrics": 3,
+          "parallelDegree": 2,
           "scrollKeepalive": "5m"
         },
         "timeRangeHours": 168,
@@ -91,6 +92,18 @@ python metrics_exporter.py --parallel 4
 - 2-4 核机器：parallel=2
 - 4-8 核机器：parallel=3-4
 - 8+ 核机器：parallel=4-6
+
+使用 `--parallel-degree` 或 `execution.parallelDegree` 可在单个指标内并行提取（默认 1）：
+
+```bash
+# 指标间并行 3，单指标内并行 2
+python metrics_exporter.py --parallel 3 --parallel-degree 2
+```
+
+说明：
+- `parallelMetrics`：不同指标类型之间并行
+- `parallelDegree`：单个指标类型内部并行（`node_stats` / `index_stats` / `shard_stats`）
+- `parallelDegree` 在 `sampling` 和 `full` 两种模式下均生效
 
 ### 3. 字段筛选
 
@@ -138,6 +151,7 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
 **抽样实现原理：**
 
 - **`interval` 抽样**：通过 ES 的 `composite` 聚合按时间字段分桶，每桶取一条文档，在服务端完成时间维度的均匀采样
+- 当配置 `parallelDegree > 1` 时，抽样导出会并行执行切片查询，并在客户端按 `(group_fields + time_bucket)` 去重合并，避免重复导出
 
 抽样模式：
 - `interval`: 按时间间隔抽样（如 "1h", "5m", "30s"），每个时间桶保留最新一条记录
@@ -227,6 +241,7 @@ python metrics_exporter.py --slim
   },
   "execution": {
     "parallelMetrics": 2,
+    "parallelDegree": 1,
     "batchSize": null,
     "scrollKeepalive": "5m",
     "maxRetries": 3,
@@ -254,11 +269,23 @@ python metrics_exporter.py --slim
 | `output.directory` | string | 输出目录 |
 | `output.splitBy` | string | 分割方式：metric_type/cluster/none |
 | `execution.parallelMetrics` | int | 并行导出数 |
+| `execution.parallelDegree` | int | 单指标内并行度（默认 1） |
 | `execution.batchSize` | int | 批次大小（null=自适应） |
 | `timeRangeHours` | int | 时间范围（小时） |
 | `maxDocs` | int | 每类型最大文档数 |
 | `sourceFields` | array | 要导出的字段列表 |
 | `includeAlerts` | bool | 是否导出告警数据 |
+
+### 控制台进度输出
+
+导出过程会输出统一的任务级状态，包含：
+
+- 任务启动（每个 metric/alert）
+- 周期性进度（已处理/已导出）
+- 任务完成或失败
+- 阶段切换（监控指标导出、告警导出、摘要写入）
+
+该输出为线程安全实现，可避免并行导出时日志行相互覆盖。
 
 ---
 
