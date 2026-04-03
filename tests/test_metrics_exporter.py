@@ -457,6 +457,84 @@ class TestScrollPagination(unittest.TestCase):
             data = [json.loads(line) for line in lines]
             self.assertEqual([doc["_id"] for doc in data], ["doc-1", "doc-2", "doc-3"])
 
+    def test_export_with_scroll_supports_sliced_parallelism(self):
+        """parallel_degree>1 时应按 slice 并行导出并汇总结果"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/metrics/_search?scroll=5m":
+                slice_info = body.get("slice")
+                self.assertIsNotNone(slice_info)
+
+                if slice_info["id"] == 0:
+                    return {
+                        "_scroll_id": "slice-0-scroll",
+                        "hits": {
+                            "total": {"value": 1},
+                            "hits": [
+                                {
+                                    "_id": "s0-doc-1",
+                                    "_source": {"value": 1},
+                                    "sort": [2, "s0-doc-1"],
+                                }
+                            ],
+                        },
+                    }
+
+                if slice_info["id"] == 1:
+                    return {
+                        "_scroll_id": "slice-1-scroll",
+                        "hits": {
+                            "total": {"value": 1},
+                            "hits": [
+                                {
+                                    "_id": "s1-doc-1",
+                                    "_source": {"value": 2},
+                                    "sort": [1, "s1-doc-1"],
+                                }
+                            ],
+                        },
+                    }
+
+            if method == "POST" and path == "/_search/scroll":
+                if body["scroll_id"] == "slice-0-scroll":
+                    return {"_scroll_id": "slice-0-end", "hits": {"hits": []}}
+                if body["scroll_id"] == "slice-1-scroll":
+                    return {"_scroll_id": "slice-1-end", "hits": {"hits": []}}
+
+            if method == "DELETE" and path == "/_search/scroll":
+                return {"succeeded": True}
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            count, file_paths = exporter.export_with_scroll(
+                index_pattern="metrics",
+                query={"query": {"match_all": {}}},
+                output_file=temp_base,
+                batch_size=1,
+                parallel_degree=2,
+            )
+
+            self.assertEqual(count, 2)
+            self.assertTrue(any(f.startswith("test_slice0") for f in file_paths))
+            self.assertTrue(any(f.startswith("test_slice1") for f in file_paths))
+
+            with open(f"{temp_base}_slice0.jsonl", 'r') as f:
+                docs0 = [json.loads(line) for line in f.readlines()]
+            with open(f"{temp_base}_slice1.jsonl", 'r') as f:
+                docs1 = [json.loads(line) for line in f.readlines()]
+
+            self.assertEqual([d["_id"] for d in docs0], ["s0-doc-1"])
+            self.assertEqual([d["_id"] for d in docs1], ["s1-doc-1"])
+
 
 class TestStratifiedSampling(unittest.TestCase):
     """测试 ES 端分层抽样导出"""

@@ -21,10 +21,12 @@ Metrics Exporter - Console 监控数据导出工具 (优化版)
 """
 
 import argparse
+import copy
 import getpass
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -109,6 +111,7 @@ ALERT_TYPES = {
 DEFAULT_BATCH_SIZE = 3000
 DEFAULT_SCROLL_KEEPALIVE = "5m"  # 增加到 5 分钟，避免大数据量时 scroll context 过期
 DEFAULT_PARALLEL_JOBS = 2  # 默认并行导出的指标类型数
+DEFAULT_PARALLEL_DEGREE = 1  # 单个指标内部并行度（基于 sliced scroll）
 
 
 class JSONLinesWriter:
@@ -282,11 +285,13 @@ class MetricsExporter:
         system_cluster_id: str,
         scroll_keepalive: str = DEFAULT_SCROLL_KEEPALIVE,
         parallel_jobs: int = DEFAULT_PARALLEL_JOBS,
+        parallel_degree: int = DEFAULT_PARALLEL_DEGREE,
     ):
         self.client = client
         self.system_cluster_id = system_cluster_id
         self.scroll_keepalive = scroll_keepalive
         self.parallel_jobs = parallel_jobs
+        self.parallel_degree = max(1, parallel_degree)
 
     @staticmethod
     def _mask_doc(value: Any) -> Any:
@@ -559,7 +564,7 @@ class MetricsExporter:
                 doc_copy = self._slim_doc(doc_copy, slim_config)
             writer.write_doc(doc_copy)
 
-    def export_with_scroll(
+    def _export_with_scroll_single(
         self,
         index_pattern: str,
         query: Dict,
@@ -657,6 +662,104 @@ class MetricsExporter:
             self.clear_scroll(scroll_id)
 
         return total_exported, writer.get_file_paths()
+
+    def _export_with_sliced_scroll(
+        self,
+        index_pattern: str,
+        query: Dict,
+        output_file: str,
+        batch_size: int,
+        shard_size: int,
+        parallel_degree: int,
+        progress_callback=None,
+        slim_config: SlimConfig = None,
+        mask_ip: bool = False,
+    ) -> Tuple[int, List[str]]:
+        """使用 sliced scroll 在单个指标内并行导出。"""
+        effective_slices = max(1, parallel_degree)
+        progress_lock = threading.Lock()
+        per_slice_exported = [0] * effective_slices
+        total_exported = 0
+        all_file_paths: List[str] = []
+
+        def make_slice_progress(slice_id: int):
+            def _callback(current: int, _total: int):
+                nonlocal total_exported
+                with progress_lock:
+                    delta = current - per_slice_exported[slice_id]
+                    if delta > 0:
+                        per_slice_exported[slice_id] = current
+                        total_exported += delta
+                        if progress_callback:
+                            progress_callback(total_exported, 0)
+
+            return _callback
+
+        def run_slice(slice_id: int) -> Tuple[int, List[str]]:
+            slice_query = copy.deepcopy(query)
+            slice_query["slice"] = {"id": slice_id, "max": effective_slices}
+            slice_output_base = f"{output_file}_slice{slice_id}"
+
+            return self._export_with_scroll_single(
+                index_pattern=index_pattern,
+                query=slice_query,
+                output_file=slice_output_base,
+                batch_size=batch_size,
+                shard_size=shard_size,
+                progress_callback=make_slice_progress(slice_id),
+                slim_config=slim_config,
+                mask_ip=mask_ip,
+            )
+
+        with ThreadPoolExecutor(max_workers=effective_slices) as executor:
+            futures = {executor.submit(run_slice, slice_id): slice_id for slice_id in range(effective_slices)}
+
+            for future in as_completed(futures):
+                slice_id = futures[future]
+                count, file_paths = future.result()
+                # 某些分片可能无数据，保留空文件行为以便定位分片执行状态
+                all_file_paths.extend(file_paths)
+                with progress_lock:
+                    per_slice_exported[slice_id] = count
+
+        return sum(per_slice_exported), sorted(all_file_paths)
+
+    def export_with_scroll(
+        self,
+        index_pattern: str,
+        query: Dict,
+        output_file: str,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        shard_size: int = 100000,
+        progress_callback=None,
+        slim_config: SlimConfig = None,
+        mask_ip: bool = False,
+        parallel_degree: int = 1,
+    ) -> Tuple[int, List[str]]:
+        """使用 scroll API 导出数据，可选在单个指标内启用 sliced scroll 并行。"""
+        if parallel_degree and parallel_degree > 1:
+            return self._export_with_sliced_scroll(
+                index_pattern=index_pattern,
+                query=query,
+                output_file=output_file,
+                batch_size=batch_size,
+                shard_size=shard_size,
+                parallel_degree=parallel_degree,
+                progress_callback=progress_callback,
+                slim_config=slim_config,
+                mask_ip=mask_ip,
+            )
+
+        return self._export_with_scroll_single(
+            index_pattern=index_pattern,
+            query=query,
+            output_file=output_file,
+            batch_size=batch_size,
+            shard_size=shard_size,
+            progress_callback=progress_callback,
+            slim_config=slim_config,
+            mask_ip=mask_ip,
+        )
 
     def _resume_with_search_after(
         self,
@@ -1018,6 +1121,7 @@ class MetricsExporter:
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
         skip_estimation: bool = False,
+        parallel_degree: int = 1,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -1077,6 +1181,12 @@ class MetricsExporter:
                     mask_ip,
                 )
             else:
+                # 单指标并行仅对大体量 stats 指标开启，避免小指标引入额外调度开销
+                metric_parallel_degree = (
+                    max(1, parallel_degree)
+                    if metric_type in {"node_stats", "index_stats", "shard_stats"}
+                    else 1
+                )
                 count, file_paths = self.export_with_scroll(
                     config["index_pattern"],
                     query,
@@ -1086,6 +1196,7 @@ class MetricsExporter:
                     progress_callback,
                     slim_config,
                     mask_ip,
+                    metric_parallel_degree,
                 )
 
             result.count = count
@@ -1229,6 +1340,7 @@ class MetricsExporter:
         batch_size: int = None,
         source_fields: List[str] = None,
         parallel_jobs: int = None,
+        parallel_degree: int = 1,
         sampling: SamplingConfig = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
@@ -1282,6 +1394,7 @@ class MetricsExporter:
             "batch_size": batch_size,
             "scroll_keepalive": self.scroll_keepalive,
             "parallel_jobs": effective_parallel,
+            "parallel_degree": max(1, parallel_degree),
             "cluster_filter": cluster_id_filter,
             "cluster_ids": cluster_ids,
             "source_fields": source_fields,
@@ -1335,6 +1448,7 @@ class MetricsExporter:
                     slim_config,
                     mask_ip,
                     skip_estimation,
+                    parallel_degree,
                 )
                 futures[future] = metric_type
 
@@ -1440,6 +1554,7 @@ class MetricsExporter:
         # 更新执行参数
         self.scroll_keepalive = job.execution.scroll_keepalive
         self.parallel_jobs = job.execution.parallel_metrics
+        self.parallel_degree = max(1, job.execution.parallel_degree)
 
         # 执行导出
         return self.export_all(
@@ -1453,6 +1568,7 @@ class MetricsExporter:
             batch_size=job.execution.batch_size,
             source_fields=job.source_fields,
             parallel_jobs=job.execution.parallel_metrics,
+            parallel_degree=job.execution.parallel_degree,
             sampling=job.sampling,
             slim_config=job.slim,
             mask_ip=job.mask_ip,
@@ -1494,6 +1610,7 @@ class MetricsExporter:
         print(f"批次大小: {summary.get('batch_size', '自适应')}")
         print(f"Scroll Keepalive: {summary.get('scroll_keepalive', DEFAULT_SCROLL_KEEPALIVE)}")
         print(f"并行度: {summary.get('parallel_jobs', 2)}")
+        print(f"单指标并行度: {summary.get('parallel_degree', 1)}")
 
         if summary.get("cluster_filter"):
             print(f"集群过滤: {summary['cluster_filter']}")
@@ -1573,6 +1690,12 @@ Examples:
         type=int,
         default=2,
         help="并行导出的指标类型数，默认2",
+    )
+    parser.add_argument(
+        "--parallel-degree",
+        type=int,
+        default=1,
+        help="单个指标内并行度（sliced scroll），默认1",
     )
     parser.add_argument(
         "--cluster-id",
@@ -1792,6 +1915,7 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
         "output": {"directory": output_dir},
         "execution": {
             "parallelMetrics": args.parallel,
+            "parallelDegree": args.parallel_degree,
             "batchSize": args.batch_size,
             "scrollKeepalive": args.scroll_keepalive,
         },
