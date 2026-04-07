@@ -1239,6 +1239,88 @@ class TestStratifiedSampling(unittest.TestCase):
             data = [json.loads(line) for line in lines]
             self.assertEqual([d["_id"] for d in data], ["doc-1", "doc-2", "doc-3"])
 
+    def test_sampling_bucket_uses_avg_value_as_sample_point(self):
+        """sampling 应优先使用桶内 avg 值作为采样点 value"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                return {
+                    "aggregations": {
+                        "sampled": {
+                            "buckets": [
+                                {
+                                    "key": {
+                                        "group_0": "c1",
+                                        "group_1": "n1",
+                                        "time_bucket": 1712016000000,
+                                    },
+                                    "latest": {
+                                        "hits": {
+                                            "hits": [
+                                                {
+                                                    "_id": "doc-1",
+                                                    "_source": {
+                                                        "timestamp": "2026-04-02T00:00:00Z",
+                                                        "value": 10,
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    "avg_0": {"value": 25.5},
+                                }
+                            ]
+                        }
+                    }
+                }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+            )
+
+            self.assertEqual(result.count, 1)
+
+            with open(f"{temp_base}.jsonl", 'r') as f:
+                data = [json.loads(line) for line in f.readlines()]
+
+            self.assertEqual(data[0]["_id"], "doc-1")
+            self.assertEqual(data[0]["value"], 25.5)
+
     def test_export_with_scroll_recovers_with_search_after(self):
         """scroll context 过期后应使用 search_after 恢复导出"""
         mock_client = MagicMock()

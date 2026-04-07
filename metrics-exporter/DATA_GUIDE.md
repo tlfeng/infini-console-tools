@@ -150,11 +150,11 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
 
 **抽样实现原理：**
 
-- **`interval` 抽样**：通过 ES 的 `composite` 聚合按时间字段分桶，每桶取一条文档，在服务端完成时间维度的均匀采样
+- **`interval` 抽样**：通过 ES 的 `composite` 聚合按时间字段分桶，并在桶内用 `avg` 聚合计算采样点数值；导出时保留最新文档作为上下文并用平均值覆盖采样字段
 - 当配置 `parallelDegree > 1` 时，抽样导出会并行执行切片查询，并在客户端按 `(group_fields + time_bucket)` 去重合并，避免重复导出
 
 抽样模式：
-- `interval`: 按时间间隔抽样（如 "1h", "5m", "30s"），每个时间桶保留最新一条记录
+- `interval`: 按时间间隔抽样（如 "1h", "5m", "30s"），每个时间桶输出一个采样点，采样值为该桶内周围数据点的平均值
 
 ### 5. 精简数据
 
