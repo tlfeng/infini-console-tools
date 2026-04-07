@@ -189,6 +189,8 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 **参数：**
 ```bash
 --time-range HOURS       导出时间范围(小时)，默认24
+--start-time TIME        开始时间，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
+--end-time TIME          结束时间，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
 --max-docs N             每种类型最大文档数，默认100000（0=无限制）
 --batch-size N           每批次读取的文档数，默认自适应 (2000-5000)
 --scroll-keepalive TIME  Scroll 上下文保持时间，默认5m
@@ -214,6 +216,10 @@ python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p
 # 导出最近7天数据，并行度4
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
   --time-range 168 --parallel 4
+
+# 按绝对时间范围导出
+python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
+  --start-time "2026-04-03 11:38:46" --end-time "2026-04-03"
 
 # 只导出关键字段
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
@@ -252,6 +258,8 @@ python metrics-exporter/metrics_exporter.py --config config.json --list-jobs
         "output": { "directory": "./metrics_export_full" },
         "execution": { "parallelMetrics": 3, "parallelDegree": 2, "scrollKeepalive": "5m" },
         "timeRangeHours": 168,
+        "startTime": "2026-04-03 11:38:46",
+        "endTime": "2026-04-03",
         "maxDocs": 1000000
       },
       {

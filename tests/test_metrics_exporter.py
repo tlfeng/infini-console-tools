@@ -329,6 +329,56 @@ class TestQueryBuilding(unittest.TestCase):
 
         self.assertEqual(query["query"], {"match_all": {}})
 
+    def test_query_with_explicit_time_range_datetime(self):
+        """支持 YYYY-MM-DD HH:MM:SS 格式的起止时间"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03 11:38:46",
+            end_time="2026-04-03 12:38:46",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T11:38:46+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T12:38:46+00:00")
+
+    def test_query_with_explicit_time_range_date_only(self):
+        """支持 YYYY-MM-DD 格式，结束时间自动补 23:59:59"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03",
+            end_time="2026-04-03",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T00:00:00+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T23:59:59+00:00")
+
+    def test_query_with_invalid_time_format_raises(self):
+        """不支持的时间格式应抛出异常"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        with self.assertRaises(ValueError):
+            exporter.build_metrics_query(
+                'metadata.name:"node_stats"',
+                time_range_hours=24,
+                start_time="2026/04/03",
+            )
+
     def test_sampling_group_fields_for_node_stats(self):
         """node_stats 抽样应固定按 cluster_id + node_id 分组"""
         mock_client = MagicMock()

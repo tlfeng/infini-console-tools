@@ -251,6 +251,8 @@ class MetricsJobConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     time_range_hours: int = 24
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
     shard_size: int = 100000  # 每个分片文件的最大文档数
     source_fields: Optional[List[str]] = None
     include_alerts: bool = True
@@ -270,6 +272,26 @@ class MetricsJobConfig:
         alert_types = data.get('alertTypes', [])
         _validate_types(name, alert_types, "alerts")
 
+        has_time_range = 'timeRangeHours' in data and data.get('timeRangeHours') is not None
+        has_start_time = data.get('startTime') is not None
+        has_end_time = data.get('endTime') is not None
+
+        # 时间配置模式互斥：只能选择 timeRangeHours 或 startTime+endTime
+        if has_time_range and (has_start_time or has_end_time):
+            raise ConfigValidationError(
+                f"job '{name}' 的时间配置冲突：timeRangeHours 与 startTime/endTime 只能二选一"
+            )
+
+        if has_start_time != has_end_time:
+            raise ConfigValidationError(
+                f"job '{name}' 的时间配置不完整：使用绝对时间时必须同时提供 startTime 和 endTime"
+            )
+
+        time_range_hours = data.get('timeRangeHours', 24)
+        if has_start_time and has_end_time:
+            # 绝对时间模式下，保留一个默认值占位，不参与实际查询
+            time_range_hours = 24
+
         return cls(
             name=name,
             enabled=data.get('enabled', True),
@@ -280,7 +302,9 @@ class MetricsJobConfig:
             mask_ip=data.get('maskIp', False),
             output=OutputConfig.from_dict(data.get('output', {})),
             execution=ExecutionConfig.from_dict(data.get('execution', {})),
-            time_range_hours=data.get('timeRangeHours', 24),
+            time_range_hours=time_range_hours,
+            start_time=data.get('startTime'),
+            end_time=data.get('endTime'),
             shard_size=data.get('shardSize', 100000),
             source_fields=data.get('sourceFields'),
             include_alerts=data.get('includeAlerts', True),

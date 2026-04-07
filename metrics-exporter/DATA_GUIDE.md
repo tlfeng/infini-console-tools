@@ -272,6 +272,8 @@ python metrics_exporter.py --slim
 | `execution.parallelDegree` | int | 单指标内并行度（默认 1） |
 | `execution.batchSize` | int | 批次大小（null=自适应） |
 | `timeRangeHours` | int | 时间范围（小时） |
+| `startTime` | string | 开始时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
+| `endTime` | string | 结束时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
 | `maxDocs` | int | 每类型最大文档数 |
 | `sourceFields` | array | 要导出的字段列表 |
 | `includeAlerts` | bool | 是否导出告警数据 |
@@ -597,6 +599,8 @@ timestamp       - 时间戳
 | `--job` | 指定执行的 job 名称 | - |
 | `--list-jobs` | 列出所有 jobs | - |
 | `--time-range` | 时间范围(小时) | 24 |
+| `--start-time` | 开始时间（绝对时间） | - |
+| `--end-time` | 结束时间（绝对时间） | - |
 | `--max-docs` | 每类型最大文档数 | 100000 |
 | `--batch-size` | 批次大小 | 自适应 |
 | `--scroll-keepalive` | Scroll 保持时间 | 5m |
@@ -620,6 +624,8 @@ timestamp       - 时间戳
 2. **时间范围**
    - 默认导出最近 24 小时数据
    - 可通过 `--time-range` 调整（单位：小时）
+  - 也可通过 `--start-time`/`--end-time` 指定绝对时间窗口
+  - 支持格式：`YYYY-MM-DD HH:MM:SS` 或 `YYYY-MM-DD`
    - 注意数据量随时间范围增加
 
 3. **敏感信息**

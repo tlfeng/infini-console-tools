@@ -329,6 +329,66 @@ class MetricsExporter:
         "data.value",
     )
 
+    @staticmethod
+    def _parse_time_input(raw: str, is_end: bool = False) -> datetime:
+        """解析时间字符串，支持 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD。"""
+        if not raw:
+            raise ValueError("时间字符串不能为空")
+
+        raw = raw.strip()
+        parsed: Optional[datetime] = None
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                # 日期格式默认解释为当天起止
+                if fmt == "%Y-%m-%d" and is_end:
+                    parsed = parsed.replace(hour=23, minute=59, second=59)
+                break
+            except ValueError:
+                continue
+
+        if parsed is None:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(
+                    f"无效时间格式: {raw}，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'"
+                ) from exc
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+
+        return parsed
+
+    def _resolve_time_window(
+        self,
+        time_range_hours: int,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+    ) -> Tuple[datetime, datetime]:
+        """解析最终时间窗口。未指定绝对时间时使用最近 N 小时。"""
+        now = datetime.now(timezone.utc)
+        start_dt = self._parse_time_input(start_time, is_end=False) if start_time else None
+        end_dt = self._parse_time_input(end_time, is_end=True) if end_time else None
+
+        if start_dt is None and end_dt is None:
+            end_dt = now
+            start_dt = now - timedelta(hours=time_range_hours)
+        elif start_dt is None:
+            start_dt = end_dt - timedelta(hours=time_range_hours)
+        elif end_dt is None:
+            end_dt = now
+
+        if start_dt > end_dt:
+            raise ValueError(
+                f"开始时间不能晚于结束时间: start={start_dt.isoformat()}, end={end_dt.isoformat()}"
+            )
+
+        return start_dt, end_dt
+
     def __init__(
         self,
         client: ConsoleClient,
@@ -428,14 +488,15 @@ class MetricsExporter:
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         source_fields: List[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
     ) -> Dict:
         """构建监控指标查询"""
-        now = datetime.now(timezone.utc)
-        start_time = now - timedelta(hours=time_range_hours)
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
 
         must_clauses = [
             {"query_string": {"query": query_filter}},
-            {"range": {"timestamp": {"gte": start_time.isoformat(), "lte": now.isoformat()}}},
+            {"range": {"timestamp": {"gte": start_dt.isoformat(), "lte": end_dt.isoformat()}}},
         ]
 
         # 单个集群过滤（向后兼容）
@@ -474,6 +535,8 @@ class MetricsExporter:
         alert_type: str,
         time_range_hours: int,
         source_fields: List[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
     ) -> Dict:
         """构建告警数据查询。
 
@@ -484,8 +547,7 @@ class MetricsExporter:
         if alert_type == "alert_rules":
             return self.build_all_docs_query(source_fields)
 
-        now = datetime.now(timezone.utc)
-        start_time = now - timedelta(hours=time_range_hours)
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
 
         # 优先使用不同告警类型的主时间字段
         time_field = "timestamp" if alert_type == "alert_history" else "created"
@@ -497,8 +559,8 @@ class MetricsExporter:
                         {
                             "range": {
                                 time_field: {
-                                    "gte": start_time.isoformat(),
-                                    "lte": now.isoformat(),
+                                    "gte": start_dt.isoformat(),
+                                    "lte": end_dt.isoformat(),
                                 }
                             }
                         }
@@ -1257,6 +1319,8 @@ class MetricsExporter:
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
         sampling: SamplingConfig = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
     ) -> tuple:
         """
         估计要导出的数据条数
@@ -1272,6 +1336,8 @@ class MetricsExporter:
             cluster_id_filter,
             cluster_ids,
             None,
+            start_time,
+            end_time,
         )
 
         try:
@@ -1400,6 +1466,8 @@ class MetricsExporter:
         skip_estimation: bool = False,
         parallel_degree: int = 1,
         progress_reporter: Optional[ConsoleProgressReporter] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -1411,7 +1479,7 @@ class MetricsExporter:
             skip_estimation: 跳过数据量预估，加速启动
         """
         result = ExportResult(metric_type, config["name"])
-        start_time = time.time()
+        start_ts = time.time()
 
         try:
             # 使用配置的批次大小或默认值
@@ -1421,7 +1489,14 @@ class MetricsExporter:
             total_docs, sampled_docs = -1, -1
             if not skip_estimation:
                 total_docs, sampled_docs = self.estimate_export_count(
-                    metric_type, config, time_range_hours, cluster_id_filter, cluster_ids, sampling
+                    metric_type,
+                    config,
+                    time_range_hours,
+                    cluster_id_filter,
+                    cluster_ids,
+                    sampling,
+                    start_time,
+                    end_time,
                 )
                 if total_docs >= 0:
                     # 判断是否有抽样
@@ -1440,6 +1515,8 @@ class MetricsExporter:
                 cluster_id_filter,
                 cluster_ids,
                 source_fields,
+                start_time,
+                end_time,
             )
 
             progress_callback = self._make_progress_callback(metric_type, progress_reporter)
@@ -1490,7 +1567,7 @@ class MetricsExporter:
         except Exception as e:
             result.error = str(e)
 
-        result.duration_ms = int((time.time() - start_time) * 1000)
+        result.duration_ms = int((time.time() - start_ts) * 1000)
         return result
 
     def export_alert_type(
@@ -1505,6 +1582,8 @@ class MetricsExporter:
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
         progress_reporter: Optional[ConsoleProgressReporter] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
     ) -> ExportResult:
         """导出告警相关数据（支持自动分片）
 
@@ -1515,11 +1594,11 @@ class MetricsExporter:
             mask_ip: 是否脱敏IP地址
         """
         result = ExportResult(alert_type, config["name"])
-        start_time = time.time()
+        start_ts = time.time()
 
         try:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
-            query = self.build_alert_query(alert_type, time_range_hours, source_fields)
+            query = self.build_alert_query(alert_type, time_range_hours, source_fields, start_time, end_time)
 
             count, file_paths = self.export_with_scroll(
                 config["index_pattern"],
@@ -1545,15 +1624,22 @@ class MetricsExporter:
         except Exception as e:
             result.error = str(e)
 
-        result.duration_ms = int((time.time() - start_time) * 1000)
+        result.duration_ms = int((time.time() - start_ts) * 1000)
         return result
 
-    def get_available_clusters(self, time_range_hours: int = 24) -> List[Dict]:
+    def get_available_clusters(
+        self,
+        time_range_hours: int = 24,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+    ) -> List[Dict]:
         """获取有监控数据的集群列表
 
         Args:
             time_range_hours: 查询时间范围（小时），默认 24 小时
         """
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+
         query = {
             "size": 0,
             "aggs": {
@@ -1576,7 +1662,14 @@ class MetricsExporter:
                 "bool": {
                     "must": [
                         {"query_string": {"query": 'metadata.name:"cluster_health"'}},
-                        {"range": {"timestamp": {"gte": f"now-{time_range_hours}h"}}},
+                        {
+                            "range": {
+                                "timestamp": {
+                                    "gte": start_dt.isoformat(),
+                                    "lte": end_dt.isoformat(),
+                                }
+                            }
+                        },
                     ]
                 }
             },
@@ -1612,6 +1705,8 @@ class MetricsExporter:
         metric_types: List[str] = None,
         alert_types: List[str] = None,
         time_range_hours: int = 24,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
         shard_size: int = 100000,
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
@@ -1641,6 +1736,8 @@ class MetricsExporter:
             export_summary = {
                 "export_time": datetime.now().isoformat(),
                 "time_range_hours": time_range_hours,
+                "start_time": start_time,
+                "end_time": end_time,
                 "cluster_ids": [],
                 "metric_types": {},
                 "alert_types": {},
@@ -1670,6 +1767,8 @@ class MetricsExporter:
         export_summary = {
             "export_time": datetime.now().isoformat(),
             "time_range_hours": time_range_hours,
+            "start_time": start_time,
+            "end_time": end_time,
             "shard_size": shard_size,
             "batch_size": batch_size,
             "scroll_keepalive": self.scroll_keepalive,
@@ -1689,7 +1788,7 @@ class MetricsExporter:
         clusters = []
         if not cluster_ids and not cluster_id_filter:
             progress_reporter.stage("\n正在获取有监控数据的集群列表...")
-            clusters = self.get_available_clusters(time_range_hours)
+            clusters = self.get_available_clusters(time_range_hours, start_time, end_time)
             export_summary["clusters_with_data"] = clusters
             progress_reporter.stage(f"找到 {len(clusters)} 个有监控数据的集群")
             if not clusters:
@@ -1731,6 +1830,8 @@ class MetricsExporter:
                     skip_estimation,
                     parallel_degree,
                     progress_reporter,
+                    start_time,
+                    end_time,
                 )
                 futures[future] = metric_type
 
@@ -1749,9 +1850,8 @@ class MetricsExporter:
             export_summary["metric_types"][result.metric_type] = result.to_dict()
 
         # 导出告警数据（并行）
-        if include_alerts:
+        if include_alerts and alert_types:
             progress_reporter.stage(f"\n正在导出告警数据 (并行度: {effective_parallel})...")
-
             alert_results: List[ExportResult] = []
             valid_alert_types = [t for t in alert_types if t in ALERT_TYPES]
 
@@ -1778,6 +1878,8 @@ class MetricsExporter:
                         slim_config,
                         mask_ip,
                         progress_reporter,
+                        start_time,
+                        end_time,
                     )
                     futures[future] = alert_type
 
@@ -1814,7 +1916,7 @@ class MetricsExporter:
         cluster_filter_specified = False  # 标记用户是否指定了集群过滤
         if job.targets and job.targets.clusters:
             cluster_filter_specified = True
-            all_clusters = self.get_available_clusters(job.time_range_hours)
+            all_clusters = self.get_available_clusters(job.time_range_hours, job.start_time, job.end_time)
             cluster_ids = [
                 c['cluster_id'] for c in all_clusters
                 if job.targets.clusters.matches(c['cluster_id']) or
@@ -1842,6 +1944,8 @@ class MetricsExporter:
             metric_types=job.metrics,
             alert_types=job.alert_types if job.include_alerts else [],
             time_range_hours=job.time_range_hours,
+            start_time=job.start_time,
+            end_time=job.end_time,
             shard_size=job.shard_size,
             cluster_ids=cluster_ids,
             include_alerts=job.include_alerts,
@@ -1885,7 +1989,13 @@ class MetricsExporter:
         print("导出摘要")
         print("=" * 60)
         print(f"导出时间: {summary['export_time']}")
-        print(f"时间范围: 最近 {summary['time_range_hours']} 小时")
+        if summary.get("start_time") or summary.get("end_time"):
+            print(
+                "时间范围: "
+                f"{summary.get('start_time') or '自动计算'} ~ {summary.get('end_time') or '当前时间'}"
+            )
+        else:
+            print(f"时间范围: 最近 {summary['time_range_hours']} 小时")
         print(f"分片大小: {summary.get('shard_size', 100000):,} 条/文件")
         print(f"批次大小: {summary.get('batch_size', '自适应')}")
         print(f"Scroll Keepalive: {summary.get('scroll_keepalive', DEFAULT_SCROLL_KEEPALIVE)}")
@@ -1944,8 +2054,20 @@ Examples:
     parser.add_argument(
         "--time-range",
         type=int,
-        default=24,
+        default=None,
         help="导出时间范围(小时)，默认24小时",
+    )
+    parser.add_argument(
+        "--start-time",
+        type=str,
+        default=None,
+        help="开始时间，格式: 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'",
+    )
+    parser.add_argument(
+        "--end-time",
+        type=str,
+        default=None,
+        help="结束时间，格式: 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'",
     )
     parser.add_argument(
         "--shard-size",
@@ -2106,7 +2228,10 @@ def _list_jobs(app_config: AppConfig) -> None:
         ) + ")" if job.sampling.is_sampling() else " (全量)"
         print(f"  {status} {job.name}{sampling_str}")
         print(f"      指标: {', '.join(job.metrics)}")
-        print(f"      时间范围: {job.time_range_hours}h")
+        if job.start_time or job.end_time:
+            print(f"      时间范围: {job.start_time or '自动计算'} ~ {job.end_time or '当前时间'}")
+        else:
+            print(f"      时间范围: {job.time_range_hours}h")
 
 
 def _connect_console(console_url: str, username: str, password: str, timeout: int, insecure: bool) -> ConsoleClient:
@@ -2184,11 +2309,19 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
     """命令行模式：构建 job 并执行"""
     output_dir = args.output or f"metrics_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+    has_absolute_range = bool(args.start_time or args.end_time)
+    if has_absolute_range and args.time_range is not None:
+        print("时间参数错误: --time-range 与 --start-time/--end-time 只能二选一")
+        sys.exit(1)
+
+    if (args.start_time is None) != (args.end_time is None):
+        print("时间参数错误: 使用绝对时间时必须同时提供 --start-time 和 --end-time")
+        sys.exit(1)
+
     # 构建 job 配置
     job_config = {
         "name": "命令行导出",
         "enabled": True,
-        "timeRangeHours": args.time_range,
         "shardSize": args.shard_size,
         "includeAlerts": not args.no_alerts,
         "maskIp": args.mask_ip,
@@ -2200,6 +2333,12 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
             "scrollKeepalive": args.scroll_keepalive,
         },
     }
+
+    if has_absolute_range:
+        job_config["startTime"] = args.start_time
+        job_config["endTime"] = args.end_time
+    elif args.time_range is not None:
+        job_config["timeRangeHours"] = args.time_range
 
     if args.metric_types:
         job_config["metrics"] = [t.strip() for t in args.metric_types.split(",")]
@@ -2215,6 +2354,14 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
 
     if args.cluster_id:
         job_config["targets"] = {"clusters": {"include": [args.cluster_id]}}
+
+    # 命令行提前校验时间参数，尽早反馈用户
+    try:
+        MetricsExporter._parse_time_input(args.start_time, is_end=False) if args.start_time else None
+        MetricsExporter._parse_time_input(args.end_time, is_end=True) if args.end_time else None
+    except ValueError as e:
+        print(f"时间参数错误: {e}")
+        sys.exit(1)
 
     job = MetricsJobConfig.from_dict(job_config)
 

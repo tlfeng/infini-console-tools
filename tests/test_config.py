@@ -341,6 +341,37 @@ class TestMetricsJobConfig(unittest.TestCase):
         self.assertTrue(job.sampling.is_sampling())
         self.assertEqual(job.sampling.interval, "1h")
 
+    def test_job_with_explicit_start_end_time(self):
+        """支持在 job 中配置绝对时间范围"""
+        job = MetricsJobConfig.from_dict({
+            "name": "range-job",
+            "metrics": ["node_stats"],
+            "startTime": "2026-04-03 11:38:46",
+            "endTime": "2026-04-03",
+        })
+        self.assertEqual(job.start_time, "2026-04-03 11:38:46")
+        self.assertEqual(job.end_time, "2026-04-03")
+
+    def test_job_time_mode_conflict_raises(self):
+        """timeRangeHours 与 start/end 不能同时配置"""
+        with self.assertRaises(ConfigValidationError):
+            MetricsJobConfig.from_dict({
+                "name": "conflict-job",
+                "metrics": ["node_stats"],
+                "timeRangeHours": 24,
+                "startTime": "2026-04-03 11:38:46",
+                "endTime": "2026-04-03 12:38:46",
+            })
+
+    def test_job_absolute_time_requires_start_and_end(self):
+        """绝对时间模式必须同时提供 startTime/endTime"""
+        with self.assertRaises(ConfigValidationError):
+            MetricsJobConfig.from_dict({
+                "name": "partial-time-job",
+                "metrics": ["node_stats"],
+                "startTime": "2026-04-03 11:38:46",
+            })
+
 
 class TestAppConfig(unittest.TestCase):
     """测试完整应用配置"""
