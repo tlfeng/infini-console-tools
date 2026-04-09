@@ -321,13 +321,6 @@ class MetricsExporter:
     SLIM_META_FIELDS = {"_id", "agent"}
     SLIM_META_PREFIXES = ("category", "datatype", "name")  # metadata 下的字段
     SLIM_HUMAN_READABLE = {"store", "estimated_size", "limit_size"}
-    # 采样时优先尝试这些常见数值字段的平均值
-    SAMPLING_AVG_CANDIDATE_FIELDS = (
-        "value",
-        "metrics.value",
-        "metric.value",
-        "data.value",
-    )
 
     @staticmethod
     def _parse_time_input(raw: str, is_end: bool = False) -> datetime:
@@ -968,38 +961,14 @@ class MetricsExporter:
                 return None
         return value
 
-    def _set_nested_value(self, doc: Dict[str, Any], field_path: str, value: Any) -> None:
-        """设置嵌套字段值，不存在的路径会自动创建。"""
-        parts = field_path.split(".")
-        cur = doc
-        for part in parts[:-1]:
-            existing = cur.get(part)
-            if not isinstance(existing, dict):
-                existing = {}
-                cur[part] = existing
-            cur = existing
-        cur[parts[-1]] = value
-
     def _build_sampling_point_from_bucket(self, bucket: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """从 sampling bucket 构建采样点。
-
-        先取 latest 文档作为基准，再用 avg 聚合值覆盖对应字段。
-        """
+        """从 sampling bucket 构建采样点（保留时间桶内最新真实快照）。"""
         hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
         if not hits:
             return None
 
         hit = hits[0]
-        doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
-
-        for i, field in enumerate(self.SAMPLING_AVG_CANDIDATE_FIELDS):
-            agg = bucket.get(f"avg_{i}", {})
-            avg_value = agg.get("value") if isinstance(agg, dict) else None
-            if avg_value is None:
-                continue
-            self._set_nested_value(doc, field, avg_value)
-
-        return doc
+        return {"_id": hit.get("_id"), **hit.get("_source", {})}
 
     def export_with_es_sampling(
         self,
@@ -1084,9 +1053,6 @@ class MetricsExporter:
                     }
                 }
             }
-
-            for i, field in enumerate(self.SAMPLING_AVG_CANDIDATE_FIELDS):
-                sampling_aggs[f"avg_{i}"] = {"avg": {"field": field}}
 
             body = {
                 "size": 0,

@@ -1289,8 +1289,8 @@ class TestStratifiedSampling(unittest.TestCase):
             data = [json.loads(line) for line in lines]
             self.assertEqual([d["_id"] for d in data], ["doc-1", "doc-2", "doc-3"])
 
-    def test_sampling_bucket_uses_avg_value_as_sample_point(self):
-        """sampling 应优先使用桶内 avg 值作为采样点 value"""
+    def test_sampling_bucket_uses_latest_snapshot_as_sample_point(self):
+        """sampling 应使用桶内 latest 真实快照作为采样点"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
@@ -1339,7 +1339,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                             ]
                                         }
                                     },
-                                    "avg_0": {"value": 25.5},
                                 }
                             ]
                         }
@@ -1369,7 +1368,7 @@ class TestStratifiedSampling(unittest.TestCase):
                 data = [json.loads(line) for line in f.readlines()]
 
             self.assertEqual(data[0]["_id"], "doc-1")
-            self.assertEqual(data[0]["value"], 25.5)
+            self.assertEqual(data[0]["value"], 10)
 
     def test_export_with_scroll_recovers_with_search_after(self):
         """scroll context 过期后应使用 search_after 恢复导出"""
