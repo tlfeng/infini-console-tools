@@ -802,6 +802,13 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(result.count, 2)
             self.assertTrue(any(f.startswith("test_worker0") for f in result.file_paths))
             self.assertTrue(any(f.startswith("test_worker1") for f in result.file_paths))
+            self.assertEqual(
+                result.shard_info,
+                [
+                    {"file": "test_worker0.jsonl", "count": 1},
+                    {"file": "test_worker1.jsonl", "count": 1},
+                ],
+            )
 
             with open(f"{temp_base}_worker0.jsonl", 'r') as f:
                 data0 = [json.loads(line) for line in f.readlines()]
@@ -1094,6 +1101,16 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
+                # estimate_export_count 的 cardinality 预估查询
+                if "group_cardinality" in body.get("aggs", {}):
+                    return {
+                        "aggregations": {
+                            "group_cardinality": {
+                                "value": 1
+                            }
+                        }
+                    }
+
                 # 检查是否是 estimate_export_count 的聚合查询（没有 latest 子聚合）
                 sampled_agg = body.get("aggs", {}).get("sampled", {})
                 if "aggs" not in sampled_agg:
@@ -1145,8 +1162,8 @@ class TestStratifiedSampling(unittest.TestCase):
             )
 
             self.assertEqual(result.count, 1)
-            # 1次 _count + 1次 _detect_valid_group_fields(预估) + 1次 estimate 聚合 + 1次 _detect_valid_group_fields(导出) + 1次实际导出聚合
-            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 4)
+            # 1次 _count + 1次 _detect_valid_group_fields(复用) + 1次 estimate cardinality + 1次实际导出聚合
+            self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 3)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
     def test_node_stats_interval_sampling_uses_es_aggregations(self):
@@ -1181,6 +1198,16 @@ class TestStratifiedSampling(unittest.TestCase):
                                     }
                                 }
                             ]
+                        }
+                    }
+
+                # estimate_export_count 的 cardinality 预估查询
+                if "group_cardinality" in body.get("aggs", {}):
+                    return {
+                        "aggregations": {
+                            "group_cardinality": {
+                                "value": 2
+                            }
                         }
                     }
 
@@ -1273,9 +1300,9 @@ class TestStratifiedSampling(unittest.TestCase):
 
             self.assertEqual(result.count, 3)
 
-            # 1次 _count + 1次 _detect_valid_group_fields(预估) + 1次 estimate 聚合 + 1次 _detect_valid_group_fields(导出) + 2次实际导出聚合（有 after_key）
+            # 1次 _count + 1次 _detect_valid_group_fields(复用) + 1次 estimate cardinality + 2次实际导出聚合（有 after_key）
             search_calls = [c for c in calls if c[0] == "POST" and c[1] == "/.infini_metrics/_search"]
-            self.assertEqual(len(search_calls), 5)
+            self.assertEqual(len(search_calls), 4)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
             # 读取生成的 jsonl 文件

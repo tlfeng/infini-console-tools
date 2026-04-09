@@ -116,6 +116,7 @@ DEFAULT_BATCH_SIZE = 3000
 DEFAULT_SCROLL_KEEPALIVE = "5m"  # 增加到 5 分钟，避免大数据量时 scroll context 过期
 DEFAULT_PARALLEL_JOBS = 2  # 默认并行导出的指标类型数
 DEFAULT_PARALLEL_DEGREE = 1  # 单个指标内部并行度（基于 sliced scroll）
+DEFAULT_COMPOSITE_PAGE_SIZE = 3000  # sampling/composite 每页桶数，减少请求往返
 
 
 class JSONLinesWriter:
@@ -710,58 +711,63 @@ class MetricsExporter:
                 pass
             return 0, [f"{os.path.basename(output_file)}.jsonl"]
 
+        # 预取下一页，和当前批次写盘并行
+        def _start_prefetch(
+            executor: ThreadPoolExecutor,
+            current_scroll_id: Optional[str],
+        ) -> Tuple[Optional[Any], Optional[str]]:
+            if not current_scroll_id:
+                return None, None
+            return executor.submit(self.scroll_next, current_scroll_id), current_scroll_id
+
         # 使用分片写入器
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            # 写入第一批
-            self._write_docs(writer, first_batch, slim_config, mask_ip)
-            writer.flush()
-            total_exported += len(first_batch)
+            current_batch = first_batch
+            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+                next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
 
-            # 记录最后一条记录的排序值（用于恢复）
-            if first_batch:
-                last_sort_values = first_batch[-1].get("sort")
+                while current_batch:
+                    self._write_docs(writer, current_batch, slim_config, mask_ip)
+                    writer.flush()
+                    total_exported += len(current_batch)
 
-            if progress_callback:
-                progress_callback(total_exported, total_count)
+                    # 更新最后排序值（用于恢复）
+                    last_sort_values = current_batch[-1].get("sort")
 
-            # 继续获取后续批次
-            while scroll_id:
-                scroll_result = self.scroll_next(scroll_id)
+                    if progress_callback:
+                        progress_callback(total_exported, total_count)
 
-                # scroll context 过期，尝试恢复
-                if scroll_result is None:
-                    print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
-                    # 清理旧的 scroll
-                    self.clear_scroll(scroll_id)
-
-                    # 使用 search_after 恢复查询
-                    batch, scroll_id, _ = self._resume_with_search_after(
-                        index_pattern, query, batch_size, last_sort_values
-                    )
-
-                    if batch is None:
-                        print("    恢复失败，停止导出")
+                    if not next_future:
                         break
 
-                    print(f"    恢复成功，继续导出...")
+                    scroll_result = next_future.result()
 
-                else:
-                    batch, next_scroll_id = scroll_result
+                    # scroll context 过期，尝试恢复
+                    if scroll_result is None:
+                        print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
+                        if requested_scroll_id:
+                            self.clear_scroll(requested_scroll_id)
+
+                        # 使用 search_after 恢复查询
+                        current_batch, scroll_id, _ = self._resume_with_search_after(
+                            index_pattern, query, batch_size, last_sort_values
+                        )
+
+                        if current_batch is None:
+                            print("    恢复失败，停止导出")
+                            break
+
+                        print(f"    恢复成功，继续导出...")
+                        next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
+                        continue
+
+                    current_batch, next_scroll_id = scroll_result
                     scroll_id = next_scroll_id or scroll_id
 
-                if not batch:
-                    break
+                    if not current_batch:
+                        break
 
-                self._write_docs(writer, batch, slim_config, mask_ip)
-                writer.flush()
-                total_exported += len(batch)
-
-                # 更新最后排序值
-                if batch:
-                    last_sort_values = batch[-1].get("sort")
-
-                if progress_callback:
-                    progress_callback(total_exported, total_count)
+                    next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
 
         # 清理 scroll
         if scroll_id:
@@ -985,6 +991,48 @@ class MetricsExporter:
 
         return value * multipliers[unit]
 
+    def _parse_interval_to_ms(self, interval: str) -> int:
+        """解析 interval 字符串为毫秒"""
+        match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
+        if not match:
+            raise ValueError(f"Invalid interval format: {interval}")
+
+        value = int(match.group(1))
+        unit = match.group(2)
+
+        multipliers = {
+            "ms": 1,
+            "s": 1000,
+            "m": 60 * 1000,
+            "h": 60 * 60 * 1000,
+            "d": 24 * 60 * 60 * 1000,
+        }
+
+        return value * multipliers[unit]
+
+    def _resolve_effective_group_fields(
+        self,
+        metric_type: str,
+        index_pattern: str,
+        query: Dict[str, Any],
+        group_fields: List[str],
+    ) -> List[str]:
+        """解析抽样实际分组字段，避免预估和导出重复探测。"""
+        effective_group_fields = self._detect_valid_group_fields(
+            index_pattern,
+            query.get("query", {"match_all": {}}),
+            group_fields,
+        )
+
+        if metric_type in {"node_stats", "index_stats"}:
+            # 对 node/index 抽样强制保留完整分组维度，避免探测样本缺失导致降维
+            effective_group_fields = group_fields
+
+        if not effective_group_fields:
+            effective_group_fields = group_fields[:1]
+
+        return effective_group_fields
+
     def _build_field_aggregations(
         self, field_agg_config: FieldAggregationConfig, bucket_size_seconds: float
     ) -> Dict[str, Any]:
@@ -996,25 +1044,10 @@ class MetricsExporter:
             agg_name = self._sanitize_agg_name(field)
             aggs[agg_name] = {"max": {"field": field}}
 
-        # Derivative 聚合 (需要先 max，再 derivative，最后 bucket_script 计算 rate)
+        # Derivative 聚合在 composite bucket 下不受支持，保留 max，rate 在解析阶段兜底为 None
         for field in field_agg_config.derivative_fields:
             max_agg_name = f"{self._sanitize_agg_name(field)}_max"
-            deriv_agg_name = f"{self._sanitize_agg_name(field)}_deriv"
-            rate_agg_name = f"{self._sanitize_agg_name(field)}_rate"
-
-            # Step 1: max 聚合
             aggs[max_agg_name] = {"max": {"field": field}}
-
-            # Step 2: derivative 管道聚合
-            aggs[deriv_agg_name] = {"derivative": {"buckets_path": max_agg_name}}
-
-            # Step 3: bucket_script 计算每秒速率
-            aggs[rate_agg_name] = {
-                "bucket_script": {
-                    "buckets_path": {"derivative": deriv_agg_name},
-                    "script": f"params.derivative != null ? params.derivative / {bucket_size_seconds} : null",
-                }
-            }
 
         return aggs
 
@@ -1081,6 +1114,7 @@ class MetricsExporter:
         mask_ip: bool = False,
         parallel_degree: int = 1,
         metric_type: str = None,
+        effective_group_fields: List[str] = None,
     ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits 或 字段聚合）
@@ -1112,21 +1146,19 @@ class MetricsExporter:
 
         total_exported = 0
         after_key = None
-        composite_page_size = 1000
+        composite_page_size = DEFAULT_COMPOSITE_PAGE_SIZE
 
         # 获取字段聚合配置（使用内置配置）
         field_agg_config = get_builtin_field_aggregation(metric_type) if metric_type else FieldAggregationConfig()
         use_field_aggregation = field_agg_config.has_aggregations()
 
-        # 检测哪些分组字段实际存在（有非空值）
-        effective_group_fields = self._detect_valid_group_fields(
-            index_pattern, query.get("query", {"match_all": {}}), group_fields
-        )
-        if any(f in group_fields for f in ("metadata.labels.node_id", "metadata.labels.index_name")):
-            # 对 node/index 抽样强制保留完整分组维度，避免因探测样本偶然缺失导致降维
-            effective_group_fields = group_fields
         if not effective_group_fields:
-            effective_group_fields = group_fields[:1]  # 至少使用第一个字段
+            effective_group_fields = self._resolve_effective_group_fields(
+                metric_type or "",
+                index_pattern,
+                query,
+                group_fields,
+            )
 
         sources = []
         for i, field in enumerate(effective_group_fields):
@@ -1180,22 +1212,6 @@ class MetricsExporter:
                 body["aggs"]["sampled"]["composite"]["after"] = after
             return body
 
-        def _parse_fixed_interval_to_ms(interval: str) -> Optional[int]:
-            match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
-            if not match:
-                return None
-
-            value = int(match.group(1))
-            unit = match.group(2)
-            multipliers = {
-                "ms": 1,
-                "s": 1000,
-                "m": 60 * 1000,
-                "h": 60 * 60 * 1000,
-                "d": 24 * 60 * 60 * 1000,
-            }
-            return value * multipliers[unit]
-
         def _split_sampling_queries(base_query: Dict, parts: int) -> List[Dict]:
             """按 fixed_interval 桶边界拆分时间范围，避免跨 worker 重复 time_bucket。"""
             if parts <= 1:
@@ -1227,8 +1243,9 @@ class MetricsExporter:
             if end_ms < start_ms:
                 return [base_query]
 
-            interval_ms = _parse_fixed_interval_to_ms(sampling_interval)
-            if not interval_ms or interval_ms <= 0:
+            try:
+                interval_ms = self._parse_interval_to_ms(sampling_interval)
+            except ValueError:
                 return [base_query]
 
             first_bucket_ms = (start_ms // interval_ms) * interval_ms
@@ -1273,6 +1290,40 @@ class MetricsExporter:
 
             return queries
 
+        def _extract_docs_and_after_from_sampled(sampled: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+            """从 sampled 聚合结果提取文档列表和 after_key。"""
+            buckets = sampled.get("buckets", [])
+            if not buckets:
+                return [], None
+
+            docs: List[Dict[str, Any]] = []
+            for bucket in buckets:
+                if use_field_aggregation:
+                    doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
+                else:
+                    doc = self._build_sampling_point_from_bucket(bucket)
+                if not doc:
+                    continue
+                if mask_ip:
+                    doc = self._mask_doc(doc)
+                if slim_config and slim_config.enabled:
+                    doc = self._slim_doc(doc, slim_config)
+                docs.append(doc)
+
+            return docs, sampled.get("after_key")
+
+        def _fetch_sampling_page(search_query: Dict, after: Dict = None) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+            """请求单页 sampling/composite 数据并转换为文档。"""
+            body = build_sampling_body(search_query, after)
+            result = self.client.proxy_request(
+                self.system_cluster_id,
+                "POST",
+                f"/{index_pattern}/_search",
+                body,
+            )
+            sampled = result.get("aggregations", {}).get("sampled", {})
+            return _extract_docs_and_after_from_sampled(sampled)
+
         # 并行路径：每个 worker 独立写文件，避免全局去重 map 长时间占用内存
         if parallel_degree and parallel_degree > 1:
             effective_slices = max(1, parallel_degree)
@@ -1292,45 +1343,36 @@ class MetricsExporter:
                     progress_callback(sum(per_worker_exported), 0)
 
             def run_sampling_slice(worker_id: int, worker_query: Dict) -> Tuple[int, List[str]]:
-                local_after = None
                 local_count = 0
                 worker_output = f"{output_file}_worker{worker_id}"
 
                 with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
-                    while True:
-                        body = build_sampling_body(worker_query, local_after)
-                        result = self.client.proxy_request(
-                            self.system_cluster_id,
-                            "POST",
-                            f"/{index_pattern}/_search",
-                            body,
+                    current_docs, next_after = _fetch_sampling_page(worker_query, None)
+
+                    with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+                        next_future = (
+                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after)
+                            if next_after
+                            else None
                         )
 
-                        sampled = result.get("aggregations", {}).get("sampled", {})
-                        buckets = sampled.get("buckets", [])
-                        if not buckets:
-                            break
+                        while current_docs:
+                            for doc in current_docs:
+                                writer.write_doc(doc)
+                                local_count += 1
 
-                        for bucket in buckets:
-                            if use_field_aggregation:
-                                doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
-                            else:
-                                doc = self._build_sampling_point_from_bucket(bucket)
-                            if not doc:
-                                continue
-                            if mask_ip:
-                                doc = self._mask_doc(doc)
-                            if slim_config and slim_config.enabled:
-                                doc = self._slim_doc(doc, slim_config)
-                            writer.write_doc(doc)
-                            local_count += 1
+                            writer.flush()
+                            _report_worker_progress(worker_id, local_count)
 
-                        writer.flush()
-                        _report_worker_progress(worker_id, local_count)
+                            if not next_future:
+                                break
 
-                        local_after = sampled.get("after_key")
-                        if not local_after:
-                            break
+                            current_docs, next_after = next_future.result()
+                            next_future = (
+                                prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after)
+                                if next_after
+                                else None
+                            )
 
                 return local_count, writer.get_file_paths()
 
@@ -1351,43 +1393,33 @@ class MetricsExporter:
             return total_exported, sorted(all_file_paths)
 
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            while True:
-                body = build_sampling_body(query, after_key)
-                result = self.client.proxy_request(
-                    self.system_cluster_id,
-                    "POST",
-                    f"/{index_pattern}/_search",
-                    body,
+            current_docs, after_key = _fetch_sampling_page(query, None)
+
+            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+                next_future = (
+                    prefetch_executor.submit(_fetch_sampling_page, query, after_key)
+                    if after_key
+                    else None
                 )
 
-                sampled = result.get("aggregations", {}).get("sampled", {})
-                buckets = sampled.get("buckets", [])
-                if not buckets:
-                    break
+                while current_docs:
+                    for doc in current_docs:
+                        writer.write_doc(doc)
+                        total_exported += 1
 
-                for bucket in buckets:
-                    if use_field_aggregation:
-                        doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
-                    else:
-                        doc = self._build_sampling_point_from_bucket(bucket)
-                    if not doc:
-                        continue
-                    # 应用IP脱敏
-                    if mask_ip:
-                        doc = self._mask_doc(doc)
-                    # 应用精简配置
-                    if slim_config and slim_config.enabled:
-                        doc = self._slim_doc(doc, slim_config)
-                    writer.write_doc(doc)
-                    total_exported += 1
+                    writer.flush()
+                    if progress_callback:
+                        progress_callback(total_exported, 0)
 
-                writer.flush()
-                if progress_callback:
-                    progress_callback(total_exported, 0)
+                    if not next_future:
+                        break
 
-                after_key = sampled.get("after_key")
-                if not after_key:
-                    break
+                    current_docs, after_key = next_future.result()
+                    next_future = (
+                        prefetch_executor.submit(_fetch_sampling_page, query, after_key)
+                        if after_key
+                        else None
+                    )
 
         return total_exported, writer.get_file_paths()
 
@@ -1401,6 +1433,7 @@ class MetricsExporter:
         sampling: SamplingConfig = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        effective_group_fields: List[str] = None,
     ) -> tuple:
         """
         估计要导出的数据条数
@@ -1433,81 +1466,61 @@ class MetricsExporter:
             total_docs = count_result.get("count", 0)
             print(f"    原始数据量: {total_docs:,} 条")
 
-            # interval 抽样时，使用聚合预估实际写入的数据量
+            # interval 抽样时，使用轻量估算：分组基数 * 时间桶数
             if sampling and sampling.interval:
                 print(f"    正在预估抽样数据量 (interval={sampling.interval})...")
-                group_fields = self._get_sampling_group_fields(metric_type, config)
-                # 检测有效字段（与 export_with_es_sampling 保持一致）
-                effective_group_fields = self._detect_valid_group_fields(
-                    config["index_pattern"], query.get("query", {"match_all": {}}), group_fields
-                )
-                if metric_type in {"node_stats", "index_stats"}:
-                    # 确保 node/index 抽样固定按目标维度分组
-                    effective_group_fields = group_fields
                 if not effective_group_fields:
-                    effective_group_fields = group_fields[:1]
-
-                sources = []
-                for i, field in enumerate(effective_group_fields):
-                    sources.append({f"group_{i}": {"terms": {"field": field}}})
-                sources.append(
-                    {
-                        "time_bucket": {
-                            "date_histogram": {
-                                "field": "timestamp",
-                                "fixed_interval": sampling.interval,
-                            }
-                        }
-                    }
-                )
-
-                # 使用 composite aggregation 遍历所有 bucket 来计算总数
-                total_buckets = 0
-                after_key = None
-                composite_page_size = 1000
-                page_count = 0
-
-                while True:
-                    body = {
-                        "size": 0,
-                        "track_total_hits": False,
-                        "query": query.get("query", {"match_all": {}}),
-                        "aggs": {
-                            "sampled": {
-                                "composite": {
-                                    "size": composite_page_size,
-                                    "sources": sources,
-                                }
-                            }
-                        },
-                    }
-                    if after_key:
-                        body["aggs"]["sampled"]["composite"]["after"] = after_key
-
-                    result = self.client.proxy_request(
-                        self.system_cluster_id,
-                        "POST",
-                        f"/{config['index_pattern']}/_search",
-                        body,
+                    group_fields = self._get_sampling_group_fields(metric_type, config)
+                    effective_group_fields = self._resolve_effective_group_fields(
+                        metric_type,
+                        config["index_pattern"],
+                        query,
+                        group_fields,
                     )
 
-                    buckets = result.get("aggregations", {}).get("sampled", {}).get("buckets", [])
-                    total_buckets += len(buckets)
-                    page_count += 1
+                script_parts = [
+                    f"(doc['{field}'].size()!=0 ? doc['{field}'].value.toString() : '')"
+                    for field in effective_group_fields
+                ]
+                cardinality_body = {
+                    "size": 0,
+                    "track_total_hits": False,
+                    "query": query.get("query", {"match_all": {}}),
+                    "aggs": {
+                        "group_cardinality": {
+                            "cardinality": {
+                                "script": {
+                                    "source": " + '|' + ".join(script_parts)
+                                },
+                                "precision_threshold": 40000,
+                            }
+                        }
+                    },
+                }
 
-                    # 每处理 10 页显示一次进度
-                    if page_count % 10 == 0:
-                        print(f"\r    已遍历 {total_buckets:,} 个时间桶...", end="", flush=True)
+                cardinality_result = self.client.proxy_request(
+                    self.system_cluster_id,
+                    "POST",
+                    f"/{config['index_pattern']}/_search",
+                    cardinality_body,
+                )
+                group_count = int(
+                    cardinality_result.get("aggregations", {})
+                    .get("group_cardinality", {})
+                    .get("value", 0)
+                )
 
-                    after_key = result.get("aggregations", {}).get("sampled", {}).get("after_key")
-                    if not after_key or not buckets:
-                        break
+                # ES fixed_interval 桶数量：floor(end/interval)-floor(start/interval)+1
+                start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+                interval_ms = self._parse_interval_to_ms(sampling.interval)
+                start_ms = int(start_dt.timestamp() * 1000)
+                end_ms = int(end_dt.timestamp() * 1000)
+                bucket_count = max(0, (end_ms // interval_ms) - (start_ms // interval_ms) + 1)
 
-                # 换行，避免进度信息被覆盖
-                if page_count >= 10:
-                    print()
+                sampled_estimate = min(total_docs, group_count * bucket_count)
+                print(f"    估算分组数: {group_count:,}，时间桶数: {bucket_count:,}")
 
-                return (total_docs, total_buckets)
+                return (total_docs, sampled_estimate)
             else:
                 # 无抽样时，两个值相同
                 return (total_docs, total_docs)
@@ -1528,6 +1541,25 @@ class MetricsExporter:
             else:
                 print(f"\r    [{metric_type}] 已导出 {current:,}", end="", flush=True)
         return callback
+
+    def _build_shard_info_from_files(self, output_file: str, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """根据真实输出文件统计分片记录数，兼容 worker 文件与普通分片文件。"""
+        output_dir = os.path.dirname(output_file) or "."
+        shard_info: List[Dict[str, Any]] = []
+
+        for file_name in file_paths:
+            count = 0
+            full_path = os.path.join(output_dir, file_name)
+            try:
+                with open(full_path, "r", encoding="utf-8") as handle:
+                    for count, _ in enumerate(handle, start=1):
+                        pass
+            except OSError:
+                count = 0
+
+            shard_info.append({"file": file_name, "count": count})
+
+        return shard_info
 
     def export_metric_type(
         self,
@@ -1565,6 +1597,25 @@ class MetricsExporter:
             # 使用配置的批次大小或默认值
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
 
+            query = self.build_metrics_query(
+                config["filter_template"],
+                time_range_hours,
+                cluster_id_filter,
+                cluster_ids,
+                source_fields,
+                start_time,
+                end_time,
+            )
+
+            effective_group_fields = None
+            if self._should_use_es_sampling(sampling):
+                effective_group_fields = self._resolve_effective_group_fields(
+                    metric_type,
+                    config["index_pattern"],
+                    query,
+                    self._get_sampling_group_fields(metric_type, config),
+                )
+
             # 预估数据量（可选）
             total_docs, sampled_docs = -1, -1
             if not skip_estimation:
@@ -1577,6 +1628,7 @@ class MetricsExporter:
                     sampling,
                     start_time,
                     end_time,
+                    effective_group_fields,
                 )
                 if total_docs >= 0:
                     # 判断是否有抽样
@@ -1588,16 +1640,6 @@ class MetricsExporter:
                         print(f"    将自动分文件存储 (每文件最多 {shard_size:,} 条)")
             else:
                 print(f"    已跳过数据量预估，直接开始导出...")
-
-            query = self.build_metrics_query(
-                config["filter_template"],
-                time_range_hours,
-                cluster_id_filter,
-                cluster_ids,
-                source_fields,
-                start_time,
-                end_time,
-            )
 
             progress_callback = self._make_progress_callback(metric_type, progress_reporter)
             metric_parallel_degree = (
@@ -1621,6 +1663,7 @@ class MetricsExporter:
                     mask_ip,
                     metric_parallel_degree,
                     metric_type=metric_type,
+                    effective_group_fields=effective_group_fields,
                 )
             else:
                 count, file_paths = self.export_with_scroll(
@@ -1640,10 +1683,7 @@ class MetricsExporter:
             if file_paths:
                 result.file_path = file_paths[0]  # 向后兼容
                 if len(file_paths) > 1:
-                    result.shard_info = [
-                        {"file": f, "count": shard_size if i < len(file_paths) - 1 else count % shard_size or shard_size}
-                        for i, f in enumerate(file_paths)
-                    ]
+                    result.shard_info = self._build_shard_info_from_files(output_file, file_paths)
 
         except Exception as e:
             result.error = str(e)
@@ -1699,10 +1739,7 @@ class MetricsExporter:
             if file_paths:
                 result.file_path = file_paths[0]  # 向后兼容
                 if len(file_paths) > 1:
-                    result.shard_info = [
-                        {"file": f, "count": shard_size if i < len(file_paths) - 1 else count % shard_size or shard_size}
-                        for i, f in enumerate(file_paths)
-                    ]
+                    result.shard_info = self._build_shard_info_from_files(output_file, file_paths)
 
         except Exception as e:
             result.error = str(e)

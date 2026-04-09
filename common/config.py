@@ -370,8 +370,8 @@ class OutputConfig:
 @dataclass
 class ExecutionConfig:
     """执行配置"""
-    parallel_metrics: int = 4  # 并行导出的指标类型数（从2提升到4）
-    parallel_degree: int = 2   # 单个指标内的并行度（从1提升到2）
+    parallel_metrics: int = 2  # 并行导出的指标类型数
+    parallel_degree: int = 1   # 单个指标内的并行度
     batch_size: Optional[int] = None
     scroll_keepalive: str = "5m"
     max_retries: int = 3
