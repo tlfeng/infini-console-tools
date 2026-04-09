@@ -1,0 +1,9 @@
+#1 test cluster health
+GET _cluster/health
+
+#2 test cat indices
+GET _cat/indices?format=json
+
+#3 search movies
+GET movies/_search
+{"query": {"match_all": {}}, "size": 1}

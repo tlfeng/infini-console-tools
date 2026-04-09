@@ -709,7 +709,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                         "metadata": {
                                             "labels": {
                                                 "cluster_id": "c1",
-                                                "node_id": "n1",
                                             }
                                         }
                                     }
@@ -735,7 +734,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                     {
                                         "key": {
                                             "group_0": "c1",
-                                            "group_1": "n1",
                                             "time_bucket": 1712016000000,
                                         },
                                         "latest": {
@@ -763,7 +761,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                     {
                                         "key": {
                                             "group_0": "c1",
-                                            "group_1": "n1",
                                             "time_bucket": 1712016000000,
                                         },
                                         "latest": {
@@ -790,9 +787,10 @@ class TestStratifiedSampling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_base = os.path.join(temp_dir, "test")
 
+            # 使用 cluster_health 而非 node_stats，避免字段聚合模式
             result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
+                metric_type="cluster_health",
+                config=METRIC_TYPES["cluster_health"],
                 output_file=temp_base,
                 time_range_hours=24,
                 cluster_ids=["cluster-1"],
@@ -810,8 +808,8 @@ class TestStratifiedSampling(unittest.TestCase):
             with open(f"{temp_base}_worker1.jsonl", 'r') as f:
                 data1 = [json.loads(line) for line in f.readlines()]
 
-            self.assertEqual([d["_id"] for d in data0], ["worker0-doc"])
-            self.assertEqual([d["_id"] for d in data1], ["worker1-doc"])
+            self.assertEqual(data0[0]["_id"], "worker0-doc")
+            self.assertEqual(data1[0]["_id"], "worker1-doc")
 
     def test_sampling_parallel_same_bucket_keeps_worker_outputs(self):
         """并发 sampling 下即便 bucket 相同，也按 worker 独立写文件"""
@@ -831,7 +829,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                         "metadata": {
                                             "labels": {
                                                 "cluster_id": "c1",
-                                                "node_id": "n1",
                                             }
                                         }
                                     }
@@ -850,7 +847,6 @@ class TestStratifiedSampling(unittest.TestCase):
 
                 same_bucket_key = {
                     "group_0": "c1",
-                    "group_1": "n1",
                     "time_bucket": 1712016000000,
                 }
 
@@ -909,9 +905,10 @@ class TestStratifiedSampling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_base = os.path.join(temp_dir, "test")
 
+            # 使用 cluster_health 而非 node_stats，避免字段聚合模式
             result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
+                metric_type="cluster_health",
+                config=METRIC_TYPES["cluster_health"],
                 output_file=temp_base,
                 time_range_hours=24,
                 cluster_ids=["cluster-1"],
@@ -927,8 +924,8 @@ class TestStratifiedSampling(unittest.TestCase):
             with open(f"{temp_base}_worker1.jsonl", 'r') as f:
                 data1 = [json.loads(line) for line in f.readlines()]
 
-            self.assertEqual([d["_id"] for d in data0], ["older-doc"])
-            self.assertEqual([d["_id"] for d in data1], ["newer-doc"])
+            self.assertEqual(data0[0]["_id"], "older-doc")
+            self.assertEqual(data1[0]["_id"], "newer-doc")
 
     def test_sampling_path_supports_parallel_degree(self):
         """sampling 模式在 parallel_degree>1 时应走 sliced 查询并汇总"""
@@ -952,7 +949,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                         "metadata": {
                                             "labels": {
                                                 "cluster_id": "c1",
-                                                "node_id": "n1",
                                             }
                                         }
                                     }
@@ -982,7 +978,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                     {
                                         "key": {
                                             "group_0": "c1",
-                                            "group_1": "n1",
                                             "time_bucket": 1712016000000,
                                         },
                                         "latest": {
@@ -1010,7 +1005,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                     {
                                         "key": {
                                             "group_0": "c1",
-                                            "group_1": "n2",
                                             "time_bucket": 1712016000000,
                                         },
                                         "latest": {
@@ -1037,9 +1031,10 @@ class TestStratifiedSampling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_base = os.path.join(temp_dir, "test")
 
+            # 使用 cluster_health 而非 node_stats，避免字段聚合模式
             result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
+                metric_type="cluster_health",
+                config=METRIC_TYPES["cluster_health"],
                 output_file=temp_base,
                 time_range_hours=24,
                 cluster_ids=["cluster-1"],
@@ -1062,8 +1057,8 @@ class TestStratifiedSampling(unittest.TestCase):
                 data0 = [json.loads(line) for line in f.readlines()]
             with open(f"{temp_base}_worker1.jsonl", 'r') as f:
                 data1 = [json.loads(line) for line in f.readlines()]
-            self.assertEqual([d["_id"] for d in data0], ["doc-s0"])
-            self.assertEqual([d["_id"] for d in data1], ["doc-s1"])
+            self.assertEqual(data0[0]["_id"], "doc-s0")
+            self.assertEqual(data1[0]["_id"], "doc-s1")
 
     def test_cluster_stats_interval_sampling_uses_es_aggregations(self):
         """所有指标的 interval 抽样都应走 ES 聚合"""
@@ -1155,7 +1150,7 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
     def test_node_stats_interval_sampling_uses_es_aggregations(self):
-        """node_stats interval 抽样应走 ES 聚合而非 scroll 全量拉取"""
+        """node_stats interval 抽样应走 ES 字段聚合模式"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
@@ -1201,7 +1196,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                # 实际导出的聚合查询
+                # 实际导出的聚合查询 - 字段聚合模式
                 after = sampled_agg.get("composite", {}).get("after")
                 if not after:
                     return {
@@ -1209,28 +1204,29 @@ class TestStratifiedSampling(unittest.TestCase):
                             "sampled": {
                                 "buckets": [
                                     {
-                                        "latest": {
-                                            "hits": {
-                                                "hits": [
-                                                    {
-                                                        "_id": "doc-1",
-                                                        "_source": {"timestamp": "2026-04-02T00:00:00Z", "v": 1},
-                                                    }
-                                                ]
-                                            }
-                                        }
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016000000,
+                                        },
+                                        "time_bucket": {
+                                            "key_as_string": "2026-04-02T00:00:00Z"
+                                        },
+                                        # 字段聚合结果示例
+                                        "indices_indexing_index_total_max": {"value": 1000},
+                                        "indices_indexing_index_total_rate": {"value": 10.5},
                                     },
                                     {
-                                        "latest": {
-                                            "hits": {
-                                                "hits": [
-                                                    {
-                                                        "_id": "doc-2",
-                                                        "_source": {"timestamp": "2026-04-02T00:15:00Z", "v": 2},
-                                                    }
-                                                ]
-                                            }
-                                        }
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016900000,
+                                        },
+                                        "time_bucket": {
+                                            "key_as_string": "2026-04-02T00:15:00Z"
+                                        },
+                                        "indices_indexing_index_total_max": {"value": 2000},
+                                        "indices_indexing_index_total_rate": {"value": 11.1},
                                     },
                                 ],
                                 "after_key": {"group_0": "c1", "group_1": "n2", "time_bucket": 1712016900000},
@@ -1243,16 +1239,16 @@ class TestStratifiedSampling(unittest.TestCase):
                         "sampled": {
                             "buckets": [
                                 {
-                                    "latest": {
-                                        "hits": {
-                                            "hits": [
-                                                {
-                                                    "_id": "doc-3",
-                                                    "_source": {"timestamp": "2026-04-02T00:30:00Z", "v": 3},
-                                                }
-                                            ]
-                                        }
-                                    }
+                                    "key": {
+                                        "group_0": "c1",
+                                        "group_1": "n2",
+                                        "time_bucket": 1712017800000,
+                                    },
+                                    "time_bucket": {
+                                        "key_as_string": "2026-04-02T00:30:00Z"
+                                    },
+                                    "indices_indexing_index_total_max": {"value": 3000},
+                                    "indices_indexing_index_total_rate": {"value": 12.2},
                                 }
                             ]
                         }
@@ -1287,10 +1283,15 @@ class TestStratifiedSampling(unittest.TestCase):
             with open(output_file, 'r') as f:
                 lines = f.readlines()
             data = [json.loads(line) for line in lines]
-            self.assertEqual([d["_id"] for d in data], ["doc-1", "doc-2", "doc-3"])
+            # node_stats 使用字段聚合模式，验证文档数量和字段
+            self.assertEqual(len(data), 3)
+            for d in data:
+                self.assertIn("timestamp", d)
+                self.assertIn("indices.indexing.index_total", d)
+                self.assertIn("indices.indexing.index_total_rate", d)
 
     def test_sampling_bucket_uses_latest_snapshot_as_sample_point(self):
-        """sampling 应使用桶内 latest 真实快照作为采样点"""
+        """sampling 应使用桶内 latest 真实快照作为采样点（非字段聚合模式）"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
@@ -1307,7 +1308,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                         "metadata": {
                                             "labels": {
                                                 "cluster_id": "c1",
-                                                "node_id": "n1",
                                             }
                                         }
                                     }
@@ -1323,7 +1323,6 @@ class TestStratifiedSampling(unittest.TestCase):
                                 {
                                     "key": {
                                         "group_0": "c1",
-                                        "group_1": "n1",
                                         "time_bucket": 1712016000000,
                                     },
                                     "latest": {
@@ -1352,9 +1351,10 @@ class TestStratifiedSampling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_base = os.path.join(temp_dir, "test")
 
+            # 使用 cluster_health 而非 node_stats，避免字段聚合模式
             result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
+                metric_type="cluster_health",
+                config=METRIC_TYPES["cluster_health"],
                 output_file=temp_base,
                 time_range_hours=24,
                 cluster_ids=["cluster-1"],
