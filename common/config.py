@@ -173,6 +173,176 @@ class SamplingConfig:
 
 
 @dataclass
+class FieldAggregationConfig:
+    """字段聚合配置 - 定义每个字段使用的聚合类型"""
+    max_fields: List[str] = field(default_factory=list)  # 使用 max 聚合的字段
+    derivative_fields: List[str] = field(default_factory=list)  # 使用 derivative 聚合的字段
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'FieldAggregationConfig':
+        if not data:
+            return cls()
+
+        return cls(
+            max_fields=data.get('max', []),
+            derivative_fields=data.get('derivative', [])
+        )
+
+    def has_aggregations(self) -> bool:
+        """是否配置了聚合字段"""
+        return bool(self.max_fields or self.derivative_fields)
+
+    def get_all_fields(self) -> List[str]:
+        """获取所有需要聚合的字段"""
+        return self.max_fields + self.derivative_fields
+
+
+# 内置的 derivative 字段定义（从 Console 项目搬运）
+# 这些字段需要计算相邻时间桶的差值，再除以 bucketSize 得到每秒速率
+DERIVATIVE_FIELDS = {
+    "node_stats": [
+        # 索引相关
+        "indices.indexing.index_total",
+        "indices.indexing.index_time_in_millis",
+        "indices.store.size_in_bytes",
+        # 搜索相关
+        "indices.search.query_total",
+        "indices.search.query_time_in_millis",
+        "indices.search.fetch_total",
+        "indices.search.fetch_time_in_millis",
+        "indices.search.scroll_total",
+        "indices.search.scroll_time_in_millis",
+        # 合并/刷新/刷盘
+        "indices.merges.total",
+        "indices.merges.total_time_in_millis",
+        "indices.refresh.total",
+        "indices.refresh.total_time_in_millis",
+        "indices.flush.total",
+        "indices.flush.total_time_in_millis",
+        # 请求缓存
+        "indices.request_cache.hit_count",
+        "indices.request_cache.miss_count",
+        "indices.query_cache.cache_count",
+        "indices.query_cache.hit_count",
+        "indices.query_cache.miss_count",
+        # HTTP
+        "http.total_opened",
+        # GC
+        "jvm.gc.collectors.young.collection_count",
+        "jvm.gc.collectors.young.collection_time_in_millis",
+        "jvm.gc.collectors.old.collection_count",
+        "jvm.gc.collectors.old.collection_time_in_millis",
+        # Transport
+        "transport.tx_count",
+        "transport.rx_count",
+        "transport.tx_size_in_bytes",
+        "transport.rx_size_in_bytes",
+        # 磁盘 IO
+        "fs.io_stats.total.operations",
+        "fs.io_stats.total.read_operations",
+        "fs.io_stats.total.write_operations",
+        # Breaker
+        "breakers.parent.tripped",
+        "breakers.accounting.tripped",
+        "breakers.fielddata.tripped",
+        "breakers.request.tripped",
+        "breakers.in_flight_requests.tripped",
+    ],
+    "index_stats": [
+        # 索引相关
+        "primaries.indexing.index_total",
+        "primaries.indexing.index_time_in_millis",
+        "total.indexing.index_total",
+        "total.indexing.index_time_in_millis",
+        # 搜索相关
+        "primaries.search.query_total",
+        "primaries.search.query_time_in_millis",
+        "total.search.query_total",
+        "total.search.query_time_in_millis",
+        "total.search.fetch_total",
+        "total.search.scroll_total",
+        # 合并/刷新/刷盘
+        "primaries.merges.total",
+        "total.merges.total",
+        "primaries.refresh.total",
+        "total.refresh.total",
+        "primaries.flush.total",
+        "total.flush.total",
+        # 请求缓存
+        "primaries.request_cache.hit_count",
+        "primaries.request_cache.miss_count",
+        "total.request_cache.hit_count",
+        "total.request_cache.miss_count",
+        # 查询缓存
+        "primaries.query_cache.cache_count",
+        "primaries.query_cache.hit_count",
+        "primaries.query_cache.miss_count",
+    ],
+    "shard_stats": [
+        # 索引相关
+        "indexing.index_total",
+        # 搜索相关
+        "search.query_total",
+        "search.fetch_total",
+        "search.scroll_total",
+        # 合并/刷新/刷盘
+        "merges.total",
+        "refresh.total",
+        "flush.total",
+        # 请求缓存
+        "request_cache.hit_count",
+        "request_cache.miss_count",
+        # 查询缓存
+        "query_cache.cache_count",
+        "query_cache.hit_count",
+        "query_cache.miss_count",
+    ],
+    "cluster_health": [],  # cluster_health 通常不需要 derivative
+    "cluster_stats": [
+        # 索引相关
+        "indices.indexing.index_total",
+        # 搜索相关
+        "indices.search.query_total",
+    ],
+}
+
+
+def get_derivative_fields(metric_type: str) -> List[str]:
+    """获取指定指标类型的 derivative 字段列表"""
+    return DERIVATIVE_FIELDS.get(metric_type, [])
+
+
+def get_builtin_field_aggregation(metric_type: str) -> FieldAggregationConfig:
+    """获取内置的字段聚合配置"""
+    derivative_fields = get_derivative_fields(metric_type)
+    return FieldAggregationConfig(
+        max_fields=[],  # max 字段不单独列出，由其他字段隐式确定
+        derivative_fields=derivative_fields
+    )
+
+
+@dataclass
+class FieldAggregationsConfig:
+    """按指标类型配置的字段聚合"""
+    aggregations: Dict[str, FieldAggregationConfig] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict]) -> 'FieldAggregationsConfig':
+        if not data:
+            return cls()
+
+        aggregations = {}
+        for metric_type, config in data.items():
+            aggregations[metric_type] = FieldAggregationConfig.from_dict(config)
+
+        return cls(aggregations=aggregations)
+
+    def get_for_metric(self, metric_type: str) -> FieldAggregationConfig:
+        """获取指定指标类型的聚合配置"""
+        return self.aggregations.get(metric_type, FieldAggregationConfig())
+
+
+@dataclass
 class OutputConfig:
     """输出配置"""
     directory: str = "."
@@ -200,8 +370,8 @@ class OutputConfig:
 @dataclass
 class ExecutionConfig:
     """执行配置"""
-    parallel_metrics: int = 2  # 并行导出的指标类型数
-    parallel_degree: int = 1   # 单个指标内的并行度（预留）
+    parallel_metrics: int = 4  # 并行导出的指标类型数（从2提升到4）
+    parallel_degree: int = 2   # 单个指标内的并行度（从1提升到2）
     batch_size: Optional[int] = None
     scroll_keepalive: str = "5m"
     max_retries: int = 3
@@ -257,6 +427,7 @@ class MetricsJobConfig:
     source_fields: Optional[List[str]] = None
     include_alerts: bool = True
     alert_types: List[str] = field(default_factory=list)
+    field_aggregations: FieldAggregationsConfig = field(default_factory=FieldAggregationsConfig)  # 字段聚合配置
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'MetricsJobConfig':

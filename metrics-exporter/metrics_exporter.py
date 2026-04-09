@@ -39,7 +39,8 @@ from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIErr
 from common.config import (
     add_common_args, get_config_value,
     AppConfig, MetricsJobConfig, ConfigValidationError,
-    SamplingConfig, SlimConfig,
+    SamplingConfig, SlimConfig, FieldAggregationConfig,
+    get_builtin_field_aggregation,
 )
 
 
@@ -51,7 +52,7 @@ METRIC_TYPES = {
         "index_pattern": ".infini_metrics",
         "filter_template": 'metadata.name:"cluster_health"',
         "key_fields": ["metadata.labels.cluster_id", "metadata.labels.cluster_name"],
-        "default_batch_size": 5000,  # 数据量小，可用大批次
+        "default_batch_size": 8000,  # 数据量小，可用大批次
     },
     "cluster_stats": {
         "name": "集群统计指标",
@@ -59,7 +60,7 @@ METRIC_TYPES = {
         "index_pattern": ".infini_metrics",
         "filter_template": 'metadata.name:"cluster_stats"',
         "key_fields": ["metadata.labels.cluster_id", "metadata.labels.cluster_name"],
-        "default_batch_size": 5000,
+        "default_batch_size": 8000,
     },
     "node_stats": {
         "name": "节点统计指标",
@@ -68,7 +69,7 @@ METRIC_TYPES = {
         "filter_template": 'metadata.name:"node_stats"',
         # 抽样分层按 cluster + node 维度，避免 node_name 变更导致同节点被拆分
         "key_fields": ["metadata.labels.cluster_id", "metadata.labels.node_id"],
-        "default_batch_size": 3000,  # 数据量大，中等批次
+        "default_batch_size": 5000,  # 数据量大，从3000提升到5000
     },
     "index_stats": {
         "name": "索引统计指标",
@@ -76,7 +77,7 @@ METRIC_TYPES = {
         "index_pattern": ".infini_metrics",
         "filter_template": 'metadata.name:"index_stats"',
         "key_fields": ["metadata.labels.cluster_id", "metadata.labels.index_name"],
-        "default_batch_size": 3000,
+        "default_batch_size": 5000,
     },
     "shard_stats": {
         "name": "分片统计指标",
@@ -84,7 +85,7 @@ METRIC_TYPES = {
         "index_pattern": ".infini_metrics",
         "filter_template": 'metadata.name:"shard_stats"',
         "key_fields": ["metadata.labels.cluster_id", "metadata.labels.index_name", "metadata.labels.shard_id"],
-        "default_batch_size": 2000,  # 数据量最大，较小批次
+        "default_batch_size": 3000,  # 数据量最大，从2000提升到3000
     },
 }
 
@@ -94,19 +95,19 @@ ALERT_TYPES = {
         "name": "告警规则",
         "description": "配置的告警规则定义",
         "index_pattern": ".infini_alert-rule",
-        "default_batch_size": 5000,
+        "default_batch_size": 8000,
     },
     "alert_messages": {
         "name": "告警消息",
         "description": "告警触发产生的消息记录",
         "index_pattern": ".infini_alert-message",
-        "default_batch_size": 3000,
+        "default_batch_size": 5000,
     },
     "alert_history": {
         "name": "告警历史",
         "description": "告警状态变更的历史记录",
         "index_pattern": ".infini_alert-history",
-        "default_batch_size": 3000,
+        "default_batch_size": 5000,
     },
 }
 
@@ -961,6 +962,101 @@ class MetricsExporter:
                 return None
         return value
 
+    def _sanitize_agg_name(self, field: str) -> str:
+        """将字段路径转换为合法的聚合名称"""
+        return field.replace(".", "_")
+
+    def _parse_interval_to_seconds(self, interval: str) -> float:
+        """解析 interval 字符串为秒数"""
+        match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
+        if not match:
+            raise ValueError(f"Invalid interval format: {interval}")
+
+        value = int(match.group(1))
+        unit = match.group(2)
+
+        multipliers = {
+            "ms": 0.001,
+            "s": 1,
+            "m": 60,
+            "h": 3600,
+            "d": 86400,
+        }
+
+        return value * multipliers[unit]
+
+    def _build_field_aggregations(
+        self, field_agg_config: FieldAggregationConfig, bucket_size_seconds: float
+    ) -> Dict[str, Any]:
+        """构建字段级别的聚合"""
+        aggs = {}
+
+        # Max 聚合
+        for field in field_agg_config.max_fields:
+            agg_name = self._sanitize_agg_name(field)
+            aggs[agg_name] = {"max": {"field": field}}
+
+        # Derivative 聚合 (需要先 max，再 derivative，最后 bucket_script 计算 rate)
+        for field in field_agg_config.derivative_fields:
+            max_agg_name = f"{self._sanitize_agg_name(field)}_max"
+            deriv_agg_name = f"{self._sanitize_agg_name(field)}_deriv"
+            rate_agg_name = f"{self._sanitize_agg_name(field)}_rate"
+
+            # Step 1: max 聚合
+            aggs[max_agg_name] = {"max": {"field": field}}
+
+            # Step 2: derivative 管道聚合
+            aggs[deriv_agg_name] = {"derivative": {"buckets_path": max_agg_name}}
+
+            # Step 3: bucket_script 计算每秒速率
+            aggs[rate_agg_name] = {
+                "bucket_script": {
+                    "buckets_path": {"derivative": deriv_agg_name},
+                    "script": f"params.derivative != null ? params.derivative / {bucket_size_seconds} : null",
+                }
+            }
+
+        return aggs
+
+    def _build_doc_from_aggregation_bucket(
+        self, bucket: Dict[str, Any], field_agg_config: FieldAggregationConfig
+    ) -> Optional[Dict[str, Any]]:
+        """从聚合 bucket 构建文档"""
+        result = {}
+
+        # 解析 max 聚合结果
+        for field in field_agg_config.max_fields:
+            agg_name = self._sanitize_agg_name(field)
+            value = bucket.get(agg_name, {})
+            if isinstance(value, dict):
+                result[field] = value.get("value")
+            else:
+                result[field] = value
+
+        # 解析 derivative (rate) 结果
+        for field in field_agg_config.derivative_fields:
+            rate_agg_name = f"{self._sanitize_agg_name(field)}_rate"
+            max_agg_name = f"{self._sanitize_agg_name(field)}_max"
+
+            # 优先使用 rate 值
+            rate_value = bucket.get(rate_agg_name, {})
+            if isinstance(rate_value, dict):
+                result[f"{field}_rate"] = rate_value.get("value")
+            else:
+                result[f"{field}_rate"] = rate_value
+
+            # 同时保留 max 值
+            max_value = bucket.get(max_agg_name, {})
+            if isinstance(max_value, dict):
+                result[field] = max_value.get("value")
+
+        # 添加时间戳和分组信息
+        time_bucket = bucket.get("time_bucket", {})
+        if time_bucket:
+            result["timestamp"] = time_bucket.get("key_as_string")
+
+        return result if result else None
+
     def _build_sampling_point_from_bucket(self, bucket: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """从 sampling bucket 构建采样点（保留时间桶内最新真实快照）。"""
         hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
@@ -984,16 +1080,18 @@ class MetricsExporter:
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
         parallel_degree: int = 1,
+        metric_type: str = None,
     ) -> Tuple[int, List[str]]:
         """
-        ES 端抽样：时间桶 + 维度分层（top_hits）
-        每个 (维度组合, 时间桶) 只保留最新的一条记录
+        ES 端抽样：时间桶 + 维度分层（top_hits 或 字段聚合）
+        每个 (维度组合, 时间桶) 只保留最新的一条记录，或使用字段聚合计算指标值
 
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
+            metric_type: 指标类型，用于获取内置的字段聚合配置
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -1015,6 +1113,10 @@ class MetricsExporter:
         total_exported = 0
         after_key = None
         composite_page_size = 1000
+
+        # 获取字段聚合配置（使用内置配置）
+        field_agg_config = get_builtin_field_aggregation(metric_type) if metric_type else FieldAggregationConfig()
+        use_field_aggregation = field_agg_config.has_aggregations()
 
         # 检测哪些分组字段实际存在（有非空值）
         effective_group_fields = self._detect_valid_group_fields(
@@ -1041,18 +1143,24 @@ class MetricsExporter:
         )
 
         def build_sampling_body(search_query: Dict, after: Dict = None) -> Dict[str, Any]:
-            sampling_aggs: Dict[str, Any] = {
-                "latest": {
-                    "top_hits": {
-                        "size": 1,
-                        "sort": [
-                            {"timestamp": {"order": "desc"}},
-                            {"_id": {"order": "desc"}},
-                        ],
-                        "_source": source_fields if source_fields else True,
+            if use_field_aggregation:
+                # 使用字段聚合模式
+                bucket_size_seconds = self._parse_interval_to_seconds(sampling_interval)
+                sampling_aggs = self._build_field_aggregations(field_agg_config, bucket_size_seconds)
+            else:
+                # 使用 top_hits 模式（默认）
+                sampling_aggs: Dict[str, Any] = {
+                    "latest": {
+                        "top_hits": {
+                            "size": 1,
+                            "sort": [
+                                {"timestamp": {"order": "desc"}},
+                                {"_id": {"order": "desc"}},
+                            ],
+                            "_source": source_fields if source_fields else True,
+                        }
                     }
                 }
-            }
 
             body = {
                 "size": 0,
@@ -1204,7 +1312,10 @@ class MetricsExporter:
                             break
 
                         for bucket in buckets:
-                            doc = self._build_sampling_point_from_bucket(bucket)
+                            if use_field_aggregation:
+                                doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
+                            else:
+                                doc = self._build_sampling_point_from_bucket(bucket)
                             if not doc:
                                 continue
                             if mask_ip:
@@ -1255,7 +1366,10 @@ class MetricsExporter:
                     break
 
                 for bucket in buckets:
-                    doc = self._build_sampling_point_from_bucket(bucket)
+                    if use_field_aggregation:
+                        doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
+                    else:
+                        doc = self._build_sampling_point_from_bucket(bucket)
                     if not doc:
                         continue
                     # 应用IP脱敏
@@ -1488,7 +1602,7 @@ class MetricsExporter:
             progress_callback = self._make_progress_callback(metric_type, progress_reporter)
             metric_parallel_degree = (
                 max(1, parallel_degree)
-                if metric_type in {"node_stats", "index_stats", "shard_stats"}
+                if metric_type in {"node_stats", "index_stats", "shard_stats", "cluster_stats", "cluster_health"}
                 else 1
             )
 
@@ -1506,6 +1620,7 @@ class MetricsExporter:
                     slim_config,
                     mask_ip,
                     metric_parallel_degree,
+                    metric_type=metric_type,
                 )
             else:
                 count, file_paths = self.export_with_scroll(
@@ -1547,6 +1662,7 @@ class MetricsExporter:
         source_fields: List[str] = None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        parallel_degree: int = 1,
         progress_reporter: Optional[ConsoleProgressReporter] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
@@ -1575,6 +1691,7 @@ class MetricsExporter:
                 self._make_progress_callback(alert_type, progress_reporter),
                 slim_config,
                 mask_ip,
+                parallel_degree,
             )
 
             result.count = count
@@ -1843,6 +1960,7 @@ class MetricsExporter:
                         source_fields,
                         slim_config,
                         mask_ip,
+                        parallel_degree,
                         progress_reporter,
                         start_time,
                         end_time,
