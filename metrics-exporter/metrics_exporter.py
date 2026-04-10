@@ -1034,28 +1034,49 @@ class MetricsExporter:
         return effective_group_fields
 
     def _build_field_aggregations(
-        self, field_agg_config: FieldAggregationConfig, bucket_size_seconds: float
+        self,
+        field_agg_config: FieldAggregationConfig,
+        bucket_size_seconds: float,
+        metric_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """构建字段级别的聚合"""
         aggs = {}
 
+        def _metric_field(field: str) -> str:
+            if metric_type:
+                return f"payload.elasticsearch.{metric_type}.{field}"
+            return field
+
         # Max 聚合
         for field in field_agg_config.max_fields:
             agg_name = self._sanitize_agg_name(field)
-            aggs[agg_name] = {"max": {"field": field}}
+            aggs[agg_name] = {"max": {"field": _metric_field(field)}}
 
         # Derivative 聚合在 composite bucket 下不受支持，保留 max，rate 在解析阶段兜底为 None
         for field in field_agg_config.derivative_fields:
             max_agg_name = f"{self._sanitize_agg_name(field)}_max"
-            aggs[max_agg_name] = {"max": {"field": field}}
+            aggs[max_agg_name] = {"max": {"field": _metric_field(field)}}
 
         return aggs
 
     def _build_doc_from_aggregation_bucket(
-        self, bucket: Dict[str, Any], field_agg_config: FieldAggregationConfig
+        self,
+        bucket: Dict[str, Any],
+        field_agg_config: FieldAggregationConfig,
+        rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """从聚合 bucket 构建文档"""
         result = {}
+        bucket_key = bucket.get("key", {})
+        group_key = tuple(
+            bucket_key[k]
+            for k in sorted(bucket_key.keys())
+            if k.startswith("group_")
+        )
+
+        current_time_ms = bucket_key.get("time_bucket")
+        if not isinstance(current_time_ms, int):
+            current_time_ms = None
 
         # 解析 max 聚合结果
         for field in field_agg_config.max_fields:
@@ -1071,6 +1092,7 @@ class MetricsExporter:
             rate_agg_name = f"{self._sanitize_agg_name(field)}_rate"
             max_agg_name = f"{self._sanitize_agg_name(field)}_max"
 
+            current_value = None
             # 优先使用 rate 值
             rate_value = bucket.get(rate_agg_name, {})
             if isinstance(rate_value, dict):
@@ -1081,7 +1103,32 @@ class MetricsExporter:
             # 同时保留 max 值
             max_value = bucket.get(max_agg_name, {})
             if isinstance(max_value, dict):
-                result[field] = max_value.get("value")
+                current_value = max_value.get("value")
+                result[field] = current_value
+            else:
+                current_value = max_value
+                result[field] = max_value
+
+            # 若 ES 侧未提供 rate（composite 场景），则基于相邻桶 max 值计算每秒速率
+            if (
+                result.get(f"{field}_rate") is None
+                and rate_state is not None
+                and current_time_ms is not None
+                and current_value is not None
+            ):
+                if group_key not in rate_state:
+                    rate_state[group_key] = {}
+
+                previous = rate_state[group_key].get(field)
+                if previous:
+                    previous_time_ms, previous_value = previous
+                    delta_time_ms = current_time_ms - previous_time_ms
+                    if delta_time_ms > 0:
+                        delta_value = float(current_value) - float(previous_value)
+                        if delta_value >= 0:
+                            result[f"{field}_rate"] = delta_value / (delta_time_ms / 1000.0)
+
+                rate_state[group_key][field] = (current_time_ms, float(current_value))
 
         # 添加时间戳和分组信息
         time_bucket = bucket.get("time_bucket", {})
@@ -1178,7 +1225,11 @@ class MetricsExporter:
             if use_field_aggregation:
                 # 使用字段聚合模式
                 bucket_size_seconds = self._parse_interval_to_seconds(sampling_interval)
-                sampling_aggs = self._build_field_aggregations(field_agg_config, bucket_size_seconds)
+                sampling_aggs = self._build_field_aggregations(
+                    field_agg_config,
+                    bucket_size_seconds,
+                    metric_type,
+                )
             else:
                 # 使用 top_hits 模式（默认）
                 sampling_aggs: Dict[str, Any] = {
@@ -1290,7 +1341,10 @@ class MetricsExporter:
 
             return queries
 
-        def _extract_docs_and_after_from_sampled(sampled: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        def _extract_docs_and_after_from_sampled(
+            sampled: Dict[str, Any],
+            rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
+        ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             """从 sampled 聚合结果提取文档列表和 after_key。"""
             buckets = sampled.get("buckets", [])
             if not buckets:
@@ -1299,7 +1353,7 @@ class MetricsExporter:
             docs: List[Dict[str, Any]] = []
             for bucket in buckets:
                 if use_field_aggregation:
-                    doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config)
+                    doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config, rate_state)
                 else:
                     doc = self._build_sampling_point_from_bucket(bucket)
                 if not doc:
@@ -1312,7 +1366,11 @@ class MetricsExporter:
 
             return docs, sampled.get("after_key")
 
-        def _fetch_sampling_page(search_query: Dict, after: Dict = None) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        def _fetch_sampling_page(
+            search_query: Dict,
+            after: Dict = None,
+            rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
+        ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             """请求单页 sampling/composite 数据并转换为文档。"""
             body = build_sampling_body(search_query, after)
             result = self.client.proxy_request(
@@ -1322,7 +1380,7 @@ class MetricsExporter:
                 body,
             )
             sampled = result.get("aggregations", {}).get("sampled", {})
-            return _extract_docs_and_after_from_sampled(sampled)
+            return _extract_docs_and_after_from_sampled(sampled, rate_state)
 
         # 并行路径：每个 worker 独立写文件，避免全局去重 map 长时间占用内存
         if parallel_degree and parallel_degree > 1:
@@ -1345,13 +1403,14 @@ class MetricsExporter:
             def run_sampling_slice(worker_id: int, worker_query: Dict) -> Tuple[int, List[str]]:
                 local_count = 0
                 worker_output = f"{output_file}_worker{worker_id}"
+                local_rate_state: Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]] = {}
 
                 with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
-                    current_docs, next_after = _fetch_sampling_page(worker_query, None)
+                    current_docs, next_after = _fetch_sampling_page(worker_query, None, local_rate_state)
 
                     with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                         next_future = (
-                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after)
+                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, local_rate_state)
                             if next_after
                             else None
                         )
@@ -1369,7 +1428,7 @@ class MetricsExporter:
 
                             current_docs, next_after = next_future.result()
                             next_future = (
-                                prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after)
+                                prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, local_rate_state)
                                 if next_after
                                 else None
                             )
@@ -1393,11 +1452,12 @@ class MetricsExporter:
             return total_exported, sorted(all_file_paths)
 
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            current_docs, after_key = _fetch_sampling_page(query, None)
+            rate_state: Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]] = {}
+            current_docs, after_key = _fetch_sampling_page(query, None, rate_state)
 
             with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                 next_future = (
-                    prefetch_executor.submit(_fetch_sampling_page, query, after_key)
+                    prefetch_executor.submit(_fetch_sampling_page, query, after_key, rate_state)
                     if after_key
                     else None
                 )
@@ -1416,7 +1476,7 @@ class MetricsExporter:
 
                     current_docs, after_key = next_future.result()
                     next_future = (
-                        prefetch_executor.submit(_fetch_sampling_page, query, after_key)
+                        prefetch_executor.submit(_fetch_sampling_page, query, after_key, rate_state)
                         if after_key
                         else None
                     )

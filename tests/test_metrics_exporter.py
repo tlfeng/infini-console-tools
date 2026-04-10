@@ -1305,6 +1305,25 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(len(search_calls), 4)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
+            # 字段聚合必须使用真实文档路径 payload.elasticsearch.node_stats.*
+            sampled_calls = []
+            for c in search_calls:
+                sampled = c[2].get("aggs", {}).get("sampled", {})
+                if "aggs" in sampled:
+                    sampled_calls.append(c)
+
+            self.assertTrue(sampled_calls)
+            first_sampled_aggs = sampled_calls[0][2]["aggs"]["sampled"]["aggs"]
+            for agg_name, agg_body in first_sampled_aggs.items():
+                if not agg_name.endswith("_max"):
+                    continue
+                self.assertIn("max", agg_body)
+                self.assertIn("field", agg_body["max"])
+                self.assertTrue(
+                    agg_body["max"]["field"].startswith("payload.elasticsearch.node_stats."),
+                    f"unexpected max field path: {agg_body['max']['field']}",
+                )
+
             # 读取生成的 jsonl 文件
             output_file = f"{temp_base}.jsonl"
             with open(output_file, 'r') as f:
@@ -1316,6 +1335,100 @@ class TestStratifiedSampling(unittest.TestCase):
                 self.assertIn("timestamp", d)
                 self.assertIn("indices.indexing.index_total", d)
                 self.assertIn("indices.indexing.index_total_rate", d)
+
+    def test_sampling_field_aggregation_fallback_rate_from_delta(self):
+        """当 ES 不返回 *_rate 时，应按相邻时间桶差值补算 rate。"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+
+            if method == "POST" and path == "/.infini_metrics/_search":
+                if body.get("size") == 1 and not body.get("aggs"):
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_source": {
+                                        "metadata": {
+                                            "labels": {
+                                                "cluster_id": "c1",
+                                                "node_id": "n1",
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+
+                if "group_cardinality" in body.get("aggs", {}):
+                    return {"aggregations": {"group_cardinality": {"value": 1}}}
+
+                sampled_agg = body.get("aggs", {}).get("sampled", {})
+                if "aggs" not in sampled_agg:
+                    return {"aggregations": {"sampled": {"buckets": []}}}
+
+                # 第一页两个连续桶，仅返回 *_max，不返回 *_rate
+                if "after" not in sampled_agg.get("composite", {}):
+                    return {
+                        "aggregations": {
+                            "sampled": {
+                                "buckets": [
+                                    {
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016000000,
+                                        },
+                                        "time_bucket": {
+                                            "key_as_string": "2026-04-02T00:00:00Z"
+                                        },
+                                        "indices_indexing_index_total_max": {"value": 1000},
+                                    },
+                                    {
+                                        "key": {
+                                            "group_0": "c1",
+                                            "group_1": "n1",
+                                            "time_bucket": 1712016900000,
+                                        },
+                                        "time_bucket": {
+                                            "key_as_string": "2026-04-02T00:15:00Z"
+                                        },
+                                        "indices_indexing_index_total_max": {"value": 1600},
+                                    },
+                                ]
+                            }
+                        }
+                    }
+
+            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_base = os.path.join(temp_dir, "test")
+
+            result = exporter.export_metric_type(
+                metric_type="node_stats",
+                config=METRIC_TYPES["node_stats"],
+                output_file=temp_base,
+                time_range_hours=24,
+                cluster_ids=["cluster-1"],
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                skip_estimation=True,
+            )
+
+            self.assertEqual(result.count, 2)
+
+            with open(f"{temp_base}.jsonl", 'r') as f:
+                data = [json.loads(line) for line in f.readlines()]
+
+            # 第一桶缺少前序点，rate 可能为 null；第二桶应补算为 (1600-1000)/900 = 0.666...
+            self.assertIsNone(data[0].get("indices.indexing.index_total_rate"))
+            self.assertIsNotNone(data[1].get("indices.indexing.index_total_rate"))
+            self.assertAlmostEqual(data[1]["indices.indexing.index_total_rate"], 600 / 900, places=6)
 
     def test_sampling_bucket_uses_latest_snapshot_as_sample_point(self):
         """sampling 应使用桶内 latest 真实快照作为采样点（非字段聚合模式）"""
