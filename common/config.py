@@ -298,12 +298,9 @@ DERIVATIVE_FIELDS = {
         "query_cache.miss_count",
     ],
     "cluster_health": [],  # cluster_health 通常不需要 derivative
-    "cluster_stats": [
-        # 索引相关
-        "indices.indexing.index_total",
-        # 搜索相关
-        "indices.search.query_total",
-    ],
+    # cluster_stats 结构在不同 ES/Easysearch 版本差异较大，
+    # 固定字段聚合容易得到大量 null，改为 top_hits 抽样保留真实快照。
+    "cluster_stats": [],
 }
 
 
