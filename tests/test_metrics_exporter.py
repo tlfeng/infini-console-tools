@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from common.config import SamplingConfig
+from common.config import SamplingConfig, METRIC_FIELD_AGG_CONFIG
 
 # 导入 metrics_exporter 模块
 import importlib.util
@@ -30,6 +30,7 @@ ExportResult = metrics_exporter.ExportResult
 MetricsExporter = metrics_exporter.MetricsExporter
 METRIC_TYPES = metrics_exporter.METRIC_TYPES
 ALERT_TYPES = metrics_exporter.ALERT_TYPES
+FieldAggregator = metrics_exporter.FieldAggregator
 
 
 class TestJSONLinesWriter(unittest.TestCase):
@@ -1166,8 +1167,8 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_search"]), 3)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
-    def test_node_stats_interval_sampling_uses_es_aggregations(self):
-        """node_stats interval 抽样应走 ES 字段聚合模式"""
+    def test_node_stats_interval_sampling_uses_latest_snapshot(self):
+        """node_stats interval 抽样应使用 latest 快照，保留原始字段。"""
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
@@ -1223,7 +1224,7 @@ class TestStratifiedSampling(unittest.TestCase):
                         }
                     }
 
-                # 实际导出的聚合查询 - 字段聚合模式
+                # 实际导出的聚合查询 - latest 快照模式
                 after = sampled_agg.get("composite", {}).get("after")
                 if not after:
                     return {
@@ -1236,12 +1237,25 @@ class TestStratifiedSampling(unittest.TestCase):
                                             "group_1": "n1",
                                             "time_bucket": 1712016000000,
                                         },
-                                        "time_bucket": {
-                                            "key_as_string": "2026-04-02T00:00:00Z"
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-1",
+                                                        "_source": {
+                                                            "timestamp": "2026-04-02T00:00:00Z",
+                                                            "payload": {
+                                                                "elasticsearch": {
+                                                                    "node_stats": {
+                                                                        "indices": {"indexing": {"index_total": 1000}}
+                                                                    }
+                                                                }
+                                                            },
+                                                        },
+                                                    }
+                                                ]
+                                            }
                                         },
-                                        # 字段聚合结果示例
-                                        "indices_indexing_index_total_max": {"value": 1000},
-                                        "indices_indexing_index_total_rate": {"value": 10.5},
                                     },
                                     {
                                         "key": {
@@ -1249,11 +1263,25 @@ class TestStratifiedSampling(unittest.TestCase):
                                             "group_1": "n1",
                                             "time_bucket": 1712016900000,
                                         },
-                                        "time_bucket": {
-                                            "key_as_string": "2026-04-02T00:15:00Z"
+                                        "latest": {
+                                            "hits": {
+                                                "hits": [
+                                                    {
+                                                        "_id": "doc-2",
+                                                        "_source": {
+                                                            "timestamp": "2026-04-02T00:15:00Z",
+                                                            "payload": {
+                                                                "elasticsearch": {
+                                                                    "node_stats": {
+                                                                        "indices": {"indexing": {"index_total": 2000}}
+                                                                    }
+                                                                }
+                                                            },
+                                                        },
+                                                    }
+                                                ]
+                                            }
                                         },
-                                        "indices_indexing_index_total_max": {"value": 2000},
-                                        "indices_indexing_index_total_rate": {"value": 11.1},
                                     },
                                 ],
                                 "after_key": {"group_0": "c1", "group_1": "n2", "time_bucket": 1712016900000},
@@ -1271,11 +1299,25 @@ class TestStratifiedSampling(unittest.TestCase):
                                         "group_1": "n2",
                                         "time_bucket": 1712017800000,
                                     },
-                                    "time_bucket": {
-                                        "key_as_string": "2026-04-02T00:30:00Z"
+                                    "latest": {
+                                        "hits": {
+                                            "hits": [
+                                                {
+                                                    "_id": "doc-3",
+                                                    "_source": {
+                                                        "timestamp": "2026-04-02T00:30:00Z",
+                                                        "payload": {
+                                                            "elasticsearch": {
+                                                                "node_stats": {
+                                                                    "indices": {"indexing": {"index_total": 3000}}
+                                                                }
+                                                            }
+                                                        },
+                                                    },
+                                                }
+                                            ]
+                                        }
                                     },
-                                    "indices_indexing_index_total_max": {"value": 3000},
-                                    "indices_indexing_index_total_rate": {"value": 12.2},
                                 }
                             ]
                         }
@@ -1305,130 +1347,18 @@ class TestStratifiedSampling(unittest.TestCase):
             self.assertEqual(len(search_calls), 4)
             self.assertEqual(len([c for c in calls if c[1] == "/.infini_metrics/_count"]), 1)
 
-            # 字段聚合必须使用真实文档路径 payload.elasticsearch.node_stats.*
-            sampled_calls = []
-            for c in search_calls:
-                sampled = c[2].get("aggs", {}).get("sampled", {})
-                if "aggs" in sampled:
-                    sampled_calls.append(c)
-
-            self.assertTrue(sampled_calls)
-            first_sampled_aggs = sampled_calls[0][2]["aggs"]["sampled"]["aggs"]
-            for agg_name, agg_body in first_sampled_aggs.items():
-                if not agg_name.endswith("_max"):
-                    continue
-                self.assertIn("max", agg_body)
-                self.assertIn("field", agg_body["max"])
-                self.assertTrue(
-                    agg_body["max"]["field"].startswith("payload.elasticsearch.node_stats."),
-                    f"unexpected max field path: {agg_body['max']['field']}",
-                )
-
             # 读取生成的 jsonl 文件
             output_file = f"{temp_base}.jsonl"
             with open(output_file, 'r') as f:
                 lines = f.readlines()
             data = [json.loads(line) for line in lines]
-            # node_stats 使用字段聚合模式，验证文档数量和字段
+            # node_stats 使用 latest 快照模式，验证原始结构被保留
             self.assertEqual(len(data), 3)
             for d in data:
                 self.assertIn("timestamp", d)
-                self.assertIn("indices.indexing.index_total", d)
-                self.assertIn("indices.indexing.index_total_rate", d)
-
-    def test_sampling_field_aggregation_fallback_rate_from_delta(self):
-        """当 ES 不返回 *_rate 时，应按相邻时间桶差值补算 rate。"""
-        mock_client = MagicMock()
-        exporter = MetricsExporter(mock_client, "system-id")
-
-        def proxy_request(cluster_id, method, path, body=None):
-            self.assertEqual(cluster_id, "system-id")
-
-            if method == "POST" and path == "/.infini_metrics/_search":
-                if body.get("size") == 1 and not body.get("aggs"):
-                    return {
-                        "hits": {
-                            "hits": [
-                                {
-                                    "_source": {
-                                        "metadata": {
-                                            "labels": {
-                                                "cluster_id": "c1",
-                                                "node_id": "n1",
-                                            }
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    }
-
-                if "group_cardinality" in body.get("aggs", {}):
-                    return {"aggregations": {"group_cardinality": {"value": 1}}}
-
-                sampled_agg = body.get("aggs", {}).get("sampled", {})
-                if "aggs" not in sampled_agg:
-                    return {"aggregations": {"sampled": {"buckets": []}}}
-
-                # 第一页两个连续桶，仅返回 *_max，不返回 *_rate
-                if "after" not in sampled_agg.get("composite", {}):
-                    return {
-                        "aggregations": {
-                            "sampled": {
-                                "buckets": [
-                                    {
-                                        "key": {
-                                            "group_0": "c1",
-                                            "group_1": "n1",
-                                            "time_bucket": 1712016000000,
-                                        },
-                                        "time_bucket": {
-                                            "key_as_string": "2026-04-02T00:00:00Z"
-                                        },
-                                        "indices_indexing_index_total_max": {"value": 1000},
-                                    },
-                                    {
-                                        "key": {
-                                            "group_0": "c1",
-                                            "group_1": "n1",
-                                            "time_bucket": 1712016900000,
-                                        },
-                                        "time_bucket": {
-                                            "key_as_string": "2026-04-02T00:15:00Z"
-                                        },
-                                        "indices_indexing_index_total_max": {"value": 1600},
-                                    },
-                                ]
-                            }
-                        }
-                    }
-
-            self.fail(f"Unexpected proxy_request call: {(method, path, body)}")
-
-        mock_client.proxy_request.side_effect = proxy_request
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_base = os.path.join(temp_dir, "test")
-
-            result = exporter.export_metric_type(
-                metric_type="node_stats",
-                config=METRIC_TYPES["node_stats"],
-                output_file=temp_base,
-                time_range_hours=24,
-                cluster_ids=["cluster-1"],
-                sampling=SamplingConfig(mode="sampling", interval="15m"),
-                skip_estimation=True,
-            )
-
-            self.assertEqual(result.count, 2)
-
-            with open(f"{temp_base}.jsonl", 'r') as f:
-                data = [json.loads(line) for line in f.readlines()]
-
-            # 第一桶缺少前序点，rate 可能为 null；第二桶应补算为 (1600-1000)/900 = 0.666...
-            self.assertIsNone(data[0].get("indices.indexing.index_total_rate"))
-            self.assertIsNotNone(data[1].get("indices.indexing.index_total_rate"))
-            self.assertAlmostEqual(data[1]["indices.indexing.index_total_rate"], 600 / 900, places=6)
+                self.assertIn("payload", d)
+                self.assertIn("elasticsearch", d["payload"])
+                self.assertIn("node_stats", d["payload"]["elasticsearch"])
 
     def test_sampling_bucket_uses_latest_snapshot_as_sample_point(self):
         """sampling 应使用桶内 latest 真实快照作为采样点（非字段聚合模式）"""
@@ -1923,11 +1853,437 @@ class TestIPMasking(unittest.TestCase):
                 }
             }
         }
-        
+
         result = MetricsExporter._mask_doc(doc)
-        
+
         self.assertEqual(result["level1"]["level2"]["level3"]["ip"], "*.*.1.1")
         self.assertEqual(result["level1"]["level2"]["level3"]["peers"], ["*.*.0.1", "*.*.0.2"])
+
+
+class TestFieldAggregator(unittest.TestCase):
+    """测试字段聚合器"""
+
+    def test_rate_field_computes_delta_over_bucket_size(self):
+        """rate 字段应计算 delta / bucket_size"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)  # 15m = 900000ms
+
+        # 第一个桶：累积值 1000
+        doc1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 1000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        result1 = aggregator.apply_field_overrides(doc1, bucket_key1)
+        # 首次见到该字段，无前值，保留原始值
+        self.assertEqual(result1["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 1000)
+
+        # 第二个桶：累积值 2000（delta=1000，bucket_size=900s）
+        doc2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 2000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2 = aggregator.apply_field_overrides(doc2, bucket_key2)
+        # rate = delta / bucket_size_sec = 1000 / 900 ≈ 1.111...
+        rate_val = result2["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"]
+        self.assertAlmostEqual(rate_val, 1000 / 900.0, places=6)
+
+    def test_rate_field_handles_counter_reset(self):
+        """rate 字段应正确处理计数器重置（如节点重启）"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        doc1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 10000  # 重置前的大值
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        result1 = aggregator.apply_field_overrides(doc1, bucket_key1)
+        self.assertEqual(result1["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 10000)
+
+        # 重置后：累积值从 0 开始
+        doc2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 500  # 重置后的小值
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2 = aggregator.apply_field_overrides(doc2, bucket_key2)
+        # 计数器重置：delta < 0，应使用当前值作为 delta
+        # rate = 500 / 900 ≈ 0.556...
+        rate_val = result2["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"]
+        self.assertAlmostEqual(rate_val, 500 / 900.0, places=6)
+
+    def test_latency_field_computes_delta_time_over_delta_count(self):
+        """latency 字段应计算 delta(time) / delta(count)"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        # 第一个桶：query_total=1000, query_time_in_millis=5000ms
+        doc1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "search": {
+                                "query_total": 1000,
+                                "query_time_in_millis": 5000,
+                                "query_latency": 0  # 原始值会被覆盖
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        result1 = aggregator.apply_field_overrides(doc1, bucket_key1)
+        # 首次见到，无前值，保留原始值
+        self.assertEqual(result1["payload"]["elasticsearch"]["node_stats"]["indices"]["search"]["query_latency"], 0)
+
+        # 第二个桶：query_total=2000, query_time_in_millis=12000ms
+        doc2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "search": {
+                                "query_total": 2000,
+                                "query_time_in_millis": 12000,
+                                "query_latency": 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2 = aggregator.apply_field_overrides(doc2, bucket_key2)
+        # latency = delta(time) / delta(count) = (12000-5000) / (2000-1000) = 7000 / 1000 = 7ms
+        latency_val = result2["payload"]["elasticsearch"]["node_stats"]["indices"]["search"]["query_latency"]
+        self.assertAlmostEqual(latency_val, 7.0, places=6)
+
+    def test_latency_field_outputs_zero_when_delta_count_is_zero(self):
+        """latency 字段在 delta(count)=0 时应输出 0"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        doc1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "search": {
+                                "query_total": 1000,
+                                "query_time_in_millis": 5000,
+                                "query_latency": 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        aggregator.apply_field_overrides(doc1, bucket_key1)
+
+        # 第二个桶：query_total 无变化
+        doc2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "search": {
+                                "query_total": 1000,  # 无变化
+                                "query_time_in_millis": 6000,
+                                "query_latency": 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2 = aggregator.apply_field_overrides(doc2, bucket_key2)
+        # delta(count) = 0，latency 应为 0
+        self.assertEqual(result2["payload"]["elasticsearch"]["node_stats"]["indices"]["search"]["query_latency"], 0.0)
+
+    def test_max_field_takes_max_from_bucket_aggs(self):
+        """max 字段应从 bucket 聚合中取最大值"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        doc = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "jvm": {
+                            "mem": {
+                                "heap_used_in_bytes": 1000000000  # 原始值
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+
+        # 模拟 bucket 聚合结果（max 值）
+        bucket_aggs = {
+            "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes": {
+                "value": 2000000000  # max 值更大
+            }
+        }
+
+        result = aggregator.apply_field_overrides(doc, bucket_key, bucket_aggs)
+        # 应覆盖为 max 值
+        self.assertEqual(result["payload"]["elasticsearch"]["node_stats"]["jvm"]["mem"]["heap_used_in_bytes"], 2000000000)
+
+    def test_max_field_keeps_latest_when_no_bucket_aggs(self):
+        """max 字段在无 bucket 聚合时应保留 latest 值"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        doc = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "jvm": {
+                            "mem": {
+                                "heap_used_in_bytes": 1000000000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+
+        # 无 bucket 聚合
+        result = aggregator.apply_field_overrides(doc, bucket_key, None)
+        # 应保留 latest 值
+        self.assertEqual(result["payload"]["elasticsearch"]["node_stats"]["jvm"]["mem"]["heap_used_in_bytes"], 1000000000)
+
+    def test_unclassified_field_keeps_latest_value(self):
+        """未分类字段应保留 latest 值（typed fallback）"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        doc = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "metadata": {
+                "labels": {
+                    "cluster_id": "c1",
+                    "node_id": "n1"
+                }
+            },
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "os": {
+                            "cpu": {
+                                "percent": 75  # 未分类字段
+                            }
+                        },
+                        "custom_field": "custom_value"  # 未分类字段
+                    }
+                }
+            }
+        }
+        bucket_key = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+
+        result = aggregator.apply_field_overrides(doc, bucket_key, None)
+        # 未分类字段应保持原值
+        self.assertEqual(result["payload"]["elasticsearch"]["node_stats"]["os"]["cpu"]["percent"], 75)
+        self.assertEqual(result["payload"]["elasticsearch"]["node_stats"]["custom_field"], "custom_value")
+
+    def test_rate_state_maintains_across_multiple_buckets(self):
+        """rate_state 应跨多个桶维护状态"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        # 第一个桶
+        doc1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 1000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        aggregator.apply_field_overrides(doc1, bucket_key1)
+
+        # 第二个桶
+        doc2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 2000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2 = aggregator.apply_field_overrides(doc2, bucket_key2)
+        self.assertAlmostEqual(result2["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 1000 / 900.0, places=6)
+
+        # 第三个桶
+        doc3 = {
+            "timestamp": "2026-04-02T00:30:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 3500
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key3 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712017800000}
+        result3 = aggregator.apply_field_overrides(doc3, bucket_key3)
+        # rate = (3500-2000) / 900 = 1500 / 900 ≈ 1.667
+        self.assertAlmostEqual(result3["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 1500 / 900.0, places=6)
+
+    def test_rate_state_isolated_by_group_key(self):
+        """rate_state 应按 group_key 隔离，避免不同节点状态串扰"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+
+        # 节点 n1 的第一个桶
+        doc1_n1 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 1000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1_n1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016000000}
+        aggregator.apply_field_overrides(doc1_n1, bucket_key1_n1)
+
+        # 节点 n2 的第一个桶（不同的 group_key）
+        doc1_n2 = {
+            "timestamp": "2026-04-02T00:00:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 5000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key1_n2 = {"group_0": "c1", "group_1": "n2", "time_bucket": 1712016000000}
+        aggregator.apply_field_overrides(doc1_n2, bucket_key1_n2)
+
+        # 节点 n1 的第二个桶
+        doc2_n1 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 2000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2_n1 = {"group_0": "c1", "group_1": "n1", "time_bucket": 1712016900000}
+        result2_n1 = aggregator.apply_field_overrides(doc2_n1, bucket_key2_n1)
+        # n1 的 rate = (2000-1000) / 900
+        self.assertAlmostEqual(result2_n1["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 1000 / 900.0, places=6)
+
+        # 节点 n2 的第二个桶
+        doc2_n2 = {
+            "timestamp": "2026-04-02T00:15:00Z",
+            "payload": {
+                "elasticsearch": {
+                    "node_stats": {
+                        "indices": {
+                            "indexing": {
+                                "index_total": 7000
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bucket_key2_n2 = {"group_0": "c1", "group_1": "n2", "time_bucket": 1712016900000}
+        result2_n2 = aggregator.apply_field_overrides(doc2_n2, bucket_key2_n2)
+        # n2 的 rate = (7000-5000) / 900 = 2000 / 900
+        self.assertAlmostEqual(result2_n2["payload"]["elasticsearch"]["node_stats"]["indices"]["indexing"]["index_total"], 2000 / 900.0, places=6)
+
+    def test_build_max_aggs_generates_correct_dsl(self):
+        """build_max_aggs 应生成正确的 max 聚合 DSL"""
+        aggregator = FieldAggregator("node_stats", interval_ms=900000)
+        max_aggs = aggregator.build_max_aggs()
+
+        # 验证生成的聚合 DSL 使用原始字段路径（含点）作为聚合名，确保与 apply_field_overrides 查找一致
+        key = "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes"
+        self.assertIn(key, max_aggs)
+        self.assertEqual(max_aggs[key], {"max": {"field": key}})
 
 
 if __name__ == "__main__":

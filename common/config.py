@@ -172,171 +172,199 @@ class SamplingConfig:
         return self.mode == 'sampling'
 
 
-@dataclass
-class FieldAggregationConfig:
-    """字段聚合配置 - 定义每个字段使用的聚合类型"""
-    max_fields: List[str] = field(default_factory=list)  # 使用 max 聚合的字段
-    derivative_fields: List[str] = field(default_factory=list)  # 使用 derivative 聚合的字段
-
-    @classmethod
-    def from_dict(cls, data: Optional[Dict]) -> 'FieldAggregationConfig':
-        if not data:
-            return cls()
-
-        return cls(
-            max_fields=data.get('max', []),
-            derivative_fields=data.get('derivative', [])
-        )
-
-    def has_aggregations(self) -> bool:
-        """是否配置了聚合字段"""
-        return bool(self.max_fields or self.derivative_fields)
-
-    def get_all_fields(self) -> List[str]:
-        """获取所有需要聚合的字段"""
-        return self.max_fields + self.derivative_fields
+# 字段聚合策略类型
+class FieldAggStrategy:
+    """字段聚合策略常量"""
+    RATE = "rate"  # 导数字段：delta / bucket_size
+    RATIO = "ratio"  # 比率字段：delta(numerator) / delta(denominator)
+    LATENCY = "latency"  # 延迟字段：delta(total_time) / delta(count)
+    MAX = "max"  # 取最大值（如线程池、连接数等瞬时值）
+    LATEST = "latest"  # 取最新值（默认策略）
 
 
-# 内置的 derivative 字段定义（从 Console 项目搬运）
-# 这些字段需要计算相邻时间桶的差值，再除以 bucketSize 得到每秒速率
-DERIVATIVE_FIELDS = {
-    "node_stats": [
-        # 索引相关
-        "indices.indexing.index_total",
-        "indices.indexing.index_time_in_millis",
-        "indices.store.size_in_bytes",
-        # 搜索相关
-        "indices.search.query_total",
-        "indices.search.query_time_in_millis",
-        "indices.search.fetch_total",
-        "indices.search.fetch_time_in_millis",
-        "indices.search.scroll_total",
-        "indices.search.scroll_time_in_millis",
-        # 合并/刷新/刷盘
-        "indices.merges.total",
-        "indices.merges.total_time_in_millis",
-        "indices.refresh.total",
-        "indices.refresh.total_time_in_millis",
-        "indices.flush.total",
-        "indices.flush.total_time_in_millis",
-        # 请求缓存
-        "indices.request_cache.hit_count",
-        "indices.request_cache.miss_count",
-        "indices.query_cache.cache_count",
-        "indices.query_cache.hit_count",
-        "indices.query_cache.miss_count",
-        # HTTP
-        "http.total_opened",
-        # GC
-        "jvm.gc.collectors.young.collection_count",
-        "jvm.gc.collectors.young.collection_time_in_millis",
-        "jvm.gc.collectors.old.collection_count",
-        "jvm.gc.collectors.old.collection_time_in_millis",
-        # Transport
-        "transport.tx_count",
-        "transport.rx_count",
-        "transport.tx_size_in_bytes",
-        "transport.rx_size_in_bytes",
-        # 磁盘 IO
-        "fs.io_stats.total.operations",
-        "fs.io_stats.total.read_operations",
-        "fs.io_stats.total.write_operations",
-        # Breaker
-        "breakers.parent.tripped",
-        "breakers.accounting.tripped",
-        "breakers.fielddata.tripped",
-        "breakers.request.tripped",
-        "breakers.in_flight_requests.tripped",
-    ],
-    "index_stats": [
-        # 索引相关
-        "primaries.indexing.index_total",
-        "primaries.indexing.index_time_in_millis",
-        "total.indexing.index_total",
-        "total.indexing.index_time_in_millis",
-        # 搜索相关
-        "primaries.search.query_total",
-        "primaries.search.query_time_in_millis",
-        "total.search.query_total",
-        "total.search.query_time_in_millis",
-        "total.search.fetch_total",
-        "total.search.scroll_total",
-        # 合并/刷新/刷盘
-        "primaries.merges.total",
-        "total.merges.total",
-        "primaries.refresh.total",
-        "total.refresh.total",
-        "primaries.flush.total",
-        "total.flush.total",
-        # 请求缓存
-        "primaries.request_cache.hit_count",
-        "primaries.request_cache.miss_count",
-        "total.request_cache.hit_count",
-        "total.request_cache.miss_count",
-        # 查询缓存
-        "primaries.query_cache.cache_count",
-        "primaries.query_cache.hit_count",
-        "primaries.query_cache.miss_count",
-    ],
-    "shard_stats": [
-        # 索引相关
-        "indexing.index_total",
-        # 搜索相关
-        "search.query_total",
-        "search.fetch_total",
-        "search.scroll_total",
-        # 合并/刷新/刷盘
-        "merges.total",
-        "refresh.total",
-        "flush.total",
-        # 请求缓存
-        "request_cache.hit_count",
-        "request_cache.miss_count",
-        # 查询缓存
-        "query_cache.cache_count",
-        "query_cache.hit_count",
-        "query_cache.miss_count",
-    ],
-    "cluster_health": [],  # cluster_health 通常不需要 derivative
-    # cluster_stats 结构在不同 ES/Easysearch 版本差异较大，
-    # 固定字段聚合容易得到大量 null，改为 top_hits 抽样保留真实快照。
-    "cluster_stats": [],
+# 指标类型字段聚合配置
+# 定义哪些字段需要使用特定的聚合策略
+METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
+    "node_stats": {
+        # Rate 型字段：累积计数器，计算 delta / bucket_size
+        "rate_fields": {
+            # 索引相关
+            "payload.elasticsearch.node_stats.indices.indexing.index_total": None,
+            "payload.elasticsearch.node_stats.indices.indexing.index_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.indexing.index_current": None,
+            "payload.elasticsearch.node_stats.indices.indexing.delete_total": None,
+            "payload.elasticsearch.node_stats.indices.indexing.delete_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.indexing.delete_current": None,
+            "payload.elasticsearch.node_stats.indices.indexing.noop_update_total": None,
+            "payload.elasticsearch.node_stats.indices.indexing.is_throttled": None,
+            "payload.elasticsearch.node_stats.indices.indexing.throttle_time_in_millis": None,
+            # 查询相关
+            "payload.elasticsearch.node_stats.indices.search.query_total": None,
+            "payload.elasticsearch.node_stats.indices.search.query_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.search.query_current": None,
+            "payload.elasticsearch.node_stats.indices.search.fetch_total": None,
+            "payload.elasticsearch.node_stats.indices.search.fetch_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.search.fetch_current": None,
+            "payload.elasticsearch.node_stats.indices.search.scroll_total": None,
+            "payload.elasticsearch.node_stats.indices.search.scroll_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.search.scroll_current": None,
+            "payload.elasticsearch.node_stats.indices.search.suggest_total": None,
+            "payload.elasticsearch.node_stats.indices.search.suggest_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.search.suggest_current": None,
+            # 段合并相关
+            "payload.elasticsearch.node_stats.indices.merges.current": None,
+            "payload.elasticsearch.node_stats.indices.merges.current_docs": None,
+            "payload.elasticsearch.node_stats.indices.merges.current_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.merges.total": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_docs": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_stopped_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_throttled_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.merges.total_auto_throttle_in_bytes": None,
+            # 刷新相关
+            "payload.elasticsearch.node_stats.indices.refresh.total": None,
+            "payload.elasticsearch.node_stats.indices.refresh.total_time_in_millis": None,
+            "payload.elasticsearch.node_stats.indices.refresh.listeners": None,
+            # Flush 相关
+            "payload.elasticsearch.node_stats.indices.flush.total": None,
+            "payload.elasticsearch.node_stats.indices.flush.total_time_in_millis": None,
+            # 写入相关
+            "payload.elasticsearch.node_stats.indices.translog.operations": None,
+            "payload.elasticsearch.node_stats.indices.translog.size_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.translog.uncommitted_operations": None,
+            "payload.elasticsearch.node_stats.indices.translog.uncommitted_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.translog.earliest_last_modified_age": None,
+            # 请求缓存
+            "payload.elasticsearch.node_stats.indices.request_cache.hit_count": None,
+            "payload.elasticsearch.node_stats.indices.request_cache.miss_count": None,
+            # 字段数据缓存
+            "payload.elasticsearch.node_stats.indices.fielddata.memory_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.fielddata.evictions": None,
+            # 查询缓存
+            "payload.elasticsearch.node_stats.indices.query_cache.hit_count": None,
+            "payload.elasticsearch.node_stats.indices.query_cache.miss_count": None,
+            "payload.elasticsearch.node_stats.indices.query_cache.cache_count": None,
+            "payload.elasticsearch.node_stats.indices.query_cache.cache_size": None,
+            "payload.elasticsearch.node_stats.indices.query_cache.total_count": None,
+            # Recovery
+            "payload.elasticsearch.node_stats.indices.recovery.current_as_source": None,
+            "payload.elasticsearch.node_stats.indices.recovery.current_as_target": None,
+            "payload.elasticsearch.node_stats.indices.recovery.throttle_time_in_millis": None,
+            # 分片相关
+            "payload.elasticsearch.node_stats.indices.shard_stats.total_count": None,
+            # HTTP 连接
+            "payload.elasticsearch.node_stats.http.total_opened": None,
+            "payload.elasticsearch.node_stats.http.current_open": None,
+            # 网络流量
+            "payload.elasticsearch.node_stats.transport.rx_count": None,
+            "payload.elasticsearch.node_stats.transport.rx_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.transport.tx_count": None,
+            "payload.elasticsearch.node_stats.transport.tx_size_in_bytes": None,
+            # 文件系统 IO
+            "payload.elasticsearch.node_stats.fs.io_stats.total.read_operations": None,
+            "payload.elasticsearch.node_stats.fs.io_stats.total.read_kilobytes": None,
+            "payload.elasticsearch.node_stats.fs.io_stats.total.write_operations": None,
+            "payload.elasticsearch.node_stats.fs.io_stats.total.write_kilobytes": None,
+            # 进程 CPU
+            "payload.elasticsearch.node_stats.process.cpu.total_in_millis": None,
+        },
+        # Latency 型字段：计算 delta(time) / delta(count)
+        "latency_fields": {
+            "payload.elasticsearch.node_stats.indices.search.query_latency": {
+                "time_field": "payload.elasticsearch.node_stats.indices.search.query_time_in_millis",
+                "count_field": "payload.elasticsearch.node_stats.indices.search.query_total",
+            },
+            "payload.elasticsearch.node_stats.indices.indexing.index_latency": {
+                "time_field": "payload.elasticsearch.node_stats.indices.indexing.index_time_in_millis",
+                "count_field": "payload.elasticsearch.node_stats.indices.indexing.index_total",
+            },
+        },
+        # Max 型字段：取最大值（瞬时值类）
+        "max_fields": {
+            # JVM 内存
+            "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes": None,
+            "payload.elasticsearch.node_stats.jvm.mem.heap_used_percent": None,
+            "payload.elasticsearch.node_stats.jvm.mem.heap_committed_in_bytes": None,
+            "payload.elasticsearch.node_stats.jvm.mem.heap_max_in_bytes": None,
+            "payload.elasticsearch.node_stats.jvm.mem.non_heap_used_in_bytes": None,
+            "payload.elasticsearch.node_stats.jvm.mem.non_heap_committed_in_bytes": None,
+            # GC 相关
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_count": None,
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_time_in_millis": None,
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_count": None,
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_time_in_millis": None,
+            # 线程池
+            "payload.elasticsearch.node_stats.thread_pool.bulk.queue": None,
+            "payload.elasticsearch.node_stats.thread_pool.bulk.active": None,
+            "payload.elasticsearch.node_stats.thread_pool.bulk.largest": None,
+            "payload.elasticsearch.node_stats.thread_pool.bulk.completed": None,
+            "payload.elasticsearch.node_stats.thread_pool.write.queue": None,
+            "payload.elasticsearch.node_stats.thread_pool.write.active": None,
+            "payload.elasticsearch.node_stats.thread_pool.write.largest": None,
+            "payload.elasticsearch.node_stats.thread_pool.write.completed": None,
+            "payload.elasticsearch.node_stats.thread_pool.search.queue": None,
+            "payload.elasticsearch.node_stats.thread_pool.search.active": None,
+            "payload.elasticsearch.node_stats.thread_pool.search.largest": None,
+            "payload.elasticsearch.node_stats.thread_pool.search.completed": None,
+            "payload.elasticsearch.node_stats.thread_pool.get.queue": None,
+            "payload.elasticsearch.node_stats.thread_pool.get.active": None,
+            "payload.elasticsearch.node_stats.thread_pool.get.largest": None,
+            "payload.elasticsearch.node_stats.thread_pool.get.completed": None,
+            # 系统负载
+            "payload.elasticsearch.node_stats.os.cpu.percent": None,
+            "payload.elasticsearch.node_stats.os.cpu.load_average.1m": None,
+            "payload.elasticsearch.node_stats.os.cpu.load_average.5m": None,
+            "payload.elasticsearch.node_stats.os.cpu.load_average.15m": None,
+            # 文件系统
+            "payload.elasticsearch.node_stats.fs.total.free_in_bytes": None,
+            "payload.elasticsearch.node_stats.fs.total.available_in_bytes": None,
+            "payload.elasticsearch.node_stats.fs.total.total_in_bytes": None,
+        },
+    },
+    "index_stats": {
+        # Rate 型字段
+        "rate_fields": {
+            "payload.elasticsearch.index_stats.total.indexing.index_total": None,
+            "payload.elasticsearch.index_stats.total.indexing.index_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.indexing.index_current": None,
+            "payload.elasticsearch.index_stats.total.indexing.delete_total": None,
+            "payload.elasticsearch.index_stats.total.indexing.delete_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.search.query_total": None,
+            "payload.elasticsearch.index_stats.total.search.query_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.search.fetch_total": None,
+            "payload.elasticsearch.index_stats.total.search.fetch_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.search.scroll_total": None,
+            "payload.elasticsearch.index_stats.total.search.scroll_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.refresh.total": None,
+            "payload.elasticsearch.index_stats.total.refresh.total_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.flush.total": None,
+            "payload.elasticsearch.index_stats.total.flush.total_time_in_millis": None,
+            "payload.elasticsearch.index_stats.total.merges.total": None,
+            "payload.elasticsearch.index_stats.total.merges.total_time_in_millis": None,
+        },
+        # Latency 型字段
+        "latency_fields": {
+            "payload.elasticsearch.index_stats.total.search.query_latency": {
+                "time_field": "payload.elasticsearch.index_stats.total.search.query_time_in_millis",
+                "count_field": "payload.elasticsearch.index_stats.total.search.query_total",
+            },
+            "payload.elasticsearch.index_stats.total.indexing.index_latency": {
+                "time_field": "payload.elasticsearch.index_stats.total.indexing.index_time_in_millis",
+                "count_field": "payload.elasticsearch.index_stats.total.indexing.index_total",
+            },
+        },
+        # Max 型字段（瞬时值）
+        "max_fields": {
+            "payload.elasticsearch.index_stats.total.docs.count": None,
+            "payload.elasticsearch.index_stats.total.docs.deleted": None,
+            "payload.elasticsearch.index_stats.total.store.size_in_bytes": None,
+            "payload.elasticsearch.index_stats.primaries.docs.count": None,
+            "payload.elasticsearch.index_stats.primaries.docs.deleted": None,
+            "payload.elasticsearch.index_stats.primaries.store.size_in_bytes": None,
+        },
+    },
 }
-
-
-def get_derivative_fields(metric_type: str) -> List[str]:
-    """获取指定指标类型的 derivative 字段列表"""
-    return DERIVATIVE_FIELDS.get(metric_type, [])
-
-
-def get_builtin_field_aggregation(metric_type: str) -> FieldAggregationConfig:
-    """获取内置的字段聚合配置"""
-    derivative_fields = get_derivative_fields(metric_type)
-    return FieldAggregationConfig(
-        max_fields=[],  # max 字段不单独列出，由其他字段隐式确定
-        derivative_fields=derivative_fields
-    )
-
-
-@dataclass
-class FieldAggregationsConfig:
-    """按指标类型配置的字段聚合"""
-    aggregations: Dict[str, FieldAggregationConfig] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: Optional[Dict]) -> 'FieldAggregationsConfig':
-        if not data:
-            return cls()
-
-        aggregations = {}
-        for metric_type, config in data.items():
-            aggregations[metric_type] = FieldAggregationConfig.from_dict(config)
-
-        return cls(aggregations=aggregations)
-
-    def get_for_metric(self, metric_type: str) -> FieldAggregationConfig:
-        """获取指定指标类型的聚合配置"""
-        return self.aggregations.get(metric_type, FieldAggregationConfig())
 
 
 @dataclass
@@ -424,7 +452,6 @@ class MetricsJobConfig:
     source_fields: Optional[List[str]] = None
     include_alerts: bool = True
     alert_types: List[str] = field(default_factory=list)
-    field_aggregations: FieldAggregationsConfig = field(default_factory=FieldAggregationsConfig)  # 字段聚合配置
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'MetricsJobConfig':

@@ -39,8 +39,8 @@ from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIErr
 from common.config import (
     add_common_args, get_config_value,
     AppConfig, MetricsJobConfig, ConfigValidationError,
-    SamplingConfig, SlimConfig, FieldAggregationConfig,
-    get_builtin_field_aggregation,
+    SamplingConfig, SlimConfig,
+    FieldAggStrategy, METRIC_FIELD_AGG_CONFIG,
 )
 
 
@@ -117,6 +117,164 @@ DEFAULT_SCROLL_KEEPALIVE = "5m"  # 增加到 5 分钟，避免大数据量时 sc
 DEFAULT_PARALLEL_JOBS = 2  # 默认并行导出的指标类型数
 DEFAULT_PARALLEL_DEGREE = 1  # 单个指标内部并行度（基于 sliced scroll）
 DEFAULT_COMPOSITE_PAGE_SIZE = 3000  # sampling/composite 每页桶数，减少请求往返
+
+
+class FieldAggregator:
+    """
+    字段聚合器：根据字段聚合策略，从 ES 聚合桶中计算覆盖值。
+
+    策略类型：
+    - rate:     累积计数器的变化率，delta(value) / bucket_size
+    - ratio:    两个导数字段的比率，delta(num) / delta(den)
+    - latency:  平均延迟，delta(time) / delta(count)
+    - max:      取最大值（瞬时值类字段）
+    - latest:   取最新值（默认策略，未分类字段）
+    """
+
+    def __init__(self, metric_type: str, interval_ms: int):
+        self.metric_type = metric_type
+        self.interval_ms = interval_ms
+        self.config = METRIC_FIELD_AGG_CONFIG.get(metric_type, {})
+        self.rate_fields = set(self.config.get("rate_fields", {}).keys())
+        self.latency_fields = self.config.get("latency_fields", {})
+        self.max_fields = set(self.config.get("max_fields", {}).keys())
+        # rate_state: 按 (group_key, field_path) 维护上一桶的值，用于跨页/跨 worker 导数计算
+        self._rate_state: Dict[Tuple[str, str], float] = {}
+
+    def _group_key_from_bucket(self, bucket_key: Dict) -> str:
+        """从 composite bucket key 生成唯一分组标识"""
+        parts = []
+        for k in sorted(bucket_key.keys()):
+            if k != "time_bucket":
+                parts.append(str(bucket_key[k]))
+        return "|".join(parts) if parts else "_default"
+
+    def _set_nested_value(self, doc: Dict, field_path: str, value: Any) -> None:
+        """设置嵌套字段值，自动创建中间字典"""
+        parts = field_path.split(".")
+        current = doc
+        for part in parts[:-1]:
+            if part not in current or not isinstance(current[part], dict):
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+
+    def _get_nested_value(self, doc: Dict, field_path: str) -> Optional[Any]:
+        """获取嵌套字段值"""
+        parts = field_path.split(".")
+        value = doc
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return None
+        return value
+
+    def apply_field_overrides(
+        self,
+        doc: Dict,
+        bucket_key: Dict,
+        bucket_aggs: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        根据字段聚合策略覆盖 latest 快照中的字段值。
+
+        步骤：
+        1. 取 latest 快照作为底稿
+        2. 对已分类字段，按策略计算覆盖值
+        3. 未分类字段保持 latest 值（typed fallback 由快照保证）
+        """
+        if not self.config:
+            return doc
+
+        group_key = self._group_key_from_bucket(bucket_key)
+        result = copy.deepcopy(doc)
+        bucket_size_sec = self.interval_ms / 1000.0
+
+        # 1. Latency 字段：delta(time) / delta(count)
+        # 注意：latency 必须先于 rate 处理，因为它依赖原始累积值
+        for field_path, spec in self.latency_fields.items():
+            time_field = spec["time_field"]
+            count_field = spec["count_field"]
+            # 使用原始文档中的值，而不是 result（可能已被 rate 转换）
+            time_val = self._get_nested_value(doc, time_field)
+            count_val = self._get_nested_value(doc, count_field)
+            if time_val is None or count_val is None:
+                continue
+            try:
+                time_num = float(time_val)
+                count_num = float(count_val)
+            except (TypeError, ValueError):
+                continue
+
+            time_state_key = (group_key, time_field)
+            count_state_key = (group_key, count_field)
+
+            prev_time = self._rate_state.get(time_state_key)
+            prev_count = self._rate_state.get(count_state_key)
+
+            # 更新 rate_state（latency 的 time/count 也要参与 rate 状态追踪）
+            self._rate_state[time_state_key] = time_num
+            self._rate_state[count_state_key] = count_num
+
+            if prev_time is not None and prev_count is not None:
+                delta_time = time_num - prev_time
+                delta_count = count_num - prev_count
+                if delta_time < 0:
+                    delta_time = time_num
+                if delta_count < 0:
+                    delta_count = count_num
+                if delta_count == 0:
+                    latency_val = 0.0
+                else:
+                    latency_val = delta_time / delta_count
+                self._set_nested_value(result, field_path, latency_val)
+
+        # 2. Rate 字段：delta / bucket_size
+        for field_path in self.rate_fields:
+            current_val = self._get_nested_value(doc, field_path)
+            if current_val is None:
+                continue
+            try:
+                current_num = float(current_val)
+            except (TypeError, ValueError):
+                continue
+
+            state_key = (group_key, field_path)
+            prev_val = self._rate_state.get(state_key)
+            self._rate_state[state_key] = current_num
+
+            if prev_val is not None:
+                delta = current_num - prev_val
+                # 处理计数器重置（如节点重启）
+                if delta < 0:
+                    delta = current_num
+                rate_val = delta / bucket_size_sec
+                self._set_nested_value(result, field_path, rate_val)
+            # 首次见到该字段（无前值），保留原始值不变
+
+        # 3. Max 字段：从 bucket 聚合中取 max（如果有的话），否则保留 latest
+        if bucket_aggs:
+            for field_path in self.max_fields:
+                # bucket_aggs 的 key 是扁平的字符串（如 "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes"）
+                agg_val = bucket_aggs.get(field_path)
+                if agg_val is not None:
+                    if isinstance(agg_val, dict) and "value" in agg_val:
+                        max_val = agg_val["value"]
+                        if max_val is not None:
+                            self._set_nested_value(result, field_path, max_val)
+
+        return result
+
+    def build_max_aggs(self) -> Dict[str, Any]:
+        """构建 max 聚合 DSL，用于需要取最大值的字段。
+        直接用原始字段路径作为聚合名，和 apply_field_overrides 里的查找 key 保持一致。
+        ES 聚合名可以是任意字符串，含点号亦合法。
+        """
+        aggs = {}
+        for field_path in self.max_fields:
+            aggs[field_path] = {"max": {"field": field_path}}
+        return aggs
 
 
 class JSONLinesWriter:
@@ -968,29 +1126,6 @@ class MetricsExporter:
                 return None
         return value
 
-    def _sanitize_agg_name(self, field: str) -> str:
-        """将字段路径转换为合法的聚合名称"""
-        return field.replace(".", "_")
-
-    def _parse_interval_to_seconds(self, interval: str) -> float:
-        """解析 interval 字符串为秒数"""
-        match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
-        if not match:
-            raise ValueError(f"Invalid interval format: {interval}")
-
-        value = int(match.group(1))
-        unit = match.group(2)
-
-        multipliers = {
-            "ms": 0.001,
-            "s": 1,
-            "m": 60,
-            "h": 3600,
-            "d": 86400,
-        }
-
-        return value * multipliers[unit]
-
     def _parse_interval_to_ms(self, interval: str) -> int:
         """解析 interval 字符串为毫秒"""
         match = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval or "")
@@ -1033,118 +1168,25 @@ class MetricsExporter:
 
         return effective_group_fields
 
-    def _build_field_aggregations(
-        self,
-        field_agg_config: FieldAggregationConfig,
-        bucket_size_seconds: float,
-        metric_type: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """构建字段级别的聚合"""
-        aggs = {}
-
-        def _metric_field(field: str) -> str:
-            if metric_type:
-                return f"payload.elasticsearch.{metric_type}.{field}"
-            return field
-
-        # Max 聚合
-        for field in field_agg_config.max_fields:
-            agg_name = self._sanitize_agg_name(field)
-            aggs[agg_name] = {"max": {"field": _metric_field(field)}}
-
-        # Derivative 聚合在 composite bucket 下不受支持，保留 max，rate 在解析阶段兜底为 None
-        for field in field_agg_config.derivative_fields:
-            max_agg_name = f"{self._sanitize_agg_name(field)}_max"
-            aggs[max_agg_name] = {"max": {"field": _metric_field(field)}}
-
-        return aggs
-
-    def _build_doc_from_aggregation_bucket(
-        self,
-        bucket: Dict[str, Any],
-        field_agg_config: FieldAggregationConfig,
-        rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
+    def _build_sampling_point_from_bucket(
+        self, bucket: Dict[str, Any],
+        field_aggregator: Optional['FieldAggregator'] = None,
     ) -> Optional[Dict[str, Any]]:
-        """从聚合 bucket 构建文档"""
-        result = {}
-        bucket_key = bucket.get("key", {})
-        group_key = tuple(
-            bucket_key[k]
-            for k in sorted(bucket_key.keys())
-            if k.startswith("group_")
-        )
-
-        current_time_ms = bucket_key.get("time_bucket")
-        if not isinstance(current_time_ms, int):
-            current_time_ms = None
-
-        # 解析 max 聚合结果
-        for field in field_agg_config.max_fields:
-            agg_name = self._sanitize_agg_name(field)
-            value = bucket.get(agg_name, {})
-            if isinstance(value, dict):
-                result[field] = value.get("value")
-            else:
-                result[field] = value
-
-        # 解析 derivative (rate) 结果
-        for field in field_agg_config.derivative_fields:
-            rate_agg_name = f"{self._sanitize_agg_name(field)}_rate"
-            max_agg_name = f"{self._sanitize_agg_name(field)}_max"
-
-            current_value = None
-            # 优先使用 rate 值
-            rate_value = bucket.get(rate_agg_name, {})
-            if isinstance(rate_value, dict):
-                result[f"{field}_rate"] = rate_value.get("value")
-            else:
-                result[f"{field}_rate"] = rate_value
-
-            # 同时保留 max 值
-            max_value = bucket.get(max_agg_name, {})
-            if isinstance(max_value, dict):
-                current_value = max_value.get("value")
-                result[field] = current_value
-            else:
-                current_value = max_value
-                result[field] = max_value
-
-            # 若 ES 侧未提供 rate（composite 场景），则基于相邻桶 max 值计算每秒速率
-            if (
-                result.get(f"{field}_rate") is None
-                and rate_state is not None
-                and current_time_ms is not None
-                and current_value is not None
-            ):
-                if group_key not in rate_state:
-                    rate_state[group_key] = {}
-
-                previous = rate_state[group_key].get(field)
-                if previous:
-                    previous_time_ms, previous_value = previous
-                    delta_time_ms = current_time_ms - previous_time_ms
-                    if delta_time_ms > 0:
-                        delta_value = float(current_value) - float(previous_value)
-                        if delta_value >= 0:
-                            result[f"{field}_rate"] = delta_value / (delta_time_ms / 1000.0)
-
-                rate_state[group_key][field] = (current_time_ms, float(current_value))
-
-        # 添加时间戳和分组信息
-        time_bucket = bucket.get("time_bucket", {})
-        if time_bucket:
-            result["timestamp"] = time_bucket.get("key_as_string")
-
-        return result if result else None
-
-    def _build_sampling_point_from_bucket(self, bucket: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """从 sampling bucket 构建采样点（保留时间桶内最新真实快照）。"""
+        """从 sampling bucket 构建采样点（保留时间桶内最新真实快照），并应用字段聚合覆盖。"""
         hits = bucket.get("latest", {}).get("hits", {}).get("hits", [])
         if not hits:
             return None
 
         hit = hits[0]
-        return {"_id": hit.get("_id"), **hit.get("_source", {})}
+        doc = {"_id": hit.get("_id"), **hit.get("_source", {})}
+
+        # 应用字段聚合覆盖
+        if field_aggregator:
+            bucket_key = bucket.get("key", {})
+            bucket_aggs = {k: v for k, v in bucket.items() if k not in ("key", "latest", "doc_count")}
+            doc = field_aggregator.apply_field_overrides(doc, bucket_key, bucket_aggs)
+
+        return doc
 
     def export_with_es_sampling(
         self,
@@ -1195,9 +1237,11 @@ class MetricsExporter:
         after_key = None
         composite_page_size = DEFAULT_COMPOSITE_PAGE_SIZE
 
-        # 获取字段聚合配置（使用内置配置）
-        field_agg_config = get_builtin_field_aggregation(metric_type) if metric_type else FieldAggregationConfig()
-        use_field_aggregation = field_agg_config.has_aggregations()
+        # 创建字段聚合器（仅 node_stats / index_stats 启用字段聚合）
+        interval_ms = self._parse_interval_to_ms(sampling_interval)
+        field_aggregator: Optional[FieldAggregator] = None
+        if metric_type and metric_type in METRIC_FIELD_AGG_CONFIG:
+            field_aggregator = FieldAggregator(metric_type, interval_ms)
 
         if not effective_group_fields:
             effective_group_fields = self._resolve_effective_group_fields(
@@ -1222,28 +1266,24 @@ class MetricsExporter:
         )
 
         def build_sampling_body(search_query: Dict, after: Dict = None) -> Dict[str, Any]:
-            if use_field_aggregation:
-                # 使用字段聚合模式
-                bucket_size_seconds = self._parse_interval_to_seconds(sampling_interval)
-                sampling_aggs = self._build_field_aggregations(
-                    field_agg_config,
-                    bucket_size_seconds,
-                    metric_type,
-                )
-            else:
-                # 使用 top_hits 模式（默认）
-                sampling_aggs: Dict[str, Any] = {
-                    "latest": {
-                        "top_hits": {
-                            "size": 1,
-                            "sort": [
-                                {"timestamp": {"order": "desc"}},
-                                {"_id": {"order": "desc"}},
-                            ],
-                            "_source": source_fields if source_fields else True,
-                        }
+            sampling_aggs: Dict[str, Any] = {
+                "latest": {
+                    "top_hits": {
+                        "size": 1,
+                        "sort": [
+                            {"timestamp": {"order": "desc"}},
+                            {"_id": {"order": "desc"}},
+                        ],
+                        "_source": source_fields if source_fields else True,
                     }
                 }
+            }
+
+            # 对 max 型字段追加 max 聚合
+            if field_aggregator:
+                max_aggs = field_aggregator.build_max_aggs()
+                if max_aggs:
+                    sampling_aggs.update(max_aggs)
 
             body = {
                 "size": 0,
@@ -1343,7 +1383,7 @@ class MetricsExporter:
 
         def _extract_docs_and_after_from_sampled(
             sampled: Dict[str, Any],
-            rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
+            aggregator: Optional["FieldAggregator"] = None,
         ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             """从 sampled 聚合结果提取文档列表和 after_key。"""
             buckets = sampled.get("buckets", [])
@@ -1352,10 +1392,7 @@ class MetricsExporter:
 
             docs: List[Dict[str, Any]] = []
             for bucket in buckets:
-                if use_field_aggregation:
-                    doc = self._build_doc_from_aggregation_bucket(bucket, field_agg_config, rate_state)
-                else:
-                    doc = self._build_sampling_point_from_bucket(bucket)
+                doc = self._build_sampling_point_from_bucket(bucket, aggregator)
                 if not doc:
                     continue
                 if mask_ip:
@@ -1369,7 +1406,7 @@ class MetricsExporter:
         def _fetch_sampling_page(
             search_query: Dict,
             after: Dict = None,
-            rate_state: Optional[Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]]] = None,
+            aggregator: Optional["FieldAggregator"] = None,
         ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             """请求单页 sampling/composite 数据并转换为文档。"""
             body = build_sampling_body(search_query, after)
@@ -1380,7 +1417,7 @@ class MetricsExporter:
                 body,
             )
             sampled = result.get("aggregations", {}).get("sampled", {})
-            return _extract_docs_and_after_from_sampled(sampled, rate_state)
+            return _extract_docs_and_after_from_sampled(sampled, aggregator)
 
         # 并行路径：每个 worker 独立写文件，避免全局去重 map 长时间占用内存
         if parallel_degree and parallel_degree > 1:
@@ -1401,16 +1438,21 @@ class MetricsExporter:
                     progress_callback(sum(per_worker_exported), 0)
 
             def run_sampling_slice(worker_id: int, worker_query: Dict) -> Tuple[int, List[str]]:
+                # 每个 worker 独立的字段聚合器，避免多 worker 并发时 _rate_state 竞争
+                worker_aggregator = (
+                    FieldAggregator(metric_type, interval_ms)
+                    if field_aggregator is not None
+                    else None
+                )
                 local_count = 0
                 worker_output = f"{output_file}_worker{worker_id}"
-                local_rate_state: Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]] = {}
 
                 with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
-                    current_docs, next_after = _fetch_sampling_page(worker_query, None, local_rate_state)
+                    current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
 
                     with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                         next_future = (
-                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, local_rate_state)
+                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, worker_aggregator)
                             if next_after
                             else None
                         )
@@ -1428,7 +1470,7 @@ class MetricsExporter:
 
                             current_docs, next_after = next_future.result()
                             next_future = (
-                                prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, local_rate_state)
+                                prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, worker_aggregator)
                                 if next_after
                                 else None
                             )
@@ -1452,12 +1494,11 @@ class MetricsExporter:
             return total_exported, sorted(all_file_paths)
 
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            rate_state: Dict[Tuple[Any, ...], Dict[str, Tuple[int, float]]] = {}
-            current_docs, after_key = _fetch_sampling_page(query, None, rate_state)
+            current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
 
             with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                 next_future = (
-                    prefetch_executor.submit(_fetch_sampling_page, query, after_key, rate_state)
+                    prefetch_executor.submit(_fetch_sampling_page, query, after_key, field_aggregator)
                     if after_key
                     else None
                 )
@@ -1476,7 +1517,7 @@ class MetricsExporter:
 
                     current_docs, after_key = next_future.result()
                     next_future = (
-                        prefetch_executor.submit(_fetch_sampling_page, query, after_key, rate_state)
+                        prefetch_executor.submit(_fetch_sampling_page, query, after_key, field_aggregator)
                         if after_key
                         else None
                     )
