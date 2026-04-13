@@ -187,181 +187,443 @@ class FieldAggStrategy:
 METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
     "node_stats": {
         # Rate 型字段：累积计数器，计算 delta / bucket_size
+        # 公式: (current_value - previous_value) / interval_seconds
         "rate_fields": {
-            # 索引相关
-            "payload.elasticsearch.node_stats.indices.indexing.index_total": None,
-            "payload.elasticsearch.node_stats.indices.indexing.index_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.indexing.index_current": None,
-            "payload.elasticsearch.node_stats.indices.indexing.delete_total": None,
-            "payload.elasticsearch.node_stats.indices.indexing.delete_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.indexing.delete_current": None,
-            "payload.elasticsearch.node_stats.indices.indexing.noop_update_total": None,
-            "payload.elasticsearch.node_stats.indices.indexing.is_throttled": None,
-            "payload.elasticsearch.node_stats.indices.indexing.throttle_time_in_millis": None,
+            # 索引操作相关
+            "payload.elasticsearch.node_stats.indices.indexing.index_total": {"unit": "ops/sec", "desc": "索引操作速率(ops/sec)"},
+            "payload.elasticsearch.node_stats.indices.indexing.index_time_in_millis": {"unit": "ms/sec", "desc": "索引耗时速率"},
+            "payload.elasticsearch.node_stats.indices.indexing.delete_total": {"unit": "ops/sec", "desc": "删除操作速率"},
+            "payload.elasticsearch.node_stats.indices.indexing.delete_time_in_millis": {"unit": "ms/sec", "desc": "删除耗时速率"},
+            "payload.elasticsearch.node_stats.indices.indexing.noop_update_total": {"unit": "ops/sec", "desc": "空更新速率"},
+            "payload.elasticsearch.node_stats.indices.indexing.throttle_time_in_millis": {"unit": "ms/sec", "desc": "限流时间速率"},
             # 查询相关
-            "payload.elasticsearch.node_stats.indices.search.query_total": None,
-            "payload.elasticsearch.node_stats.indices.search.query_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.search.query_current": None,
-            "payload.elasticsearch.node_stats.indices.search.fetch_total": None,
-            "payload.elasticsearch.node_stats.indices.search.fetch_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.search.fetch_current": None,
-            "payload.elasticsearch.node_stats.indices.search.scroll_total": None,
-            "payload.elasticsearch.node_stats.indices.search.scroll_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.search.scroll_current": None,
-            "payload.elasticsearch.node_stats.indices.search.suggest_total": None,
-            "payload.elasticsearch.node_stats.indices.search.suggest_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.search.suggest_current": None,
+            "payload.elasticsearch.node_stats.indices.search.query_total": {"unit": "queries/sec", "desc": "查询速率(QPS)"},
+            "payload.elasticsearch.node_stats.indices.search.query_time_in_millis": {"unit": "ms/sec", "desc": "查询耗时速率"},
+            "payload.elasticsearch.node_stats.indices.search.fetch_total": {"unit": "ops/sec", "desc": "Fetch操作速率"},
+            "payload.elasticsearch.node_stats.indices.search.fetch_time_in_millis": {"unit": "ms/sec", "desc": "Fetch耗时速率"},
+            "payload.elasticsearch.node_stats.indices.search.scroll_total": {"unit": "ops/sec", "desc": "滚动查询速率"},
+            "payload.elasticsearch.node_stats.indices.search.scroll_time_in_millis": {"unit": "ms/sec", "desc": "滚动查询耗时速率"},
+            "payload.elasticsearch.node_stats.indices.search.suggest_total": {"unit": "ops/sec", "desc": "Suggest操作速率"},
+            "payload.elasticsearch.node_stats.indices.search.suggest_time_in_millis": {"unit": "ms/sec", "desc": "Suggest耗时速率"},
             # 段合并相关
-            "payload.elasticsearch.node_stats.indices.merges.current": None,
-            "payload.elasticsearch.node_stats.indices.merges.current_docs": None,
-            "payload.elasticsearch.node_stats.indices.merges.current_size_in_bytes": None,
-            "payload.elasticsearch.node_stats.indices.merges.total": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_docs": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_size_in_bytes": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_stopped_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_throttled_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.merges.total_auto_throttle_in_bytes": None,
+            "payload.elasticsearch.node_stats.indices.merges.total": {"unit": "merges/sec", "desc": "合并操作速率"},
+            "payload.elasticsearch.node_stats.indices.merges.total_time_in_millis": {"unit": "ms/sec", "desc": "合并耗时速率"},
+            "payload.elasticsearch.node_stats.indices.merges.total_docs": {"unit": "docs/sec", "desc": "合并文档数速率"},
+            "payload.elasticsearch.node_stats.indices.merges.total_size_in_bytes": {"unit": "bytes/sec", "desc": "合并数据量速率"},
+            "payload.elasticsearch.node_stats.indices.merges.total_stopped_time_in_millis": {"unit": "ms/sec", "desc": "合并停止时间速率"},
+            "payload.elasticsearch.node_stats.indices.merges.total_throttled_time_in_millis": {"unit": "ms/sec", "desc": "合并限流时间速率"},
             # 刷新相关
-            "payload.elasticsearch.node_stats.indices.refresh.total": None,
-            "payload.elasticsearch.node_stats.indices.refresh.total_time_in_millis": None,
-            "payload.elasticsearch.node_stats.indices.refresh.listeners": None,
+            "payload.elasticsearch.node_stats.indices.refresh.total": {"unit": "ops/sec", "desc": "刷新操作速率"},
+            "payload.elasticsearch.node_stats.indices.refresh.total_time_in_millis": {"unit": "ms/sec", "desc": "刷新耗时速率"},
             # Flush 相关
-            "payload.elasticsearch.node_stats.indices.flush.total": None,
-            "payload.elasticsearch.node_stats.indices.flush.total_time_in_millis": None,
-            # 写入相关
-            "payload.elasticsearch.node_stats.indices.translog.operations": None,
-            "payload.elasticsearch.node_stats.indices.translog.size_in_bytes": None,
-            "payload.elasticsearch.node_stats.indices.translog.uncommitted_operations": None,
-            "payload.elasticsearch.node_stats.indices.translog.uncommitted_size_in_bytes": None,
-            "payload.elasticsearch.node_stats.indices.translog.earliest_last_modified_age": None,
-            # 请求缓存
-            "payload.elasticsearch.node_stats.indices.request_cache.hit_count": None,
-            "payload.elasticsearch.node_stats.indices.request_cache.miss_count": None,
-            # 字段数据缓存
-            "payload.elasticsearch.node_stats.indices.fielddata.memory_size_in_bytes": None,
-            "payload.elasticsearch.node_stats.indices.fielddata.evictions": None,
-            # 查询缓存
-            "payload.elasticsearch.node_stats.indices.query_cache.hit_count": None,
-            "payload.elasticsearch.node_stats.indices.query_cache.miss_count": None,
-            "payload.elasticsearch.node_stats.indices.query_cache.cache_count": None,
-            "payload.elasticsearch.node_stats.indices.query_cache.cache_size": None,
-            "payload.elasticsearch.node_stats.indices.query_cache.total_count": None,
-            # Recovery
-            "payload.elasticsearch.node_stats.indices.recovery.current_as_source": None,
-            "payload.elasticsearch.node_stats.indices.recovery.current_as_target": None,
-            "payload.elasticsearch.node_stats.indices.recovery.throttle_time_in_millis": None,
-            # 分片相关
-            "payload.elasticsearch.node_stats.indices.shard_stats.total_count": None,
+            "payload.elasticsearch.node_stats.indices.flush.total": {"unit": "ops/sec", "desc": "Flush操作速率"},
+            "payload.elasticsearch.node_stats.indices.flush.total_time_in_millis": {"unit": "ms/sec", "desc": "Flush耗时速率"},
+            # GET 操作相关
+            "payload.elasticsearch.node_stats.indices.get.total": {"unit": "ops/sec", "desc": "GET操作速率"},
+            "payload.elasticsearch.node_stats.indices.get.time_in_millis": {"unit": "ms/sec", "desc": "GET耗时速率"},
+            "payload.elasticsearch.node_stats.indices.get.exists_total": {"unit": "ops/sec", "desc": "EXISTS操作速率"},
+            "payload.elasticsearch.node_stats.indices.get.exists_time_in_millis": {"unit": "ms/sec", "desc": "EXISTS耗时速率"},
+            "payload.elasticsearch.node_stats.indices.get.missing_total": {"unit": "ops/sec", "desc": "GET失败速率"},
+            "payload.elasticsearch.node_stats.indices.get.missing_time_in_millis": {"unit": "ms/sec", "desc": "GET失败耗时速率"},
+            # 缓存相关
+            "payload.elasticsearch.node_stats.indices.request_cache.hit_count": {"unit": "hits/sec", "desc": "请求缓存命中速率"},
+            "payload.elasticsearch.node_stats.indices.request_cache.miss_count": {"unit": "misses/sec", "desc": "请求缓存失败速率"},
+            "payload.elasticsearch.node_stats.indices.query_cache.hit_count": {"unit": "hits/sec", "desc": "查询缓存命中速率"},
+            "payload.elasticsearch.node_stats.indices.query_cache.miss_count": {"unit": "misses/sec", "desc": "查询缓存失败速率"},
+            "payload.elasticsearch.node_stats.indices.fielddata.evictions": {"unit": "ops/sec", "desc": "字段缓存驱逐速率"},
+            "payload.elasticsearch.node_stats.indices.query_cache.evictions": {"unit": "ops/sec", "desc": "查询缓存驱逐速率"},
+            # Warmer 相关
+            "payload.elasticsearch.node_stats.indices.warmer.total": {"unit": "ops/sec", "desc": "Warmer操作速率"},
+            "payload.elasticsearch.node_stats.indices.warmer.total_time_in_millis": {"unit": "ms/sec", "desc": "Warmer耗时速率"},
+            # 恢复相关
+            "payload.elasticsearch.node_stats.indices.recovery.throttle_time_in_millis": {"unit": "ms/sec", "desc": "恢复限流时间速率"},
+            # 事务日志相关
+            "payload.elasticsearch.node_stats.indices.translog.operations": {"unit": "ops", "desc": "事务日志操作数"},
+            "payload.elasticsearch.node_stats.indices.translog.size_in_bytes": {"unit": "bytes", "desc": "事务日志大小"},
+            "payload.elasticsearch.node_stats.indices.translog.uncommitted_operations": {"unit": "ops", "desc": "未提交操作数"},
+            "payload.elasticsearch.node_stats.indices.translog.uncommitted_size_in_bytes": {"unit": "bytes", "desc": "未提交日志大小"},
+            # 网络相关
+            "payload.elasticsearch.node_stats.transport.rx_count": {"unit": "packets/sec", "desc": "接收包速率"},
+            "payload.elasticsearch.node_stats.transport.rx_size_in_bytes": {"unit": "bytes/sec", "desc": "接收数据量(bytes/sec)"},
+            "payload.elasticsearch.node_stats.transport.tx_count": {"unit": "packets/sec", "desc": "发送包速率"},
+            "payload.elasticsearch.node_stats.transport.tx_size_in_bytes": {"unit": "bytes/sec", "desc": "发送数据量(bytes/sec)"},
             # HTTP 连接
-            "payload.elasticsearch.node_stats.http.total_opened": None,
-            "payload.elasticsearch.node_stats.http.current_open": None,
-            # 网络流量
-            "payload.elasticsearch.node_stats.transport.rx_count": None,
-            "payload.elasticsearch.node_stats.transport.rx_size_in_bytes": None,
-            "payload.elasticsearch.node_stats.transport.tx_count": None,
-            "payload.elasticsearch.node_stats.transport.tx_size_in_bytes": None,
+            "payload.elasticsearch.node_stats.http.total_opened": {"unit": "connections/sec", "desc": "HTTP连接开启速率"},
             # 文件系统 IO
-            "payload.elasticsearch.node_stats.fs.io_stats.total.read_operations": None,
-            "payload.elasticsearch.node_stats.fs.io_stats.total.read_kilobytes": None,
-            "payload.elasticsearch.node_stats.fs.io_stats.total.write_operations": None,
-            "payload.elasticsearch.node_stats.fs.io_stats.total.write_kilobytes": None,
+            "payload.elasticsearch.node_stats.fs.io_stats.total.read_operations": {"unit": "ops/sec", "desc": "磁盘读操作速率"},
+            "payload.elasticsearch.node_stats.fs.io_stats.total.read_kilobytes": {"unit": "KB/sec", "desc": "磁盘读吞吐量"},
+            "payload.elasticsearch.node_stats.fs.io_stats.total.write_operations": {"unit": "ops/sec", "desc": "磁盘写操作速率"},
+            "payload.elasticsearch.node_stats.fs.io_stats.total.write_kilobytes": {"unit": "KB/sec", "desc": "磁盘写吞吐量"},
             # 进程 CPU
-            "payload.elasticsearch.node_stats.process.cpu.total_in_millis": None,
+            "payload.elasticsearch.node_stats.process.cpu.total_in_millis": {"unit": "ms/sec", "desc": "进程CPU累计耗时"},
         },
         # Latency 型字段：计算 delta(time) / delta(count)
         "latency_fields": {
             "payload.elasticsearch.node_stats.indices.search.query_latency": {
                 "time_field": "payload.elasticsearch.node_stats.indices.search.query_time_in_millis",
                 "count_field": "payload.elasticsearch.node_stats.indices.search.query_total",
+                "unit": "ms",
+                "desc": "平均查询延迟(ms)"
             },
             "payload.elasticsearch.node_stats.indices.indexing.index_latency": {
                 "time_field": "payload.elasticsearch.node_stats.indices.indexing.index_time_in_millis",
                 "count_field": "payload.elasticsearch.node_stats.indices.indexing.index_total",
+                "unit": "ms",
+                "desc": "平均索引延迟(ms)"
+            },
+            "payload.elasticsearch.node_stats.indices.search.fetch_latency_ms": {
+                "time_field": "payload.elasticsearch.node_stats.indices.search.fetch_time_in_millis",
+                "count_field": "payload.elasticsearch.node_stats.indices.search.fetch_total",
+                "unit": "ms",
+                "desc": "平均Fetch延迟(ms)"
+            },
+            "payload.elasticsearch.node_stats.indices.indexing.delete_latency_ms": {
+                "time_field": "payload.elasticsearch.node_stats.indices.indexing.delete_time_in_millis",
+                "count_field": "payload.elasticsearch.node_stats.indices.indexing.delete_total",
+                "unit": "ms",
+                "desc": "平均删除延迟(ms)"
+            },
+            "payload.elasticsearch.node_stats.indices.get.latency_ms": {
+                "time_field": "payload.elasticsearch.node_stats.indices.get.time_in_millis",
+                "count_field": "payload.elasticsearch.node_stats.indices.get.total",
+                "unit": "ms",
+                "desc": "平均GET延迟(ms)"
             },
         },
         # Max 型字段：取最大值（瞬时值类）
+        # 用于 JVM 内存、线程池大小等
         "max_fields": {
-            # JVM 内存
-            "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes": None,
-            "payload.elasticsearch.node_stats.jvm.mem.heap_used_percent": None,
-            "payload.elasticsearch.node_stats.jvm.mem.heap_committed_in_bytes": None,
-            "payload.elasticsearch.node_stats.jvm.mem.heap_max_in_bytes": None,
-            "payload.elasticsearch.node_stats.jvm.mem.non_heap_used_in_bytes": None,
-            "payload.elasticsearch.node_stats.jvm.mem.non_heap_committed_in_bytes": None,
-            # GC 相关
-            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_count": None,
-            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_time_in_millis": None,
-            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_count": None,
-            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_time_in_millis": None,
-            # 线程池
-            "payload.elasticsearch.node_stats.thread_pool.bulk.queue": None,
-            "payload.elasticsearch.node_stats.thread_pool.bulk.active": None,
-            "payload.elasticsearch.node_stats.thread_pool.bulk.largest": None,
-            "payload.elasticsearch.node_stats.thread_pool.bulk.completed": None,
-            "payload.elasticsearch.node_stats.thread_pool.write.queue": None,
-            "payload.elasticsearch.node_stats.thread_pool.write.active": None,
-            "payload.elasticsearch.node_stats.thread_pool.write.largest": None,
-            "payload.elasticsearch.node_stats.thread_pool.write.completed": None,
-            "payload.elasticsearch.node_stats.thread_pool.search.queue": None,
-            "payload.elasticsearch.node_stats.thread_pool.search.active": None,
-            "payload.elasticsearch.node_stats.thread_pool.search.largest": None,
-            "payload.elasticsearch.node_stats.thread_pool.search.completed": None,
-            "payload.elasticsearch.node_stats.thread_pool.get.queue": None,
-            "payload.elasticsearch.node_stats.thread_pool.get.active": None,
-            "payload.elasticsearch.node_stats.thread_pool.get.largest": None,
-            "payload.elasticsearch.node_stats.thread_pool.get.completed": None,
+            # JVM 内存（瞬时值，取峰值）
+            "payload.elasticsearch.node_stats.jvm.mem.heap_used_in_bytes": {"unit": "bytes", "desc": "堆内存使用峰值"},
+            "payload.elasticsearch.node_stats.jvm.mem.heap_used_percent": {"unit": "%", "desc": "堆内存使用率峰值"},
+            "payload.elasticsearch.node_stats.jvm.mem.heap_committed_in_bytes": {"unit": "bytes", "desc": "堆内存已提交"},
+            "payload.elasticsearch.node_stats.jvm.mem.heap_max_in_bytes": {"unit": "bytes", "desc": "堆内存最大值"},
+            "payload.elasticsearch.node_stats.jvm.mem.non_heap_used_in_bytes": {"unit": "bytes", "desc": "非堆内存使用"},
+            "payload.elasticsearch.node_stats.jvm.mem.non_heap_committed_in_bytes": {"unit": "bytes", "desc": "非堆内存已提交"},
+            # GC 统计
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_count": {"unit": "count", "desc": "Young GC次数"},
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.young.collection_time_in_millis": {"unit": "ms", "desc": "Young GC总耗时"},
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_count": {"unit": "count", "desc": "Full GC次数"},
+            "payload.elasticsearch.node_stats.jvm.gc.collectors.old.collection_time_in_millis": {"unit": "ms", "desc": "Full GC总耗时"},
+            # 线程池（瞬时值）
+            "payload.elasticsearch.node_stats.thread_pool.bulk.queue": {"unit": "count", "desc": "Bulk线程池排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.bulk.active": {"unit": "count", "desc": "Bulk活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.bulk.largest": {"unit": "count", "desc": "Bulk最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.write.queue": {"unit": "count", "desc": "Write线程池排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.write.active": {"unit": "count", "desc": "Write活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.write.largest": {"unit": "count", "desc": "Write最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.search.queue": {"unit": "count", "desc": "Search线程池排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.search.active": {"unit": "count", "desc": "Search活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.search.largest": {"unit": "count", "desc": "Search最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.get.queue": {"unit": "count", "desc": "Get线程池排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.get.active": {"unit": "count", "desc": "Get活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.get.largest": {"unit": "count", "desc": "Get最大线程数"},
             # 系统负载
-            "payload.elasticsearch.node_stats.os.cpu.percent": None,
-            "payload.elasticsearch.node_stats.os.cpu.load_average.1m": None,
-            "payload.elasticsearch.node_stats.os.cpu.load_average.5m": None,
-            "payload.elasticsearch.node_stats.os.cpu.load_average.15m": None,
+            "payload.elasticsearch.node_stats.os.cpu.percent": {"unit": "%", "desc": "CPU使用率"},
+            "payload.elasticsearch.node_stats.os.cpu.load_average.1m": {"unit": "load", "desc": "1分钟负载"},
+            "payload.elasticsearch.node_stats.os.cpu.load_average.5m": {"unit": "load", "desc": "5分钟负载"},
+            "payload.elasticsearch.node_stats.os.cpu.load_average.15m": {"unit": "load", "desc": "15分钟负载"},
             # 文件系统
-            "payload.elasticsearch.node_stats.fs.total.free_in_bytes": None,
-            "payload.elasticsearch.node_stats.fs.total.available_in_bytes": None,
-            "payload.elasticsearch.node_stats.fs.total.total_in_bytes": None,
+            "payload.elasticsearch.node_stats.fs.total.free_in_bytes": {"unit": "bytes", "desc": "可用磁盘空间"},
+            "payload.elasticsearch.node_stats.fs.total.available_in_bytes": {"unit": "bytes", "desc": "磁盘可用空间"},
+            "payload.elasticsearch.node_stats.fs.total.total_in_bytes": {"unit": "bytes", "desc": "磁盘总大小"},
+            # 缓存大小
+            "payload.elasticsearch.node_stats.indices.query_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "查询缓存内存"},
+            "payload.elasticsearch.node_stats.indices.fielddata.memory_size_in_bytes": {"unit": "bytes", "desc": "字段缓存内存"},
+            "payload.elasticsearch.node_stats.indices.request_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "请求缓存内存"},
+            # 分片和索引
+            "payload.elasticsearch.node_stats.indices.segments.count": {"unit": "count", "desc": "段数量"},
+            "payload.elasticsearch.node_stats.indices.segments.memory_in_bytes": {"unit": "bytes", "desc": "段内存占用"},
+            "payload.elasticsearch.node_stats.indices.store.size_in_bytes": {"unit": "bytes", "desc": "索引存储大小"},
+
+            # cgroup 数值字段（瞬时值）
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.cfs_period_micros": {"unit": "micros", "desc": "cgroup cpu period"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.cfs_quota_micros": {"unit": "micros", "desc": "cgroup cpu quota"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.number_of_elapsed_periods": {"unit": "count", "desc": "cgroup cpu elapsed periods"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.number_of_times_throttled": {"unit": "count", "desc": "cgroup cpu throttled 次数"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.time_throttled_nanos": {"unit": "nanos", "desc": "cgroup cpu throttled 时间"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpuacct.usage_nanos": {"unit": "nanos", "desc": "cgroup cpu 使用时间"},
+            "payload.elasticsearch.node_stats.os.cgroup.memory.limit_in_bytes": {"unit": "bytes", "desc": "cgroup 内存限制"},
+            "payload.elasticsearch.node_stats.os.cgroup.memory.usage_in_bytes": {"unit": "bytes", "desc": "cgroup 内存使用"},
+
+            # 线程池补齐（瞬时值）
+            "payload.elasticsearch.node_stats.thread_pool.ccr.active": {"unit": "count", "desc": "CCR活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ccr.queue": {"unit": "count", "desc": "CCR排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.ccr.largest": {"unit": "count", "desc": "CCR最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ccr.threads": {"unit": "count", "desc": "CCR线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.index.active": {"unit": "count", "desc": "Index活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.index.queue": {"unit": "count", "desc": "Index排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.index.largest": {"unit": "count", "desc": "Index最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.index.threads": {"unit": "count", "desc": "Index线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_autodetect.active": {"unit": "count", "desc": "ML autodetect活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_autodetect.queue": {"unit": "count", "desc": "ML autodetect排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_autodetect.largest": {"unit": "count", "desc": "ML autodetect最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_autodetect.threads": {"unit": "count", "desc": "ML autodetect线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_datafeed.active": {"unit": "count", "desc": "ML datafeed活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_datafeed.queue": {"unit": "count", "desc": "ML datafeed排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_datafeed.largest": {"unit": "count", "desc": "ML datafeed最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_datafeed.threads": {"unit": "count", "desc": "ML datafeed线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_utility.active": {"unit": "count", "desc": "ML utility活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_utility.queue": {"unit": "count", "desc": "ML utility排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_utility.largest": {"unit": "count", "desc": "ML utility最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.ml_utility.threads": {"unit": "count", "desc": "ML utility线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.rollup_indexing.active": {"unit": "count", "desc": "Rollup活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.rollup_indexing.queue": {"unit": "count", "desc": "Rollup排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.rollup_indexing.largest": {"unit": "count", "desc": "Rollup最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.rollup_indexing.threads": {"unit": "count", "desc": "Rollup线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.security-token-key.active": {"unit": "count", "desc": "Security token活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.security-token-key.queue": {"unit": "count", "desc": "Security token排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.security-token-key.largest": {"unit": "count", "desc": "Security token最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.security-token-key.threads": {"unit": "count", "desc": "Security token线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.watcher.active": {"unit": "count", "desc": "Watcher活跃线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.watcher.queue": {"unit": "count", "desc": "Watcher排队数"},
+            "payload.elasticsearch.node_stats.thread_pool.watcher.largest": {"unit": "count", "desc": "Watcher最大线程数"},
+            "payload.elasticsearch.node_stats.thread_pool.watcher.threads": {"unit": "count", "desc": "Watcher线程数"},
+        },
+        # Latest 型字段：保留最新值（字符串/数组结构字段）
+        "latest_fields": {
+            # attributes
+            "payload.elasticsearch.node_stats.attributes.data_type": {"desc": "节点数据分层"},
+            "payload.elasticsearch.node_stats.attributes.ml.enabled": {"desc": "ML开关"},
+            "payload.elasticsearch.node_stats.attributes.ml.machine_memory": {"desc": "ML机器内存"},
+            "payload.elasticsearch.node_stats.attributes.ml.max_open_jobs": {"desc": "ML最大任务数"},
+            "payload.elasticsearch.node_stats.attributes.xpack.installed": {"desc": "xpack 安装状态"},
+
+            # cgroup 字符串字段
+            "payload.elasticsearch.node_stats.os.cgroup.cpu.control_group": {"desc": "cpu cgroup"},
+            "payload.elasticsearch.node_stats.os.cgroup.cpuacct.control_group": {"desc": "cpuacct cgroup"},
+            "payload.elasticsearch.node_stats.os.cgroup.memory.control_group": {"desc": "memory cgroup"},
+
+            # fs io 设备明细（数组）
+            "payload.elasticsearch.node_stats.fs.io_stats.devices": {"desc": "磁盘设备IO明细"},
         },
     },
     "index_stats": {
-        # Rate 型字段
+        # Rate 型字段：累积计数器，计算 delta / bucket_size  
         "rate_fields": {
-            "payload.elasticsearch.index_stats.total.indexing.index_total": None,
-            "payload.elasticsearch.index_stats.total.indexing.index_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.indexing.index_current": None,
-            "payload.elasticsearch.index_stats.total.indexing.delete_total": None,
-            "payload.elasticsearch.index_stats.total.indexing.delete_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.search.query_total": None,
-            "payload.elasticsearch.index_stats.total.search.query_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.search.fetch_total": None,
-            "payload.elasticsearch.index_stats.total.search.fetch_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.search.scroll_total": None,
-            "payload.elasticsearch.index_stats.total.search.scroll_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.refresh.total": None,
-            "payload.elasticsearch.index_stats.total.refresh.total_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.flush.total": None,
-            "payload.elasticsearch.index_stats.total.flush.total_time_in_millis": None,
-            "payload.elasticsearch.index_stats.total.merges.total": None,
-            "payload.elasticsearch.index_stats.total.merges.total_time_in_millis": None,
+            # 索引操作
+            "payload.elasticsearch.index_stats.total.indexing.index_total": {"unit": "ops/sec", "desc": "每秒索引操作数"},
+            "payload.elasticsearch.index_stats.total.indexing.index_time_in_millis": {"unit": "ms/sec", "desc": "索引累计耗时"},
+            "payload.elasticsearch.index_stats.total.indexing.delete_total": {"unit": "ops/sec", "desc": "每秒删除操作数"},
+            "payload.elasticsearch.index_stats.total.indexing.delete_time_in_millis": {"unit": "ms/sec", "desc": "删除累计耗时"},
+            "payload.elasticsearch.index_stats.total.indexing.noop_update_total": {"unit": "ops/sec", "desc": "每秒空更新数"},
+            "payload.elasticsearch.index_stats.total.indexing.throttle_time_in_millis": {"unit": "ms/sec", "desc": "索引限流时间"},
+            # 查询操作
+            "payload.elasticsearch.index_stats.total.search.query_total": {"unit": "queries/sec", "desc": "每秒查询数(QPS)"},
+            "payload.elasticsearch.index_stats.total.search.query_time_in_millis": {"unit": "ms/sec", "desc": "查询累计耗时"},
+            "payload.elasticsearch.index_stats.total.search.fetch_total": {"unit": "ops/sec", "desc": "每秒Fetch操作数"},
+            "payload.elasticsearch.index_stats.total.search.fetch_time_in_millis": {"unit": "ms/sec", "desc": "Fetch累计耗时"},
+            "payload.elasticsearch.index_stats.total.search.scroll_total": {"unit": "ops/sec", "desc": "每秒Scroll操作数"},
+            "payload.elasticsearch.index_stats.total.search.scroll_time_in_millis": {"unit": "ms/sec", "desc": "Scroll累计耗时"},
+            # GET操作
+            "payload.elasticsearch.index_stats.total.get.total": {"unit": "ops/sec", "desc": "每秒GET操作数"},
+            "payload.elasticsearch.index_stats.total.get.time_in_millis": {"unit": "ms/sec", "desc": "GET累计耗时"},
+            "payload.elasticsearch.index_stats.total.get.exists_total": {"unit": "ops/sec", "desc": "每秒EXISTS操作数"},
+            "payload.elasticsearch.index_stats.total.get.exists_time_in_millis": {"unit": "ms/sec", "desc": "EXISTS累计耗时"},
+            "payload.elasticsearch.index_stats.total.get.missing_total": {"unit": "ops/sec", "desc": "每秒missing操作数"},
+            "payload.elasticsearch.index_stats.total.get.missing_time_in_millis": {"unit": "ms/sec", "desc": "missing累计耗时"},
+            # Refresh
+            "payload.elasticsearch.index_stats.total.refresh.total": {"unit": "ops/sec", "desc": "每秒Refresh操作数"},
+            "payload.elasticsearch.index_stats.total.refresh.total_time_in_millis": {"unit": "ms/sec", "desc": "Refresh累计耗时"},
+            # Flush  
+            "payload.elasticsearch.index_stats.total.flush.total": {"unit": "ops/sec", "desc": "每秒Flush操作数"},
+            "payload.elasticsearch.index_stats.total.flush.total_time_in_millis": {"unit": "ms/sec", "desc": "Flush累计耗时"},
+            # Merge
+            "payload.elasticsearch.index_stats.total.merges.total": {"unit": "ops/sec", "desc": "每秒Merge操作数"},
+            "payload.elasticsearch.index_stats.total.merges.total_time_in_millis": {"unit": "ms/sec", "desc": "Merge累计耗时"},
+            "payload.elasticsearch.index_stats.total.merges.total_docs": {"unit": "docs/sec", "desc": "每秒Merge文档数"},
+            "payload.elasticsearch.index_stats.total.merges.total_size_in_bytes": {"unit": "bytes/sec", "desc": "Merge数据量速率"},
         },
-        # Latency 型字段
+        # Latency 型字段：计算 delta(time) / delta(count)
         "latency_fields": {
             "payload.elasticsearch.index_stats.total.search.query_latency": {
                 "time_field": "payload.elasticsearch.index_stats.total.search.query_time_in_millis",
                 "count_field": "payload.elasticsearch.index_stats.total.search.query_total",
+                "unit": "ms",
+                "desc": "平均查询延迟(ms)"
             },
             "payload.elasticsearch.index_stats.total.indexing.index_latency": {
                 "time_field": "payload.elasticsearch.index_stats.total.indexing.index_time_in_millis",
                 "count_field": "payload.elasticsearch.index_stats.total.indexing.index_total",
+                "unit": "ms",
+                "desc": "平均索引延迟(ms)"
+            },
+            "payload.elasticsearch.index_stats.total.search.fetch_latency_ms": {
+                "time_field": "payload.elasticsearch.index_stats.total.search.fetch_time_in_millis",
+                "count_field": "payload.elasticsearch.index_stats.total.search.fetch_total",
+                "unit": "ms",
+                "desc": "平均Fetch延迟(ms)"
+            },
+            "payload.elasticsearch.index_stats.total.get.latency_ms": {
+                "time_field": "payload.elasticsearch.index_stats.total.get.time_in_millis",
+                "count_field": "payload.elasticsearch.index_stats.total.get.total",
+                "unit": "ms",
+                "desc": "平均GET延迟(ms)"
             },
         },
         # Max 型字段（瞬时值）
         "max_fields": {
-            "payload.elasticsearch.index_stats.total.docs.count": None,
-            "payload.elasticsearch.index_stats.total.docs.deleted": None,
-            "payload.elasticsearch.index_stats.total.store.size_in_bytes": None,
-            "payload.elasticsearch.index_stats.primaries.docs.count": None,
-            "payload.elasticsearch.index_stats.primaries.docs.deleted": None,
-            "payload.elasticsearch.index_stats.primaries.store.size_in_bytes": None,
+            # 文档统计
+            "payload.elasticsearch.index_stats.total.docs.count": {"unit": "docs", "desc": "文档总数"},
+            "payload.elasticsearch.index_stats.total.docs.deleted": {"unit": "docs", "desc": "删除文档数"},
+            # 存储大小
+            "payload.elasticsearch.index_stats.total.store.size_in_bytes": {"unit": "bytes", "desc": "总存储大小(含副本)"},
+            "payload.elasticsearch.index_stats.primaries.store.size_in_bytes": {"unit": "bytes", "desc": "主分片存储大小"},
+            # 主分片文档
+            "payload.elasticsearch.index_stats.primaries.docs.count": {"unit": "docs", "desc": "主分片文档数"},
+            "payload.elasticsearch.index_stats.primaries.docs.deleted": {"unit": "docs", "desc": "主分片删除数"},
+            # 段和缓存
+            "payload.elasticsearch.index_stats.total.segments.count": {"unit": "count", "desc": "段数量"},
+            "payload.elasticsearch.index_stats.total.segments.memory_in_bytes": {"unit": "bytes", "desc": "段内存占用"},
+            "payload.elasticsearch.index_stats.primaries.segments.count": {"unit": "count", "desc": "主分片段数"},
+            "payload.elasticsearch.index_stats.total.query_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "查询缓存内存"},
+            "payload.elasticsearch.index_stats.total.fielddata.memory_size_in_bytes": {"unit": "bytes", "desc": "字段缓存内存"},
+            "payload.elasticsearch.index_stats.total.request_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "请求缓存内存"},
+        },
+        # 结构字段（显式列出）
+        "latest_fields": {
+            "payload.elasticsearch.index_stats.index_info": {"desc": "索引静态信息"},
+            "payload.elasticsearch.index_stats.shard_info": {"desc": "分片明细"},
+            "payload.elasticsearch.index_stats.primaries": {"desc": "主分片统计快照"},
+            "payload.elasticsearch.index_stats.total": {"desc": "全分片统计快照"},
+        },
+    },
+    "cluster_health": {
+        # cluster_health 以瞬时值为主，数值取 max，字符串走 latest
+        "rate_fields": {},
+        "latency_fields": {},
+        "max_fields": {
+            "payload.elasticsearch.cluster_health.number_of_nodes": {"unit": "count", "desc": "节点数"},
+            "payload.elasticsearch.cluster_health.number_of_data_nodes": {"unit": "count", "desc": "数据节点数"},
+            "payload.elasticsearch.cluster_health.active_primary_shards": {"unit": "count", "desc": "主分片数"},
+            "payload.elasticsearch.cluster_health.active_shards": {"unit": "count", "desc": "活跃分片数"},
+            "payload.elasticsearch.cluster_health.relocating_shards": {"unit": "count", "desc": "迁移分片数"},
+            "payload.elasticsearch.cluster_health.initializing_shards": {"unit": "count", "desc": "初始化分片数"},
+            "payload.elasticsearch.cluster_health.unassigned_shards": {"unit": "count", "desc": "未分配分片数"},
+            "payload.elasticsearch.cluster_health.delayed_unassigned_shards": {"unit": "count", "desc": "延迟未分配分片数"},
+            "payload.elasticsearch.cluster_health.number_of_pending_tasks": {"unit": "count", "desc": "待处理任务数"},
+            "payload.elasticsearch.cluster_health.number_of_in_flight_fetch": {"unit": "count", "desc": "in-flight fetch数"},
+            "payload.elasticsearch.cluster_health.task_max_waiting_in_queue_millis": {"unit": "ms", "desc": "任务队列最长等待"},
+            "payload.elasticsearch.cluster_health.active_shards_percent_as_number": {"unit": "%", "desc": "活跃分片占比"},
+        },
+        "latest_fields": {
+            "payload.elasticsearch.cluster_health.cluster_name": {"desc": "集群名称"},
+            "payload.elasticsearch.cluster_health.status": {"desc": "集群状态"},
+            "payload.elasticsearch.cluster_health.timed_out": {"desc": "是否超时"},
+            "payload.elasticsearch.cluster_health.indices": {"desc": "索引健康结构"},
+        },
+    },
+    "cluster_stats": {
+        # cluster_stats 主体是计数器快照，取 max 保留峰值
+        "rate_fields": {},
+        "latency_fields": {},
+        "max_fields": {
+            # indices
+            "payload.elasticsearch.cluster_stats.indices.count": {"unit": "count", "desc": "索引数"},
+            "payload.elasticsearch.cluster_stats.indices.docs.count": {"unit": "docs", "desc": "文档数"},
+            "payload.elasticsearch.cluster_stats.indices.docs.deleted": {"unit": "docs", "desc": "删除文档数"},
+            "payload.elasticsearch.cluster_stats.indices.store.size_in_bytes": {"unit": "bytes", "desc": "存储大小"},
+            "payload.elasticsearch.cluster_stats.indices.fielddata.memory_size_in_bytes": {"unit": "bytes", "desc": "fielddata内存"},
+            "payload.elasticsearch.cluster_stats.indices.fielddata.evictions": {"unit": "count", "desc": "fielddata驱逐"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "query cache内存"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.total_count": {"unit": "count", "desc": "query cache总请求"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.hit_count": {"unit": "count", "desc": "query cache命中"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.miss_count": {"unit": "count", "desc": "query cache未命中"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.cache_count": {"unit": "count", "desc": "query cache写入"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.cache_size": {"unit": "count", "desc": "query cache当前条目"},
+            "payload.elasticsearch.cluster_stats.indices.query_cache.evictions": {"unit": "count", "desc": "query cache驱逐"},
+            "payload.elasticsearch.cluster_stats.indices.completion.size_in_bytes": {"unit": "bytes", "desc": "completion内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.count": {"unit": "count", "desc": "segments数量"},
+            "payload.elasticsearch.cluster_stats.indices.segments.memory_in_bytes": {"unit": "bytes", "desc": "segments内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.terms_memory_in_bytes": {"unit": "bytes", "desc": "terms内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.stored_fields_memory_in_bytes": {"unit": "bytes", "desc": "stored_fields内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.term_vectors_memory_in_bytes": {"unit": "bytes", "desc": "term_vectors内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.norms_memory_in_bytes": {"unit": "bytes", "desc": "norms内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.points_memory_in_bytes": {"unit": "bytes", "desc": "points内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.doc_values_memory_in_bytes": {"unit": "bytes", "desc": "doc_values内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.index_writer_memory_in_bytes": {"unit": "bytes", "desc": "index_writer内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.version_map_memory_in_bytes": {"unit": "bytes", "desc": "version_map内存"},
+            "payload.elasticsearch.cluster_stats.indices.segments.fixed_bit_set_memory_in_bytes": {"unit": "bytes", "desc": "fixed_bit_set内存"},
+
+            # shards
+            "payload.elasticsearch.cluster_stats.indices.shards.total": {"unit": "count", "desc": "总分片数"},
+            "payload.elasticsearch.cluster_stats.indices.shards.primaries": {"unit": "count", "desc": "主分片数"},
+            "payload.elasticsearch.cluster_stats.indices.shards.replication": {"unit": "ratio", "desc": "副本系数"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.shards.min": {"unit": "count", "desc": "单索引最小分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.shards.max": {"unit": "count", "desc": "单索引最大分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.shards.avg": {"unit": "count", "desc": "单索引平均分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.primaries.min": {"unit": "count", "desc": "单索引最小主分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.primaries.max": {"unit": "count", "desc": "单索引最大主分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.primaries.avg": {"unit": "count", "desc": "单索引平均主分片"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.replication.min": {"unit": "ratio", "desc": "单索引最小副本系数"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.replication.max": {"unit": "ratio", "desc": "单索引最大副本系数"},
+            "payload.elasticsearch.cluster_stats.indices.shards.index.replication.avg": {"unit": "ratio", "desc": "单索引平均副本系数"},
+
+            # nodes
+            "payload.elasticsearch.cluster_stats.nodes.count.total": {"unit": "count", "desc": "节点总数"},
+            "payload.elasticsearch.cluster_stats.nodes.count.data": {"unit": "count", "desc": "data节点数"},
+            "payload.elasticsearch.cluster_stats.nodes.count.master": {"unit": "count", "desc": "master节点数"},
+            "payload.elasticsearch.cluster_stats.nodes.count.ingest": {"unit": "count", "desc": "ingest节点数"},
+            "payload.elasticsearch.cluster_stats.nodes.count.coordinating_only": {"unit": "count", "desc": "coordinating-only节点数"},
+            "payload.elasticsearch.cluster_stats.nodes.os.available_processors": {"unit": "count", "desc": "可用CPU核数"},
+            "payload.elasticsearch.cluster_stats.nodes.os.allocated_processors": {"unit": "count", "desc": "分配CPU核数"},
+            "payload.elasticsearch.cluster_stats.nodes.os.mem.total_in_bytes": {"unit": "bytes", "desc": "总内存"},
+            "payload.elasticsearch.cluster_stats.nodes.os.mem.free_in_bytes": {"unit": "bytes", "desc": "空闲内存"},
+            "payload.elasticsearch.cluster_stats.nodes.os.mem.used_in_bytes": {"unit": "bytes", "desc": "已用内存"},
+            "payload.elasticsearch.cluster_stats.nodes.os.mem.free_percent": {"unit": "%", "desc": "空闲内存占比"},
+            "payload.elasticsearch.cluster_stats.nodes.os.mem.used_percent": {"unit": "%", "desc": "已用内存占比"},
+            "payload.elasticsearch.cluster_stats.nodes.process.cpu.percent": {"unit": "%", "desc": "进程CPU使用率"},
+            "payload.elasticsearch.cluster_stats.nodes.process.open_file_descriptors.min": {"unit": "count", "desc": "最小打开文件数"},
+            "payload.elasticsearch.cluster_stats.nodes.process.open_file_descriptors.max": {"unit": "count", "desc": "最大打开文件数"},
+            "payload.elasticsearch.cluster_stats.nodes.process.open_file_descriptors.avg": {"unit": "count", "desc": "平均打开文件数"},
+            "payload.elasticsearch.cluster_stats.nodes.jvm.max_uptime_in_millis": {"unit": "ms", "desc": "最长JVM运行时长"},
+            "payload.elasticsearch.cluster_stats.nodes.jvm.mem.heap_max_in_bytes": {"unit": "bytes", "desc": "JVM堆上限"},
+            "payload.elasticsearch.cluster_stats.nodes.jvm.mem.heap_used_in_bytes": {"unit": "bytes", "desc": "JVM堆使用"},
+            "payload.elasticsearch.cluster_stats.nodes.jvm.threads": {"unit": "count", "desc": "JVM线程数"},
+            "payload.elasticsearch.cluster_stats.nodes.fs.total_in_bytes": {"unit": "bytes", "desc": "磁盘总空间"},
+            "payload.elasticsearch.cluster_stats.nodes.fs.free_in_bytes": {"unit": "bytes", "desc": "磁盘空闲空间"},
+            "payload.elasticsearch.cluster_stats.nodes.fs.available_in_bytes": {"unit": "bytes", "desc": "磁盘可用空间"},
+        },
+        "latest_fields": {
+            "payload.elasticsearch.cluster_stats.cluster_name": {"desc": "集群名称"},
+            "payload.elasticsearch.cluster_stats.status": {"desc": "集群状态"},
+            "payload.elasticsearch.cluster_stats.cluster_uuid": {"desc": "集群UUID"},
+            "payload.elasticsearch.cluster_stats.timestamp": {"desc": "采样时间"},
+            "payload.elasticsearch.cluster_stats.nodes.versions": {"desc": "ES版本分布"},
+            "payload.elasticsearch.cluster_stats.nodes.plugins": {"desc": "插件列表"},
+            "payload.elasticsearch.cluster_stats.nodes.os.names": {"desc": "OS名称分布"},
+            "payload.elasticsearch.cluster_stats.nodes.os.pretty_names": {"desc": "OS描述分布"},
+            "payload.elasticsearch.cluster_stats.nodes.jvm.versions": {"desc": "JVM版本分布"},
+            "payload.elasticsearch.cluster_stats.nodes.network_types": {"desc": "网络类型分布"},
+        },
+    },
+    "shard_stats": {
+        # Shard 级别的统计 - 数据量最大需要采样
+        "rate_fields": {
+            "payload.elasticsearch.shard_stats.stats.indexing.index_total": {"unit": "ops/sec", "desc": "每秒索引数"},
+            "payload.elasticsearch.shard_stats.stats.indexing.index_time_in_millis": {"unit": "ms/sec", "desc": "索引耗时"},
+            "payload.elasticsearch.shard_stats.stats.indexing.delete_total": {"unit": "ops/sec", "desc": "每秒删除数"},
+            "payload.elasticsearch.shard_stats.stats.search.query_total": {"unit": "queries/sec", "desc": "每秒查询数"},
+            "payload.elasticsearch.shard_stats.stats.search.query_time_in_millis": {"unit": "ms/sec", "desc": "查询耗时"},
+            "payload.elasticsearch.shard_stats.stats.search.fetch_total": {"unit": "ops/sec", "desc": "每秒Fetch数"},
+        },
+        "latency_fields": {
+            "payload.elasticsearch.shard_stats.stats.search.query_latency": {
+                "time_field": "payload.elasticsearch.shard_stats.stats.search.query_time_in_millis",
+                "count_field": "payload.elasticsearch.shard_stats.stats.search.query_total",
+                "unit": "ms",
+                "desc": "平均查询延迟(ms)"
+            },
+            "payload.elasticsearch.shard_stats.stats.indexing.index_latency": {
+                "time_field": "payload.elasticsearch.shard_stats.stats.indexing.index_time_in_millis",
+                "count_field": "payload.elasticsearch.shard_stats.stats.indexing.index_total",
+                "unit": "ms",
+                "desc": "平均索引延迟(ms)"
+            },
+        },
+        "max_fields": {
+            "payload.elasticsearch.shard_stats.stats.docs.count": {"unit": "docs", "desc": "分片文档数"},
+            "payload.elasticsearch.shard_stats.stats.store.size_in_bytes": {"unit": "bytes", "desc": "分片存储大小"},
         },
     },
 }
