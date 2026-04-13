@@ -611,7 +611,7 @@ class TestStratifiedSampling(unittest.TestCase):
         mock_client = MagicMock()
         exporter = MetricsExporter(mock_client, "system-id")
 
-        target_field = "payload.elasticsearch.node_stats.os.cgroup.memory.limit_in_bytes"
+        target_field = "payload.elasticsearch.node_stats.os.cpu.percent"
         search_bodies = []
 
         def proxy_request(cluster_id, method, path, body=None):
@@ -649,10 +649,8 @@ class TestStratifiedSampling(unittest.TestCase):
                                                         "elasticsearch": {
                                                             "node_stats": {
                                                                 "os": {
-                                                                    "cgroup": {
-                                                                        "memory": {
-                                                                            "limit_in_bytes": "max"
-                                                                        }
+                                                                    "cpu": {
+                                                                        "percent": 12
                                                                     }
                                                                 }
                                                             }

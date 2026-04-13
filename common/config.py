@@ -336,16 +336,6 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.node_stats.indices.segments.memory_in_bytes": {"unit": "bytes", "desc": "段内存占用"},
             "payload.elasticsearch.node_stats.indices.store.size_in_bytes": {"unit": "bytes", "desc": "索引存储大小"},
 
-            # cgroup 数值字段（瞬时值）
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.cfs_period_micros": {"unit": "micros", "desc": "cgroup cpu period"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.cfs_quota_micros": {"unit": "micros", "desc": "cgroup cpu quota"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.number_of_elapsed_periods": {"unit": "count", "desc": "cgroup cpu elapsed periods"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.number_of_times_throttled": {"unit": "count", "desc": "cgroup cpu throttled 次数"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.stat.time_throttled_nanos": {"unit": "nanos", "desc": "cgroup cpu throttled 时间"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpuacct.usage_nanos": {"unit": "nanos", "desc": "cgroup cpu 使用时间"},
-            "payload.elasticsearch.node_stats.os.cgroup.memory.limit_in_bytes": {"unit": "bytes", "desc": "cgroup 内存限制"},
-            "payload.elasticsearch.node_stats.os.cgroup.memory.usage_in_bytes": {"unit": "bytes", "desc": "cgroup 内存使用"},
-
             # 线程池补齐（瞬时值）
             "payload.elasticsearch.node_stats.thread_pool.ccr.active": {"unit": "count", "desc": "CCR活跃线程数"},
             "payload.elasticsearch.node_stats.thread_pool.ccr.queue": {"unit": "count", "desc": "CCR排队数"},
