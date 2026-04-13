@@ -606,6 +606,104 @@ class TestScrollPagination(unittest.TestCase):
 class TestStratifiedSampling(unittest.TestCase):
     """测试 ES 端分层抽样导出"""
 
+    def test_sampling_retries_when_max_field_is_not_aggregatable(self):
+        """sampling 遇到 keyword max 聚合错误时应自动剔除该字段并重试"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        target_field = "payload.elasticsearch.node_stats.os.cgroup.memory.limit_in_bytes"
+        search_bodies = []
+
+        def proxy_request(cluster_id, method, path, body=None):
+            self.assertEqual(cluster_id, "system-id")
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/.infini_metrics/_search")
+
+            search_bodies.append(body)
+
+            if len(search_bodies) == 1:
+                self.assertIn(target_field, body["aggs"]["sampled"]["aggs"])
+                raise metrics_exporter.ConsoleAPIError(
+                    f"HTTP 400: Field [{target_field}] of type [keyword] is not supported for aggregation [max]"
+                )
+
+            self.assertNotIn(target_field, body["aggs"]["sampled"]["aggs"])
+            return {
+                "aggregations": {
+                    "sampled": {
+                        "buckets": [
+                            {
+                                "key": {
+                                    "group_0": "c1",
+                                    "group_1": "n1",
+                                    "time_bucket": 1712016000000,
+                                },
+                                "latest": {
+                                    "hits": {
+                                        "hits": [
+                                            {
+                                                "_id": "node-doc-1",
+                                                "_source": {
+                                                    "timestamp": "2026-04-02T00:00:00Z",
+                                                    "payload": {
+                                                        "elasticsearch": {
+                                                            "node_stats": {
+                                                                "os": {
+                                                                    "cgroup": {
+                                                                        "memory": {
+                                                                            "limit_in_bytes": "max"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                },
+                                                "sort": [1712016000000],
+                                            }
+                                        ]
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+
+        mock_client.proxy_request.side_effect = proxy_request
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            count, file_paths = exporter.export_with_es_sampling(
+                index_pattern=".infini_metrics",
+                query={
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {"query_string": {"query": 'metadata.name:"node_stats"'}},
+                                {
+                                    "range": {
+                                        "timestamp": {
+                                            "gte": "2026-04-02T00:00:00+00:00",
+                                            "lte": "2026-04-02T00:15:00+00:00",
+                                        }
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                },
+                output_file=os.path.join(temp_dir, "node_stats_retry"),
+                sampling=SamplingConfig(mode="sampling", interval="15m"),
+                batch_size=3000,
+                group_fields=["metadata.labels.cluster_id", "metadata.labels.node_id"],
+                metric_type="node_stats",
+                effective_group_fields=["metadata.labels.cluster_id", "metadata.labels.node_id"],
+            )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(file_paths, ["node_stats_retry.jsonl"])
+            self.assertEqual(len(search_bodies), 2)
+
     def test_sampling_parallel_splits_on_interval_boundaries(self):
         """并行 sampling 的 worker 时间范围应对齐到 fixed_interval 桶边界"""
         mock_client = MagicMock()

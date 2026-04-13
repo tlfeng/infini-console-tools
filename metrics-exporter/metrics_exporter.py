@@ -138,6 +138,7 @@ class FieldAggregator:
         self.rate_fields = set(self.config.get("rate_fields", {}).keys())
         self.latency_fields = self.config.get("latency_fields", {})
         self.max_fields = set(self.config.get("max_fields", {}).keys())
+        self.disabled_max_fields = set()
         # rate_state: 按 (group_key, field_path) 维护上一桶的值，用于跨页/跨 worker 导数计算
         self._rate_state: Dict[Tuple[str, str], float] = {}
 
@@ -272,9 +273,26 @@ class FieldAggregator:
         ES 聚合名可以是任意字符串，含点号亦合法。
         """
         aggs = {}
-        for field_path in self.max_fields:
+        for field_path in self.max_fields - self.disabled_max_fields:
             aggs[field_path] = {"max": {"field": field_path}}
         return aggs
+
+    def disable_problematic_max_field(self, error_message: str) -> Optional[str]:
+        """根据错误消息禁用不可聚合的 max 字段，返回被禁用的字段名。"""
+        if not error_message:
+            return None
+
+        for field_path in sorted(self.max_fields - self.disabled_max_fields, key=len, reverse=True):
+            metric_suffix = field_path
+            marker = f"payload.elasticsearch.{self.metric_type}."
+            if marker in field_path:
+                metric_suffix = field_path.split(marker, 1)[1]
+
+            if field_path in error_message or metric_suffix in error_message:
+                self.disabled_max_fields.add(field_path)
+                return field_path
+
+        return None
 
 
 class JSONLinesWriter:
@@ -1409,15 +1427,29 @@ class MetricsExporter:
             aggregator: Optional["FieldAggregator"] = None,
         ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             """请求单页 sampling/composite 数据并转换为文档。"""
-            body = build_sampling_body(search_query, after)
-            result = self.client.proxy_request(
-                self.system_cluster_id,
-                "POST",
-                f"/{index_pattern}/_search",
-                body,
-            )
-            sampled = result.get("aggregations", {}).get("sampled", {})
-            return _extract_docs_and_after_from_sampled(sampled, aggregator)
+            while True:
+                body = build_sampling_body(search_query, after)
+                try:
+                    result = self.client.proxy_request(
+                        self.system_cluster_id,
+                        "POST",
+                        f"/{index_pattern}/_search",
+                        body,
+                    )
+                    sampled = result.get("aggregations", {}).get("sampled", {})
+                    return _extract_docs_and_after_from_sampled(sampled, aggregator)
+                except ConsoleAPIError as exc:
+                    if not aggregator:
+                        raise
+
+                    disabled_field = aggregator.disable_problematic_max_field(str(exc))
+                    if not disabled_field:
+                        raise
+
+                    print(
+                        f"    sampling max 聚合字段不可用，已自动降级为当前时间桶内最近快照值: {disabled_field}",
+                        file=sys.stderr,
+                    )
 
         # 并行路径：每个 worker 独立写文件，避免全局去重 map 长时间占用内存
         if parallel_degree and parallel_degree > 1:
