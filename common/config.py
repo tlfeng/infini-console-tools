@@ -380,23 +380,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.node_stats.thread_pool.watcher.largest": {"unit": "count", "desc": "Watcher最大线程数"},
             "payload.elasticsearch.node_stats.thread_pool.watcher.threads": {"unit": "count", "desc": "Watcher线程数"},
         },
-        # Latest 型字段：保留最新值（字符串/数组结构字段）
-        "latest_fields": {
-            # attributes
-            "payload.elasticsearch.node_stats.attributes.data_type": {"desc": "节点数据分层"},
-            "payload.elasticsearch.node_stats.attributes.ml.enabled": {"desc": "ML开关"},
-            "payload.elasticsearch.node_stats.attributes.ml.machine_memory": {"desc": "ML机器内存"},
-            "payload.elasticsearch.node_stats.attributes.ml.max_open_jobs": {"desc": "ML最大任务数"},
-            "payload.elasticsearch.node_stats.attributes.xpack.installed": {"desc": "xpack 安装状态"},
-
-            # cgroup 字符串字段
-            "payload.elasticsearch.node_stats.os.cgroup.cpu.control_group": {"desc": "cpu cgroup"},
-            "payload.elasticsearch.node_stats.os.cgroup.cpuacct.control_group": {"desc": "cpuacct cgroup"},
-            "payload.elasticsearch.node_stats.os.cgroup.memory.control_group": {"desc": "memory cgroup"},
-
-            # fs io 设备明细（数组）
-            "payload.elasticsearch.node_stats.fs.io_stats.devices": {"desc": "磁盘设备IO明细"},
-        },
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
     },
     "index_stats": {
         # Rate 型字段：累积计数器，计算 delta / bucket_size  
@@ -480,13 +464,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.index_stats.total.fielddata.memory_size_in_bytes": {"unit": "bytes", "desc": "字段缓存内存"},
             "payload.elasticsearch.index_stats.total.request_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "请求缓存内存"},
         },
-        # 结构字段（显式列出）
-        "latest_fields": {
-            "payload.elasticsearch.index_stats.index_info": {"desc": "索引静态信息"},
-            "payload.elasticsearch.index_stats.shard_info": {"desc": "分片明细"},
-            "payload.elasticsearch.index_stats.primaries": {"desc": "主分片统计快照"},
-            "payload.elasticsearch.index_stats.total": {"desc": "全分片统计快照"},
-        },
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
     },
     "cluster_health": {
         # cluster_health 以瞬时值为主，数值取 max，字符串走 latest
@@ -506,12 +484,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.cluster_health.task_max_waiting_in_queue_millis": {"unit": "ms", "desc": "任务队列最长等待"},
             "payload.elasticsearch.cluster_health.active_shards_percent_as_number": {"unit": "%", "desc": "活跃分片占比"},
         },
-        "latest_fields": {
-            "payload.elasticsearch.cluster_health.cluster_name": {"desc": "集群名称"},
-            "payload.elasticsearch.cluster_health.status": {"desc": "集群状态"},
-            "payload.elasticsearch.cluster_health.timed_out": {"desc": "是否超时"},
-            "payload.elasticsearch.cluster_health.indices": {"desc": "索引健康结构"},
-        },
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
     },
     "cluster_stats": {
         # cluster_stats 主体是计数器快照，取 max 保留峰值
@@ -584,18 +557,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.cluster_stats.nodes.fs.free_in_bytes": {"unit": "bytes", "desc": "磁盘空闲空间"},
             "payload.elasticsearch.cluster_stats.nodes.fs.available_in_bytes": {"unit": "bytes", "desc": "磁盘可用空间"},
         },
-        "latest_fields": {
-            "payload.elasticsearch.cluster_stats.cluster_name": {"desc": "集群名称"},
-            "payload.elasticsearch.cluster_stats.status": {"desc": "集群状态"},
-            "payload.elasticsearch.cluster_stats.cluster_uuid": {"desc": "集群UUID"},
-            "payload.elasticsearch.cluster_stats.timestamp": {"desc": "采样时间"},
-            "payload.elasticsearch.cluster_stats.nodes.versions": {"desc": "ES版本分布"},
-            "payload.elasticsearch.cluster_stats.nodes.plugins": {"desc": "插件列表"},
-            "payload.elasticsearch.cluster_stats.nodes.os.names": {"desc": "OS名称分布"},
-            "payload.elasticsearch.cluster_stats.nodes.os.pretty_names": {"desc": "OS描述分布"},
-            "payload.elasticsearch.cluster_stats.nodes.jvm.versions": {"desc": "JVM版本分布"},
-            "payload.elasticsearch.cluster_stats.nodes.network_types": {"desc": "网络类型分布"},
-        },
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
     },
     "shard_stats": {
         # Shard 级别的统计 - 数据量最大需要采样
