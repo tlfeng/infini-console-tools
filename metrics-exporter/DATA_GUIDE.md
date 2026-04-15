@@ -71,11 +71,11 @@ python metrics_exporter.py --config config.json --job "全量导出-一周"
 
 | 指标类型 | 默认批次 | 说明 |
 |---------|---------|------|
-| cluster_health | 5000 | 数据量小，大批次 |
-| cluster_stats | 5000 | 数据量小，大批次 |
-| node_stats | 3000 | 数据量大，中批次 |
-| index_stats | 3000 | 数据量大，中批次 |
-| shard_stats | 2000 | 数据量最大，小批次 |
+| cluster_health | 8000 | 数据量小，大批次 |
+| cluster_stats | 8000 | 数据量小，大批次 |
+| node_stats | 5000 | 数据量大，中批次 |
+| index_stats | 5000 | 数据量大，中批次 |
+| shard_stats | 3000 | 数据量最大，小批次 |
 
 可通过 `--batch-size` 或配置文件覆盖。
 
@@ -150,8 +150,13 @@ python metrics_exporter.py --fields timestamp,metadata.labels.cluster_id,payload
 
 **抽样实现原理：**
 
-- **`interval` 抽样**：通过 ES 的 `composite` 聚合按时间字段分桶，并在桶内用 `avg` 聚合计算采样点数值；导出时保留最新文档作为上下文并用平均值覆盖采样字段
-- 当配置 `parallelDegree > 1` 时，抽样导出会并行执行切片查询，并在客户端按 `(group_fields + time_bucket)` 去重合并，避免重复导出
+- **`interval` 抽样**：通过 ES 的 `composite` 聚合按时间字段分桶，每个时间桶内使用 `top_hits` 获取最新文档作为快照；同时对已配置的数值型字段应用聚合策略（rate/latency/max）计算采样值
+- 字段聚合策略：
+  - **rate 字段**：计算 delta(value) / bucket_size，适用于累积计数器（如 `query_total`、`index_total`）
+  - **latency 字段**：计算 delta(time) / delta(count)，适用于延迟指标（如查询延迟、索引延迟）
+  - **max 字段**：取时间桶内最大值，适用于瞬时值（如 JVM 堆内存、线程池队列）
+  - **latest 字段**：保留快照原始值，适用于字符串、数组等非数值字段
+- 当配置 `parallelDegree > 1` 时，抽样导出会按时间桶边界拆分为多个并行查询，每个 worker 独立写文件，避免重复导出
 
 抽样模式：
 - `interval`: 按时间间隔抽样（如 "1h", "5m", "30s"），每个时间桶输出一个采样点，采样值为该桶内周围数据点的平均值
@@ -233,6 +238,7 @@ python metrics_exporter.py --slim
     "mode": "full"
   },
   "slim": true,
+  "maskIp": false,
   "output": {
     "directory": "./output",
     "splitBy": "metric_type",
@@ -245,9 +251,11 @@ python metrics_exporter.py --slim
     "batchSize": null,
     "scrollKeepalive": "5m",
     "maxRetries": 3,
-    "retryDelay": 5
+    "retryDelay": 5,
+    "skipEstimation": false
   },
   "timeRangeHours": 168,
+  "shardSize": 100000,
   "maxDocs": 1000000,
   "sourceFields": null,
   "includeAlerts": true,
@@ -266,17 +274,21 @@ python metrics_exporter.py --slim
 | `sampling.mode` | string | full 或 sampling |
 | `sampling.interval` | string | 抽样间隔（如 "1h"），sampling 模式必填 |
 | `slim` | bool/object | 精简数据配置，删除不必要的字段 |
+| `maskIp` | bool | 是否脱敏 IP 地址（隐藏前两个 octet） |
 | `output.directory` | string | 输出目录 |
 | `output.splitBy` | string | 分割方式：metric_type/cluster/none |
 | `execution.parallelMetrics` | int | 并行导出数 |
 | `execution.parallelDegree` | int | 单指标内并行度（默认 1） |
 | `execution.batchSize` | int | 批次大小（null=自适应） |
+| `execution.skipEstimation` | bool | 跳过数据量预估（加速启动） |
 | `timeRangeHours` | int | 时间范围（小时） |
 | `startTime` | string | 开始时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
 | `endTime` | string | 结束时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
+| `shardSize` | int | 每个分片文件的最大文档数（默认 100000） |
 | `maxDocs` | int | 每类型最大文档数 |
 | `sourceFields` | array | 要导出的字段列表 |
 | `includeAlerts` | bool | 是否导出告警数据 |
+| `alertTypes` | array | 要导出的告警类型 |
 
 ### 控制台进度输出
 
@@ -288,6 +300,24 @@ python metrics_exporter.py --slim
 - 阶段切换（监控指标导出、告警导出、摘要写入）
 
 该输出为线程安全实现，可避免并行导出时日志行相互覆盖。
+
+### 输出文件格式
+
+导出文件采用 **JSON Lines (.jsonl)** 格式，每行一个紧凑 JSON 对象：
+
+```
+{"timestamp":"2026-04-15T10:00:00Z","metadata":{...},"payload":{...}}
+{"timestamp":"2026-04-15T10:00:10Z","metadata":{...},"payload":{...}}
+```
+
+**优点**：
+- 支持流式读取，无需一次性加载整个文件
+- 便于使用 `jq`、`grep` 等工具处理
+- 写入过程中断不会损坏已写入的数据
+
+**自动分片**：当文档数超过 `shardSize` 时，自动创建新文件：
+- 第一个文件：`{metric_type}_{timestamp}.jsonl`
+- 后续文件：`{metric_type}_{timestamp}_1.jsonl`、`{metric_type}_{timestamp}_2.jsonl` 等
 
 ---
 
@@ -601,14 +631,18 @@ timestamp       - 时间戳
 | `--time-range` | 时间范围(小时) | 24 |
 | `--start-time` | 开始时间（绝对时间） | - |
 | `--end-time` | 结束时间（绝对时间） | - |
+| `--shard-size` | 每个分片文件的最大文档数 | 100000 |
 | `--max-docs` | 每类型最大文档数 | 100000 |
 | `--batch-size` | 批次大小 | 自适应 |
 | `--scroll-keepalive` | Scroll 保持时间 | 5m |
 | `--parallel` | 并行度 | 2 |
+| `--parallel-degree` | 单指标内并行度 | 1 |
 | `--cluster-id` | 集群ID过滤 | - |
 | `--metric-types` | 指标类型列表 | 全部 |
 | `--fields` | 字段列表 | 全部 |
 | `--slim` | 精简数据，删除不必要的字段 | false |
+| `--mask-ip` | 脱敏 IP 地址（隐藏前两个 octet） | false |
+| `--sampling-interval` | 抽样时间间隔（如 1h, 5m） | - |
 | `--no-alerts` | 不导出告警 | false |
 | `--list-clusters` | 列出集群 | false |
 
