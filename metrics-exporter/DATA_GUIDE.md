@@ -284,6 +284,7 @@ python metrics_exporter.py --slim
 | `timeRangeHours` | int | 时间范围（小时） |
 | `startTime` | string | 开始时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
 | `endTime` | string | 结束时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
+| `timeZone` | string | 时区（IANA 名称如 Asia/Shanghai，或 UTC 偏移如 +08:00，默认 UTC） |
 | `shardSize` | int | 每个分片文件的最大文档数（默认 100000） |
 | `maxDocs` | int | 每类型最大文档数 |
 | `sourceFields` | array | 要导出的字段列表 |
@@ -631,6 +632,7 @@ timestamp       - 时间戳
 | `--time-range` | 时间范围(小时) | 24 |
 | `--start-time` | 开始时间（绝对时间） | - |
 | `--end-time` | 结束时间（绝对时间） | - |
+| `--timezone` | 时区（IANA 名称或 UTC 偏移，默认 UTC） | UTC |
 | `--shard-size` | 每个分片文件的最大文档数 | 100000 |
 | `--max-docs` | 每类型最大文档数 | 100000 |
 | `--batch-size` | 批次大小 | 自适应 |

@@ -191,6 +191,7 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 --time-range HOURS       导出时间范围(小时)，默认24
 --start-time TIME        开始时间，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
 --end-time TIME          结束时间，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'
+--timezone TZ            时区，IANA 名称(如 Asia/Shanghai)或 UTC 偏移(如 +08:00)，默认 UTC
 --max-docs N             每种类型最大文档数，默认100000（0=无限制）
 --batch-size N           每批次读取的文档数，默认自适应 (2000-5000)
 --scroll-keepalive TIME  Scroll 上下文保持时间，默认5m
@@ -220,6 +221,10 @@ python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p
 # 按绝对时间范围导出
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
   --start-time "2026-04-03 11:38:46" --end-time "2026-04-03"
+
+# 按绝对时间范围导出（指定时区，时间按东八区解释）
+python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
+  --start-time "2026-04-03 08:00:00" --end-time "2026-04-03 18:00:00" --timezone Asia/Shanghai
 
 # 只导出关键字段
 python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p password \
@@ -296,6 +301,7 @@ python metrics-exporter/metrics_exporter.py -c http://localhost:9000 -u admin -p
         "timeRangeHours": 168,
         "startTime": "2026-04-03 11:38:46",
         "endTime": "2026-04-03",
+        "timeZone": "Asia/Shanghai",
         "maxDocs": 1000000
       },
       {
