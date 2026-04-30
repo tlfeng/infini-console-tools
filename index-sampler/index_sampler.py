@@ -5,7 +5,7 @@ Index Sampler - 索引采样工具
 
 从 INFINI Console 管理的所有 Elasticsearch 集群中：
 - 获取所有非系统索引
-- 提取每个索引的 mapping
+- 提取每个索引的 mapping 和 settings
 - 提取每个索引的样本文档
 - 导出 JSON 和 CSV 格式的总结文档
 
@@ -33,18 +33,20 @@ class IndexSample:
         self.cluster_id = cluster_id
         self.cluster_name = cluster_name
         self.index_name = index_name
+        self.index_info: Dict[str, Any] = {}
         self.mapping: Optional[Dict] = None
+        self.settings: Optional[Dict] = None
         self.sample_docs: List[Dict] = []
-        self.doc_count: int = 0
 
     def to_dict(self) -> Dict:
         return {
             "cluster_id": self.cluster_id,
             "cluster_name": self.cluster_name,
             "index_name": self.index_name,
+            "index_info": self.index_info,
             "mapping": self.mapping,
+            "settings": self.settings,
             "sample_docs": self.sample_docs,
-            "doc_count": self.doc_count,
         }
 
 
@@ -135,15 +137,14 @@ def sample_cluster(
 
         sample = IndexSample(cluster_id, cluster_name, index_name)
 
-        # 获取文档数量
-        doc_count = index_info.get("docs.count", "0")
-        try:
-            sample.doc_count = int(doc_count)
-        except (ValueError, TypeError):
-            sample.doc_count = 0
+        # 保存完整的 _cat/indices 信息
+        sample.index_info = index_info
 
         # 获取 mapping
         sample.mapping = client.get_index_mapping(cluster_id, index_name)
+
+        # 获取 settings
+        sample.settings = client.get_index_settings(cluster_id, index_name)
 
         # 获取样本文档
         sample.sample_docs = client.search_index(cluster_id, index_name, size=sample_size)
@@ -189,14 +190,26 @@ def export_results(report: SamplingReport, output_dir: str):
 
 def export_csv(report: SamplingReport, filepath: Path):
     """导出CSV格式的报告"""
-    headers = [
-        "Cluster ID",
-        "Cluster Name",
-        "Index Name",
-        "Document Count",
-        "Sample Docs Count",
-        "Has Mapping",
+    # _cat/indices 关键列名与 CSV 列名的映射
+    csv_columns = [
+        ("cluster_id", "Cluster ID"),
+        ("cluster_name", "Cluster Name"),
+        ("index_name", "Index Name"),
+        ("health", "Health"),
+        ("status", "Status"),
+        ("shards", "Shards"),
+        ("pri", "Primary Shards"),
+        ("rep", "Replicas"),
+        ("docs.count", "Document Count"),
+        ("docs.deleted", "Docs Deleted"),
+        ("store.size", "Store Size"),
+        ("pri.store.size", "Primary Store Size"),
+        ("_sample_docs_count", "Sample Docs Count"),
+        ("_has_mapping", "Has Mapping"),
+        ("_has_settings", "Has Settings"),
     ]
+
+    headers = [label for _, label in csv_columns]
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -205,15 +218,25 @@ def export_csv(report: SamplingReport, filepath: Path):
         for cluster_result in report.results:
             for idx_sample in cluster_result.indices:
                 has_mapping = "Yes" if idx_sample.mapping and len(idx_sample.mapping) > 0 else "No"
+                has_settings = "Yes" if idx_sample.settings and len(idx_sample.settings) > 0 else "No"
 
-                row = [
-                    cluster_result.cluster_id,
-                    cluster_result.cluster_name,
-                    idx_sample.index_name,
-                    idx_sample.doc_count,
-                    len(idx_sample.sample_docs),
-                    has_mapping,
-                ]
+                info = idx_sample.index_info
+                row = []
+                for key, _ in csv_columns:
+                    if key == "cluster_id":
+                        row.append(cluster_result.cluster_id)
+                    elif key == "cluster_name":
+                        row.append(cluster_result.cluster_name)
+                    elif key == "index_name":
+                        row.append(idx_sample.index_name)
+                    elif key == "_sample_docs_count":
+                        row.append(len(idx_sample.sample_docs))
+                    elif key == "_has_mapping":
+                        row.append(has_mapping)
+                    elif key == "_has_settings":
+                        row.append(has_settings)
+                    else:
+                        row.append(info.get(key, ""))
                 writer.writerow(row)
 
 
