@@ -372,6 +372,37 @@ class TestMetricsJobConfig(unittest.TestCase):
                 "startTime": "2026-04-03 11:38:46",
             })
 
+    def test_job_with_timezone_iana(self):
+        """job 配置支持 IANA 时区"""
+        job = MetricsJobConfig.from_dict({
+            "name": "tz-job",
+            "metrics": ["node_stats"],
+            "startTime": "2026-04-03 08:00:00",
+            "endTime": "2026-04-03 18:00:00",
+            "timeZone": "Asia/Shanghai",
+        })
+        self.assertEqual(job.timezone, "Asia/Shanghai")
+
+    def test_job_with_timezone_offset(self):
+        """job 配置支持 UTC 偏移格式"""
+        job = MetricsJobConfig.from_dict({
+            "name": "tz-job",
+            "metrics": ["node_stats"],
+            "startTime": "2026-04-03 08:00:00",
+            "endTime": "2026-04-03 18:00:00",
+            "timeZone": "+08:00",
+        })
+        self.assertEqual(job.timezone, "+08:00")
+
+    def test_job_timezone_defaults_none(self):
+        """未指定 timeZone 时默认为 None（即 UTC）"""
+        job = MetricsJobConfig.from_dict({
+            "name": "default-tz",
+            "metrics": ["node_stats"],
+            "timeRangeHours": 24,
+        })
+        self.assertIsNone(job.timezone)
+
 
 class TestAppConfig(unittest.TestCase):
     """测试完整应用配置"""

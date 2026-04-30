@@ -30,7 +30,8 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -501,8 +502,15 @@ class MetricsExporter:
     SLIM_HUMAN_READABLE = {"store", "estimated_size", "limit_size"}
 
     @staticmethod
-    def _parse_time_input(raw: str, is_end: bool = False) -> datetime:
-        """解析时间字符串，支持 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD。"""
+    def _parse_time_input(raw: str, is_end: bool = False, tz: Optional[str] = None) -> datetime:
+        """解析时间字符串，支持 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD。
+
+        Args:
+            raw: 时间字符串
+            is_end: 是否为结束时间（日期格式自动补 23:59:59）
+            tz: 时区名称（IANA 格式如 Asia/Shanghai，或 UTC 偏移如 +08:00），
+                未指定时默认 UTC
+        """
         if not raw:
             raise ValueError("时间字符串不能为空")
 
@@ -527,23 +535,54 @@ class MetricsExporter:
                     f"无效时间格式: {raw}，支持 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'"
                 ) from exc
 
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        else:
+        # 解析时区：字符串自带时区信息优先，否则使用 tz 参数，默认 UTC
+        if parsed.tzinfo is not None:
             parsed = parsed.astimezone(timezone.utc)
+        else:
+            target_tz = MetricsExporter._resolve_tz(tz)
+            parsed = parsed.replace(tzinfo=target_tz).astimezone(timezone.utc)
 
         return parsed
+
+    @staticmethod
+    def _resolve_tz(tz: Optional[str] = None) -> tzinfo:
+        """将时区名称解析为 tzinfo 对象。
+
+        支持格式：
+        - IANA 名称: Asia/Shanghai, America/New_York, UTC
+        - UTC 偏移: +08:00, -05:00
+        - None: 默认 UTC
+        """
+        if tz is None or tz.upper() == "UTC":
+            return timezone.utc
+
+        # 尝试 UTC 偏移格式如 +08:00
+        offset_match = re.match(r'^([+-])(\d{1,2}):(\d{2})$', tz)
+        if offset_match:
+            sign = 1 if offset_match.group(1) == '+' else -1
+            hours = int(offset_match.group(2))
+            minutes = int(offset_match.group(3))
+            return timezone(timedelta(hours=sign * hours, minutes=sign * minutes))
+
+        # IANA 时区名称
+        try:
+            return ZoneInfo(tz)
+        except Exception as exc:
+            raise ValueError(
+                f"无效时区: {tz}，支持 IANA 名称（如 Asia/Shanghai）或 UTC 偏移（如 +08:00）"
+            ) from exc
 
     def _resolve_time_window(
         self,
         time_range_hours: int,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> Tuple[datetime, datetime]:
         """解析最终时间窗口。未指定绝对时间时使用最近 N 小时。"""
-        now = datetime.now(timezone.utc)
-        start_dt = self._parse_time_input(start_time, is_end=False) if start_time else None
-        end_dt = self._parse_time_input(end_time, is_end=True) if end_time else None
+        now = datetime.now(self._resolve_tz(tz))
+        start_dt = self._parse_time_input(start_time, is_end=False, tz=tz) if start_time else None
+        end_dt = self._parse_time_input(end_time, is_end=True, tz=tz) if end_time else None
 
         if start_dt is None and end_dt is None:
             end_dt = now
@@ -661,9 +700,10 @@ class MetricsExporter:
         source_fields: List[str] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> Dict:
         """构建监控指标查询"""
-        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time, tz)
 
         must_clauses = [
             {"query_string": {"query": query_filter}},
@@ -708,6 +748,7 @@ class MetricsExporter:
         source_fields: List[str] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> Dict:
         """构建告警数据查询。
 
@@ -718,7 +759,7 @@ class MetricsExporter:
         if alert_type == "alert_rules":
             return self.build_all_docs_query(source_fields)
 
-        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time, tz)
 
         # 优先使用不同告警类型的主时间字段
         time_field = "timestamp" if alert_type == "alert_history" else "created"
@@ -1567,6 +1608,7 @@ class MetricsExporter:
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         effective_group_fields: List[str] = None,
+        tz: Optional[str] = None,
     ) -> tuple:
         """
         估计要导出的数据条数
@@ -1584,6 +1626,7 @@ class MetricsExporter:
             None,
             start_time,
             end_time,
+            tz,
         )
 
         try:
@@ -1644,7 +1687,7 @@ class MetricsExporter:
                 )
 
                 # ES fixed_interval 桶数量：floor(end/interval)-floor(start/interval)+1
-                start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+                start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time, tz)
                 interval_ms = self._parse_interval_to_ms(sampling.interval)
                 start_ms = int(start_dt.timestamp() * 1000)
                 end_ms = int(end_dt.timestamp() * 1000)
@@ -1713,6 +1756,7 @@ class MetricsExporter:
         progress_reporter: Optional[ConsoleProgressReporter] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> ExportResult:
         """导出指定类型的监控指标（支持自动分片）
 
@@ -1738,6 +1782,7 @@ class MetricsExporter:
                 source_fields,
                 start_time,
                 end_time,
+                tz,
             )
 
             effective_group_fields = None
@@ -1762,6 +1807,7 @@ class MetricsExporter:
                     start_time,
                     end_time,
                     effective_group_fields,
+                    tz,
                 )
                 if total_docs >= 0:
                     # 判断是否有抽样
@@ -1839,6 +1885,7 @@ class MetricsExporter:
         progress_reporter: Optional[ConsoleProgressReporter] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> ExportResult:
         """导出告警相关数据（支持自动分片）
 
@@ -1853,7 +1900,7 @@ class MetricsExporter:
 
         try:
             effective_batch_size = batch_size or config.get("default_batch_size", DEFAULT_BATCH_SIZE)
-            query = self.build_alert_query(alert_type, time_range_hours, source_fields, start_time, end_time)
+            query = self.build_alert_query(alert_type, time_range_hours, source_fields, start_time, end_time, tz)
 
             count, file_paths = self.export_with_scroll(
                 config["index_pattern"],
@@ -1885,13 +1932,15 @@ class MetricsExporter:
         time_range_hours: int = 24,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
     ) -> List[Dict]:
         """获取有监控数据的集群列表
 
         Args:
             time_range_hours: 查询时间范围（小时），默认 24 小时
+            tz: 时区名称（IANA 或 UTC 偏移）
         """
-        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time)
+        start_dt, end_dt = self._resolve_time_window(time_range_hours, start_time, end_time, tz)
 
         query = {
             "size": 0,
@@ -1960,6 +2009,7 @@ class MetricsExporter:
         time_range_hours: int = 24,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
+        tz: Optional[str] = None,
         shard_size: int = 100000,
         cluster_id_filter: str = None,
         cluster_ids: List[str] = None,
@@ -2041,7 +2091,7 @@ class MetricsExporter:
         clusters = []
         if not cluster_ids and not cluster_id_filter:
             progress_reporter.stage("\n正在获取有监控数据的集群列表...")
-            clusters = self.get_available_clusters(time_range_hours, start_time, end_time)
+            clusters = self.get_available_clusters(time_range_hours, start_time, end_time, tz)
             export_summary["clusters_with_data"] = clusters
             progress_reporter.stage(f"找到 {len(clusters)} 个有监控数据的集群")
             if not clusters:
@@ -2085,6 +2135,7 @@ class MetricsExporter:
                     progress_reporter,
                     start_time,
                     end_time,
+                    tz,
                 )
                 futures[future] = metric_type
 
@@ -2134,6 +2185,7 @@ class MetricsExporter:
                         progress_reporter,
                         start_time,
                         end_time,
+                        tz,
                     )
                     futures[future] = alert_type
 
@@ -2170,7 +2222,7 @@ class MetricsExporter:
         cluster_filter_specified = False  # 标记用户是否指定了集群过滤
         if job.targets and job.targets.clusters:
             cluster_filter_specified = True
-            all_clusters = self.get_available_clusters(job.time_range_hours, job.start_time, job.end_time)
+            all_clusters = self.get_available_clusters(job.time_range_hours, job.start_time, job.end_time, job.timezone)
             cluster_ids = [
                 c['cluster_id'] for c in all_clusters
                 if job.targets.clusters.matches(c['cluster_id']) or
@@ -2200,6 +2252,7 @@ class MetricsExporter:
             time_range_hours=job.time_range_hours,
             start_time=job.start_time,
             end_time=job.end_time,
+            tz=job.timezone,
             shard_size=job.shard_size,
             cluster_ids=cluster_ids,
             include_alerts=job.include_alerts,
@@ -2322,6 +2375,12 @@ Examples:
         type=str,
         default=None,
         help="结束时间，格式: 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'",
+    )
+    parser.add_argument(
+        "--timezone",
+        type=str,
+        default=None,
+        help="时区，IANA 名称（如 Asia/Shanghai）或 UTC 偏移（如 +08:00），默认 UTC",
     )
     parser.add_argument(
         "--shard-size",
@@ -2609,10 +2668,14 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
     if args.cluster_id:
         job_config["targets"] = {"clusters": {"include": [args.cluster_id]}}
 
+    if args.timezone:
+        job_config["timeZone"] = args.timezone
+
     # 命令行提前校验时间参数，尽早反馈用户
     try:
-        MetricsExporter._parse_time_input(args.start_time, is_end=False) if args.start_time else None
-        MetricsExporter._parse_time_input(args.end_time, is_end=True) if args.end_time else None
+        MetricsExporter._parse_time_input(args.start_time, is_end=False, tz=args.timezone) if args.start_time else None
+        MetricsExporter._parse_time_input(args.end_time, is_end=True, tz=args.timezone) if args.end_time else None
+        MetricsExporter._resolve_tz(args.timezone) if args.timezone else None
     except ValueError as e:
         print(f"时间参数错误: {e}")
         sys.exit(1)

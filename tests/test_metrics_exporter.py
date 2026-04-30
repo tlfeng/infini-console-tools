@@ -380,6 +380,170 @@ class TestQueryBuilding(unittest.TestCase):
                 start_time="2026/04/03",
             )
 
+    def test_query_with_timezone_iana_shifts_time(self):
+        """指定 IANA 时区时，输入时间应被解释为该时区并转换为 UTC"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        # Asia/Shanghai = UTC+8，所以 08:00 CST = 00:00 UTC
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03 08:00:00",
+            end_time="2026-04-03 18:00:00",
+            tz="Asia/Shanghai",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T00:00:00+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T10:00:00+00:00")
+
+    def test_query_with_timezone_utc_offset(self):
+        """支持 UTC 偏移格式如 +08:00"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03 08:00:00",
+            end_time="2026-04-03 16:00:00",
+            tz="+08:00",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T00:00:00+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T08:00:00+00:00")
+
+    def test_query_with_timezone_date_only(self):
+        """日期格式 + 时区：日期边界应按指定时区解释"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03",
+            end_time="2026-04-03",
+            tz="Asia/Shanghai",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        # 2026-04-03 00:00:00 CST = 2026-04-02 16:00:00 UTC
+        self.assertEqual(ts["gte"], "2026-04-02T16:00:00+00:00")
+        # 2026-04-03 23:59:59 CST = 2026-04-03 15:59:59 UTC
+        self.assertEqual(ts["lte"], "2026-04-03T15:59:59+00:00")
+
+    def test_resolve_tz_invalid_raises(self):
+        """无效时区名称应抛出 ValueError"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        with self.assertRaises(ValueError):
+            MetricsExporter._resolve_tz("Invalid/Zone")
+
+    def test_resolve_tz_utc_returns_utc(self):
+        """UTC 或 None 返回 UTC timezone"""
+        result_none = MetricsExporter._resolve_tz(None)
+        result_utc = MetricsExporter._resolve_tz("UTC")
+        result_utc_lower = MetricsExporter._resolve_tz("utc")
+
+        self.assertEqual(result_none, timezone.utc)
+        self.assertEqual(result_utc, timezone.utc)
+        self.assertEqual(result_utc_lower, timezone.utc)
+
+    def test_resolve_tz_negative_offset(self):
+        """支持负 UTC 偏移如 -05:00"""
+        tz = MetricsExporter._resolve_tz("-05:00")
+        now_local = datetime(2026, 1, 1, 12, 0, 0, tzinfo=tz)
+        utc_time = now_local.astimezone(timezone.utc)
+        self.assertEqual(utc_time.hour, 17)
+
+    def test_resolve_tz_iana_new_york(self):
+        """支持 IANA 时区 America/New_York"""
+        tz = MetricsExporter._resolve_tz("America/New_York")
+        # 1月是 EST (UTC-5)
+        winter = datetime(2026, 1, 15, 12, 0, 0, tzinfo=tz)
+        self.assertEqual(winter.astimezone(timezone.utc).hour, 17)
+        # 7月是 EDT (UTC-4，夏令时)
+        summer = datetime(2026, 7, 15, 12, 0, 0, tzinfo=tz)
+        self.assertEqual(summer.astimezone(timezone.utc).hour, 16)
+
+    def test_parse_time_input_builtin_offset_overrides_tz_param(self):
+        """时间字符串自带时区偏移时，忽略 tz 参数"""
+        result = MetricsExporter._parse_time_input(
+            "2026-04-03T08:00:00+05:00", is_end=False, tz="Asia/Shanghai"
+        )
+        # +05:00 自带偏移，8:00+05:00 = 03:00 UTC，不受 Asia/Shanghai 影响
+        self.assertEqual(result.hour, 3)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_parse_time_input_naive_string_uses_tz_param(self):
+        """无时区的 naive 时间字符串使用 tz 参数解释"""
+        result = MetricsExporter._parse_time_input(
+            "2026-04-03 08:00:00", is_end=False, tz="+08:00"
+        )
+        # 08:00 按 +08:00 解释 = 00:00 UTC
+        self.assertEqual(result.hour, 0)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_parse_time_input_naive_string_defaults_utc(self):
+        """无 tz 参数时，naive 时间默认按 UTC 解释"""
+        result = MetricsExporter._parse_time_input(
+            "2026-04-03 08:00:00", is_end=False, tz=None
+        )
+        self.assertEqual(result.hour, 8)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_query_with_timezone_negative_offset(self):
+        """负 UTC 偏移（西半球）正确转换"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        # -05:00: 12:00 local = 17:00 UTC
+        query = exporter.build_metrics_query(
+            'metadata.name:"node_stats"',
+            time_range_hours=24,
+            start_time="2026-04-03 12:00:00",
+            end_time="2026-04-03 18:00:00",
+            tz="-05:00",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T17:00:00+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T23:00:00+00:00")
+
+    def test_alert_query_with_timezone(self):
+        """告警查询也支持 tz 参数"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "system-id")
+
+        query = exporter.build_alert_query(
+            "alert_history", time_range_hours=24,
+            start_time="2026-04-03 08:00:00",
+            end_time="2026-04-03 18:00:00",
+            tz="Asia/Shanghai",
+        )
+
+        must_clauses = query["query"]["bool"]["must"]
+        range_clause = [c for c in must_clauses if "range" in c][0]
+        ts = range_clause["range"]["timestamp"]
+
+        self.assertEqual(ts["gte"], "2026-04-03T00:00:00+00:00")
+        self.assertEqual(ts["lte"], "2026-04-03T10:00:00+00:00")
+
     def test_sampling_group_fields_for_node_stats(self):
         """node_stats 抽样应固定按 cluster_id + node_id 分组"""
         mock_client = MagicMock()

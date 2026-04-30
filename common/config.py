@@ -370,7 +370,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.node_stats.thread_pool.watcher.largest": {"unit": "count", "desc": "Watcher最大线程数"},
             "payload.elasticsearch.node_stats.thread_pool.watcher.threads": {"unit": "count", "desc": "Watcher线程数"},
         },
-        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值
     },
     "index_stats": {
         # Rate 型字段：累积计数器，计算 delta / bucket_size  
@@ -454,7 +454,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.index_stats.total.fielddata.memory_size_in_bytes": {"unit": "bytes", "desc": "字段缓存内存"},
             "payload.elasticsearch.index_stats.total.request_cache.memory_size_in_bytes": {"unit": "bytes", "desc": "请求缓存内存"},
         },
-        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值
     },
     "cluster_health": {
         # cluster_health 以瞬时值为主，数值取 max，字符串走 latest
@@ -474,7 +474,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.cluster_health.task_max_waiting_in_queue_millis": {"unit": "ms", "desc": "任务队列最长等待"},
             "payload.elasticsearch.cluster_health.active_shards_percent_as_number": {"unit": "%", "desc": "活跃分片占比"},
         },
-        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值
     },
     "cluster_stats": {
         # cluster_stats 主体是计数器快照，取 max 保留峰值
@@ -547,7 +547,7 @@ METRIC_FIELD_AGG_CONFIG: Dict[str, Dict[str, Any]] = {
             "payload.elasticsearch.cluster_stats.nodes.fs.free_in_bytes": {"unit": "bytes", "desc": "磁盘空闲空间"},
             "payload.elasticsearch.cluster_stats.nodes.fs.available_in_bytes": {"unit": "bytes", "desc": "磁盘可用空间"},
         },
-        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值，无需显式列出
+        # 其余字段（字符串、数组、结构体等）自动 fallback 到 latest 快照值
     },
     "shard_stats": {
         # Shard 级别的统计 - 数据量最大需要采样
@@ -662,6 +662,7 @@ class MetricsJobConfig:
     time_range_hours: int = 24
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    timezone: Optional[str] = None  # IANA 时区名称如 Asia/Shanghai，或 UTC 偏移如 +08:00
     shard_size: int = 100000  # 每个分片文件的最大文档数
     source_fields: Optional[List[str]] = None
     include_alerts: bool = True
@@ -714,6 +715,7 @@ class MetricsJobConfig:
             time_range_hours=time_range_hours,
             start_time=data.get('startTime'),
             end_time=data.get('endTime'),
+            timezone=data.get('timeZone'),
             shard_size=data.get('shardSize', 100000),
             source_fields=data.get('sourceFields'),
             include_alerts=data.get('includeAlerts', True),
