@@ -6,7 +6,7 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 
 | 工具 | 功能 | 路径 |
 |------|------|------|
-| **index-sampler** | 索引采样工具 - 提取索引 Mapping 和样本文档 | `index-sampler/` |
+| **index-sampler** | 索引采样工具 - 提取索引 Mapping、Settings 和样本文档 | `index-sampler/` |
 | **metrics-exporter** | 监控数据导出工具 - 导出集群监控指标供离线分析 | `metrics-exporter/` |
 | **cluster-report** | 集群报告工具 - 收集集群基本信息和统计 | `cluster-report/` |
 | **query-report** | 查询报告工具 - 执行查询并生成 Markdown 报告 | `query-report/` |
@@ -131,7 +131,9 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 - 自动发现所有管理的集群（排除 Console 系统集群）
 - 获取所有非系统索引（排除 `.` 开头的索引）
 - 检查集群健康状态，跳过 unavailable 集群
+- 保存每个索引完整的 `_cat/indices` 信息（health、status、shards、文档数、存储大小等）
 - 提取每个索引的 Mapping 结构
+- 提取每个索引的 Settings 配置
 - 提取每个索引的样本文档（默认 2 条）
 - 导出 JSON 和 CSV 格式的总结报告
 - 为每个索引生成详细的 JSON 文件
