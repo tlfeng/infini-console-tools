@@ -2546,5 +2546,120 @@ class TestFieldAggregator(unittest.TestCase):
         self.assertEqual(max_aggs[key], {"max": {"field": key}})
 
 
+class TestExportCheckpoint(unittest.TestCase):
+    """测试断点续传功能"""
+
+    def setUp(self):
+        ExportCheckpoint = metrics_exporter.ExportCheckpoint
+        self.ExportCheckpoint = ExportCheckpoint
+
+    def test_checkpoint_save_and_load(self):
+        """测试检查点保存和加载"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            query = {"query": {"match_all": {}}}
+            output_file = os.path.join(temp_dir, "test_output")
+
+            # 保存检查点
+            checkpoint.save(
+                output_file,
+                exported_count=500,
+                last_sort_values=[12345, "abc"],
+                query=query,
+                force=True,
+            )
+
+            # 加载检查点
+            loaded = checkpoint.load(output_file, query)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["exported_count"], 500)
+            self.assertEqual(loaded["last_sort_values"], [12345, "abc"])
+            self.assertEqual(loaded["metric_type"], "test_metric")
+
+    def test_checkpoint_query_hash_validation(self):
+        """测试查询变化时检查点失效"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            query1 = {"query": {"match_all": {}}}
+            query2 = {"query": {"match": {"field": "value"}}}
+            output_file = os.path.join(temp_dir, "test_output")
+
+            # 用 query1 保存检查点
+            checkpoint.save(output_file, 500, query=query1, force=True)
+
+            # 用 query2 加载应该返回 None（查询变化）
+            loaded = checkpoint.load(output_file, query2)
+            self.assertIsNone(loaded)
+
+    def test_checkpoint_interval_check(self):
+        """测试检查点间隔检查"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            # 初始状态，_last_save_count = 0
+            # 0 - 0 = 0，未达到间隔 100，不应保存
+            self.assertFalse(checkpoint.should_save(0))
+
+            # 未达到间隔，不应保存
+            self.assertFalse(checkpoint.should_save(50))
+
+            # 达到间隔，应该保存
+            self.assertTrue(checkpoint.should_save(100))
+
+            # 模拟保存后更新 _last_save_count
+            checkpoint._last_save_count = 100
+
+            # 再次未达到间隔
+            self.assertFalse(checkpoint.should_save(150))
+
+            # 再次达到间隔
+            self.assertTrue(checkpoint.should_save(200))
+
+    def test_checkpoint_clear(self):
+        """测试检查点清除"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            query = {"query": {"match_all": {}}}
+            output_file = os.path.join(temp_dir, "test_output")
+
+            # 保存检查点
+            checkpoint.save(output_file, 500, query=query, force=True)
+
+            # 清除检查点
+            checkpoint.clear(output_file)
+
+            # 加载应该返回 None
+            loaded = checkpoint.load(output_file, query)
+            self.assertIsNone(loaded)
+
+    def test_checkpoint_sampling_after_key(self):
+        """测试 sampling 模式的 after_key 保存"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            query = {"query": {"match_all": {}}}
+            output_file = os.path.join(temp_dir, "test_output")
+            after_key = {"group_0": "cluster1", "time_bucket": 1234567890000}
+
+            # 保存检查点（sampling 模式）
+            checkpoint.save(
+                output_file,
+                exported_count=1000,
+                sampling_after_key=after_key,
+                query=query,
+                force=True,
+            )
+
+            # 加载检查点
+            loaded = checkpoint.load(output_file, query)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["sampling_after_key"], after_key)
+
+
 if __name__ == "__main__":
     unittest.main()

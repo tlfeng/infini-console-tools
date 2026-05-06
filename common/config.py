@@ -616,6 +616,8 @@ class ExecutionConfig:
     max_retries: int = 3
     retry_delay: int = 5  # 秒
     skip_estimation: bool = False  # 跳过数据量预估（加速启动）
+    checkpoint_interval: int = 10000  # 检查点保存间隔（条数）
+    enable_checkpoint: bool = True  # 是否启用断点续传
 
     @classmethod
     def from_dict(cls, data: Optional[Dict]) -> 'ExecutionConfig':
@@ -629,7 +631,9 @@ class ExecutionConfig:
             scroll_keepalive=data.get('scrollKeepalive', '5m'),
             max_retries=data.get('maxRetries', 3),
             retry_delay=data.get('retryDelay', 5),
-            skip_estimation=data.get('skipEstimation', False)
+            skip_estimation=data.get('skipEstimation', False),
+            checkpoint_interval=data.get('checkpointInterval', 10000),
+            enable_checkpoint=data.get('enableCheckpoint', True),
         )
 
 

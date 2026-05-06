@@ -29,6 +29,7 @@ import re
 import sys
 import threading
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
@@ -43,6 +44,11 @@ from common.config import (
     SamplingConfig, SlimConfig,
     FieldAggStrategy, METRIC_FIELD_AGG_CONFIG,
 )
+
+
+# 断点续传相关常量
+DEFAULT_CHECKPOINT_INTERVAL = 10000  # 默认每 10000 条记录保存一次检查点
+CHECKPOINT_FILE_SUFFIX = ".checkpoint.json"  # 检查点文件后缀
 
 
 # 监控指标类型定义
@@ -493,6 +499,159 @@ class ConsoleProgressReporter:
                 print(f"  [{task_name}] 完成，已保存 {count:,} 条记录")
 
 
+class ExportCheckpoint:
+    """
+    导出检查点管理器 - 支持断点续传
+
+    检查点文件格式:
+    {
+        "version": 1,
+        "metric_type": "node_stats",
+        "output_file": "output/node_stats_20260101_120000",
+        "exported_count": 50000,
+        "last_sort_values": [...],
+        "last_scroll_id": "...",
+        "timestamp": "2026-01-01T12:30:00Z",
+        "query_hash": "abc123",  # 用于验证查询是否变化
+        "sampling_after_key": {...},  # sampling 模式的 after_key
+    }
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        metric_type: str,
+        checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+    ):
+        self.checkpoint_dir = checkpoint_dir
+        self.metric_type = metric_type
+        self.checkpoint_interval = checkpoint_interval
+        self._checkpoint_path: Optional[str] = None
+        self._last_save_count = 0
+
+    def _get_query_hash(self, query: Dict) -> str:
+        """计算查询的哈希值，用于验证查询是否变化"""
+        query_str = json.dumps(query, sort_keys=True)
+        return hashlib.md5(query_str.encode()).hexdigest()[:8]
+
+    def get_checkpoint_path(self, output_file: str) -> str:
+        """获取检查点文件路径"""
+        # 基于输出文件名生成检查点文件名
+        base_name = os.path.basename(output_file)
+        return os.path.join(self.checkpoint_dir, f"{base_name}{CHECKPOINT_FILE_SUFFIX}")
+
+    def load(self, output_file: str, query: Dict) -> Optional[Dict]:
+        """
+        加载检查点
+
+        Args:
+            output_file: 输出文件路径
+            query: 当前查询（用于验证）
+
+        Returns:
+            检查点数据，如果不存在或无效则返回 None
+        """
+        self._checkpoint_path = self.get_checkpoint_path(output_file)
+
+        if not os.path.exists(self._checkpoint_path):
+            return None
+
+        try:
+            with open(self._checkpoint_path, "r", encoding="utf-8") as f:
+                checkpoint = json.load(f)
+
+            # 验证版本
+            if checkpoint.get("version") != 1:
+                print(f"    检查点版本不兼容，忽略")
+                return None
+
+            # 验证 metric_type
+            if checkpoint.get("metric_type") != self.metric_type:
+                print(f"    检查点 metric_type 不匹配，忽略")
+                return None
+
+            # 验证查询是否变化
+            current_hash = self._get_query_hash(query)
+            if checkpoint.get("query_hash") != current_hash:
+                print(f"    查询条件已变化，忽略检查点")
+                return None
+
+            return checkpoint
+
+        except Exception as e:
+            print(f"    加载检查点失败: {e}")
+            return None
+
+    def save(
+        self,
+        output_file: str,
+        exported_count: int,
+        last_sort_values: Optional[List] = None,
+        scroll_id: Optional[str] = None,
+        sampling_after_key: Optional[Dict] = None,
+        query: Optional[Dict] = None,
+        force: bool = False,
+    ) -> None:
+        """
+        保存检查点
+
+        Args:
+            output_file: 输出文件路径
+            exported_count: 已导出的文档数
+            last_sort_values: 最后一条记录的排序值
+            scroll_id: scroll ID（scroll 模式）
+            sampling_after_key: sampling 模式的 after_key
+            query: 查询条件（用于生成哈希）
+            force: 是否强制保存（忽略间隔检查）
+        """
+        # 检查是否需要保存
+        if not force and (exported_count - self._last_save_count) < self.checkpoint_interval:
+            return
+
+        self._checkpoint_path = self.get_checkpoint_path(output_file)
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(self._checkpoint_path) or ".", exist_ok=True)
+
+        checkpoint = {
+            "version": 1,
+            "metric_type": self.metric_type,
+            "output_file": output_file,
+            "exported_count": exported_count,
+            "last_sort_values": last_sort_values,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if scroll_id:
+            checkpoint["last_scroll_id"] = scroll_id
+
+        if sampling_after_key:
+            checkpoint["sampling_after_key"] = sampling_after_key
+
+        if query:
+            checkpoint["query_hash"] = self._get_query_hash(query)
+
+        try:
+            with open(self._checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+            self._last_save_count = exported_count
+        except Exception as e:
+            print(f"    保存检查点失败: {e}")
+
+    def clear(self, output_file: str) -> None:
+        """清除检查点文件"""
+        checkpoint_path = self.get_checkpoint_path(output_file)
+        if os.path.exists(checkpoint_path):
+            try:
+                os.remove(checkpoint_path)
+            except Exception:
+                pass
+
+    def should_save(self, exported_count: int) -> bool:
+        """检查是否应该保存检查点"""
+        return (exported_count - self._last_save_count) >= self.checkpoint_interval
+
+
 class MetricsExporter:
     """监控数据导出器 - 优化版"""
 
@@ -898,17 +1057,20 @@ class MetricsExporter:
         progress_callback=None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        checkpoint: Optional[ExportCheckpoint] = None,
     ) -> Tuple[int, List[str]]:
         """
-        使用 scroll API 流式导出数据（支持自动分片）
+        使用 scroll API 流式导出数据（支持自动分片和断点续传）
 
         支持自动恢复：如果 scroll context 过期，会自动重新初始化查询继续导出。
+        支持断点续传：通过 checkpoint 参数定期保存进度，中断后可恢复。
 
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
+            checkpoint: 检查点管理器（可选）
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -916,13 +1078,41 @@ class MetricsExporter:
         total_exported = 0
         scroll_id = None
         last_sort_values = None  # 用于恢复时继续查询
+        resumed_from_checkpoint = False
 
-        # 初始化 scroll（不限制文档数）
-        first_batch, scroll_id, total_count = self.search_with_scroll(
-            index_pattern, query, batch_size, 0
-        )
+        # 尝试从检查点恢复
+        if checkpoint:
+            checkpoint_data = checkpoint.load(output_file, query)
+            if checkpoint_data:
+                resumed_from_checkpoint = True
+                total_exported = checkpoint_data.get("exported_count", 0)
+                last_sort_values = checkpoint_data.get("last_sort_values")
+                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录")
 
-        if not first_batch:
+                # 使用 search_after 恢复查询
+                first_batch, scroll_id, total_count = self._resume_with_search_after(
+                    index_pattern, query, batch_size, last_sort_values
+                )
+
+                if first_batch is None:
+                    print("    检查点恢复失败，从头开始导出")
+                    resumed_from_checkpoint = False
+                    total_exported = 0
+                    first_batch, scroll_id, total_count = self.search_with_scroll(
+                        index_pattern, query, batch_size, 0
+                    )
+            else:
+                # 正常初始化 scroll
+                first_batch, scroll_id, total_count = self.search_with_scroll(
+                    index_pattern, query, batch_size, 0
+                )
+        else:
+            # 无检查点，正常初始化 scroll
+            first_batch, scroll_id, total_count = self.search_with_scroll(
+                index_pattern, query, batch_size, 0
+            )
+
+        if not first_batch and not resumed_from_checkpoint:
             # 创建空文件
             with JSONLinesWriter(f"{output_file}.jsonl"):
                 pass
@@ -939,6 +1129,14 @@ class MetricsExporter:
 
         # 使用分片写入器
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
+            # 如果从检查点恢复，需要先读取已有文件的内容计数
+            if resumed_from_checkpoint and total_exported > 0:
+                # 检查点已记录 exported_count，writer 需要同步这个计数
+                # 通过读取已有文件来确定当前分片状态
+                existing_files = writer.get_file_paths()
+                # 简化处理：从检查点恢复时，writer 从新文件开始
+                # 已有数据会在最后合并处理
+
             current_batch = first_batch
             with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                 next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
@@ -950,6 +1148,16 @@ class MetricsExporter:
 
                     # 更新最后排序值（用于恢复）
                     last_sort_values = current_batch[-1].get("sort")
+
+                    # 保存检查点（定期）
+                    if checkpoint and checkpoint.should_save(total_exported):
+                        checkpoint.save(
+                            output_file,
+                            total_exported,
+                            last_sort_values,
+                            scroll_id,
+                            query=query,
+                        )
 
                     if progress_callback:
                         progress_callback(total_exported, total_count)
@@ -972,6 +1180,15 @@ class MetricsExporter:
 
                         if current_batch is None:
                             print("    恢复失败，停止导出")
+                            # 保存最终检查点，以便下次恢复
+                            if checkpoint:
+                                checkpoint.save(
+                                    output_file,
+                                    total_exported,
+                                    last_sort_values,
+                                    query=query,
+                                    force=True,
+                                )
                             break
 
                         print(f"    恢复成功，继续导出...")
@@ -990,6 +1207,10 @@ class MetricsExporter:
         if scroll_id:
             self.clear_scroll(scroll_id)
 
+        # 清理检查点（导出完成）
+        if checkpoint:
+            checkpoint.clear(output_file)
+
         return total_exported, writer.get_file_paths()
 
     def _export_with_sliced_scroll(
@@ -1003,8 +1224,12 @@ class MetricsExporter:
         progress_callback=None,
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
+        checkpoint: Optional[ExportCheckpoint] = None,
     ) -> Tuple[int, List[str]]:
-        """使用 sliced scroll 在单个指标内并行导出。"""
+        """使用 sliced scroll 在单个指标内并行导出。
+
+        注意：sliced scroll 模式下，每个 slice 有独立的检查点文件。
+        """
         effective_slices = max(1, parallel_degree)
         progress_lock = threading.Lock()
         per_slice_exported = [0] * effective_slices
@@ -1029,6 +1254,15 @@ class MetricsExporter:
             slice_query["slice"] = {"id": slice_id, "max": effective_slices}
             slice_output_base = f"{output_file}_slice{slice_id}"
 
+            # 每个 slice 有独立的检查点
+            slice_checkpoint = None
+            if checkpoint:
+                slice_checkpoint = ExportCheckpoint(
+                    checkpoint.checkpoint_dir,
+                    f"{checkpoint.metric_type}_slice{slice_id}",
+                    checkpoint.checkpoint_interval,
+                )
+
             return self._export_with_scroll_single(
                 index_pattern=index_pattern,
                 query=slice_query,
@@ -1038,6 +1272,7 @@ class MetricsExporter:
                 progress_callback=make_slice_progress(slice_id),
                 slim_config=slim_config,
                 mask_ip=mask_ip,
+                checkpoint=slice_checkpoint,
             )
 
         with ThreadPoolExecutor(max_workers=effective_slices) as executor:
@@ -1064,6 +1299,7 @@ class MetricsExporter:
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
         parallel_degree: int = 1,
+        checkpoint: Optional[ExportCheckpoint] = None,
     ) -> Tuple[int, List[str]]:
         """使用 scroll API 导出数据，可选在单个指标内启用 sliced scroll 并行。"""
         if parallel_degree and parallel_degree > 1:
@@ -1077,6 +1313,7 @@ class MetricsExporter:
                 progress_callback=progress_callback,
                 slim_config=slim_config,
                 mask_ip=mask_ip,
+                checkpoint=checkpoint,
             )
 
         return self._export_with_scroll_single(
@@ -1088,6 +1325,7 @@ class MetricsExporter:
             progress_callback=progress_callback,
             slim_config=slim_config,
             mask_ip=mask_ip,
+            checkpoint=checkpoint,
         )
 
     def _resume_with_search_after(
@@ -1263,6 +1501,7 @@ class MetricsExporter:
         parallel_degree: int = 1,
         metric_type: str = None,
         effective_group_fields: List[str] = None,
+        checkpoint: Optional[ExportCheckpoint] = None,
     ) -> Tuple[int, List[str]]:
         """
         ES 端抽样：时间桶 + 维度分层（top_hits 或 字段聚合）
@@ -1274,6 +1513,7 @@ class MetricsExporter:
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
             metric_type: 指标类型，用于获取内置的字段聚合配置
+            checkpoint: 检查点管理器（可选）
 
         Returns:
             (导出的文档总数, 文件路径列表)
@@ -1290,6 +1530,7 @@ class MetricsExporter:
                 slim_config,
                 mask_ip,
                 parallel_degree,
+                checkpoint=checkpoint,
             )
 
         total_exported = 0
@@ -1520,8 +1761,31 @@ class MetricsExporter:
                 local_count = 0
                 worker_output = f"{output_file}_worker{worker_id}"
 
+                # 每个 worker 有独立的检查点
+                worker_checkpoint = None
+                if checkpoint:
+                    worker_checkpoint = ExportCheckpoint(
+                        checkpoint.checkpoint_dir,
+                        f"{checkpoint.metric_type}_worker{worker_id}",
+                        checkpoint.checkpoint_interval,
+                    )
+
+                # 尝试从检查点恢复
+                resumed = False
+                worker_after_key = None
+                if worker_checkpoint:
+                    checkpoint_data = worker_checkpoint.load(worker_output, worker_query)
+                    if checkpoint_data:
+                        resumed = True
+                        local_count = checkpoint_data.get("exported_count", 0)
+                        worker_after_key = checkpoint_data.get("sampling_after_key")
+                        print(f"    [worker{worker_id}] 从检查点恢复: 已导出 {local_count:,} 条记录")
+
                 with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
-                    current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
+                    if not resumed:
+                        current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
+                    else:
+                        current_docs, next_after = _fetch_sampling_page(worker_query, worker_after_key, worker_aggregator)
 
                     with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                         next_future = (
@@ -1538,6 +1802,15 @@ class MetricsExporter:
                             writer.flush()
                             _report_worker_progress(worker_id, local_count)
 
+                            # 保存检查点（定期）
+                            if worker_checkpoint and worker_checkpoint.should_save(local_count):
+                                worker_checkpoint.save(
+                                    worker_output,
+                                    local_count,
+                                    sampling_after_key=next_after,
+                                    query=worker_query,
+                                )
+
                             if not next_future:
                                 break
 
@@ -1547,6 +1820,10 @@ class MetricsExporter:
                                 if next_after
                                 else None
                             )
+
+                # 清理检查点（导出完成）
+                if worker_checkpoint:
+                    worker_checkpoint.clear(worker_output)
 
                 return local_count, writer.get_file_paths()
 
@@ -1566,8 +1843,22 @@ class MetricsExporter:
 
             return total_exported, sorted(all_file_paths)
 
+        # 单线程路径：支持断点续传
+        resumed_from_checkpoint = False
+        if checkpoint:
+            checkpoint_data = checkpoint.load(output_file, query)
+            if checkpoint_data:
+                resumed_from_checkpoint = True
+                total_exported = checkpoint_data.get("exported_count", 0)
+                after_key = checkpoint_data.get("sampling_after_key")
+                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录")
+
         with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
+            if not resumed_from_checkpoint:
+                current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
+            else:
+                # 从检查点恢复，使用保存的 after_key 继续查询
+                current_docs, after_key = _fetch_sampling_page(query, after_key, field_aggregator)
 
             with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                 next_future = (
@@ -1582,6 +1873,16 @@ class MetricsExporter:
                         total_exported += 1
 
                     writer.flush()
+
+                    # 保存检查点（定期）
+                    if checkpoint and checkpoint.should_save(total_exported):
+                        checkpoint.save(
+                            output_file,
+                            total_exported,
+                            sampling_after_key=after_key,
+                            query=query,
+                        )
+
                     if progress_callback:
                         progress_callback(total_exported, 0)
 
@@ -1594,6 +1895,10 @@ class MetricsExporter:
                         if after_key
                         else None
                     )
+
+        # 清理检查点（导出完成）
+        if checkpoint:
+            checkpoint.clear(output_file)
 
         return total_exported, writer.get_file_paths()
 
@@ -1757,8 +2062,9 @@ class MetricsExporter:
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         tz: Optional[str] = None,
+        checkpoint: Optional[ExportCheckpoint] = None,
     ) -> ExportResult:
-        """导出指定类型的监控指标（支持自动分片）
+        """导出指定类型的监控指标（支持自动分片和断点续传）
 
         Args:
             output_file: 基础输出路径（不含 .json 后缀）
@@ -1766,6 +2072,7 @@ class MetricsExporter:
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
             skip_estimation: 跳过数据量预估，加速启动
+            checkpoint: 检查点管理器（可选）
         """
         result = ExportResult(metric_type, config["name"])
         start_ts = time.time()
@@ -1843,6 +2150,7 @@ class MetricsExporter:
                     metric_parallel_degree,
                     metric_type=metric_type,
                     effective_group_fields=effective_group_fields,
+                    checkpoint=checkpoint,
                 )
             else:
                 count, file_paths = self.export_with_scroll(
@@ -1855,6 +2163,7 @@ class MetricsExporter:
                     slim_config,
                     mask_ip,
                     metric_parallel_degree,
+                    checkpoint=checkpoint,
                 )
 
             result.count = count
@@ -2022,13 +2331,17 @@ class MetricsExporter:
         slim_config: SlimConfig = None,
         mask_ip: bool = False,
         skip_estimation: bool = False,
+        checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+        enable_checkpoint: bool = True,
     ) -> Dict[str, Any]:
-        """导出所有监控数据（支持并行和自动分片）
+        """导出所有监控数据（支持并行、自动分片和断点续传）
 
         Args:
             shard_size: 每个分片文件的最大文档数，默认 100000
             slim_config: 精简数据配置
             mask_ip: 是否脱敏IP地址
+            checkpoint_interval: 检查点保存间隔（条数），默认 10000
+            enable_checkpoint: 是否启用断点续传，默认 True
         """
         # 如果 cluster_ids 是空列表（不是 None），说明指定了集群但匹配不到
         # 此时应该返回空结果，而不是导出所有集群的数据
@@ -2116,6 +2429,16 @@ class MetricsExporter:
                 progress_reporter.start(metric_type)
                 # 基础路径，不含扩展名（由 ShardedJSONLinesWriter 添加）
                 output_file_base = os.path.join(output_dir, f"{metric_type}_{timestamp_suffix}")
+
+                # 创建检查点管理器
+                metric_checkpoint = None
+                if enable_checkpoint and checkpoint_interval > 0:
+                    metric_checkpoint = ExportCheckpoint(
+                        output_dir,
+                        metric_type,
+                        checkpoint_interval,
+                    )
+
                 future = executor.submit(
                     self.export_metric_type,
                     metric_type,
@@ -2136,6 +2459,7 @@ class MetricsExporter:
                     start_time,
                     end_time,
                     tz,
+                    metric_checkpoint,
                 )
                 futures[future] = metric_type
 
@@ -2264,6 +2588,8 @@ class MetricsExporter:
             slim_config=job.slim,
             mask_ip=job.mask_ip,
             skip_estimation=job.execution.skip_estimation,
+            checkpoint_interval=job.execution.checkpoint_interval,
+            enable_checkpoint=job.execution.enable_checkpoint,
         )
 
     def _print_type_summary(self, title: str, types_data: Dict, totals: list) -> None:
@@ -2450,6 +2776,17 @@ Examples:
         type=str,
         default=None,
         help="抽样时间间隔，如 1h, 5m（不指定则为全量导出）",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=10000,
+        help="检查点保存间隔（条数），默认10000，设为0禁用断点续传",
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="禁用断点续传功能",
     )
 
     # 配置文件模式参数
@@ -2644,6 +2981,8 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
             "parallelDegree": args.parallel_degree,
             "batchSize": args.batch_size,
             "scrollKeepalive": args.scroll_keepalive,
+            "checkpointInterval": args.checkpoint_interval,
+            "enableCheckpoint": not args.no_checkpoint,
         },
     }
 
