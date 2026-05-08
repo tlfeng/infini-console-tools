@@ -207,7 +207,56 @@ python metrics_exporter.py --slim
 - 小数据量或低延迟网络可按需缩短，但出现 scroll 404 时应优先延长 keepalive
 - 当前批次大小已按指标类型分层，自定义调优时建议先降低并行度，再调整批次
 
-### 6. 预估性能提升
+### 6. 断点续传
+
+导出大数据量时，支持断点续传功能，中断后可从上次进度继续：
+
+```bash
+# 默认启用断点续传（每 10000 条保存一次检查点）
+python metrics_exporter.py -c http://localhost:9000 -u admin -p password
+
+# 自定义检查点间隔（每 5000 条保存一次）
+python metrics_exporter.py --checkpoint-interval 5000
+
+# 禁用断点续传
+python metrics_exporter.py --no-checkpoint
+```
+
+配置文件方式：
+
+```json
+{
+  "execution": {
+    "checkpointInterval": 10000,
+    "enableCheckpoint": true
+  }
+}
+```
+
+**工作原理：**
+
+1. **检查点命名**：基于 `metric_type` + 查询条件哈希值
+   ```
+   {output_dir}/node_stats_a1b2c3d4e5f6.checkpoint.json
+   ```
+   - 相同查询条件（时间范围、集群过滤等）的两次运行能正确恢复
+   - 查询条件变化会生成不同的检查点文件，不会误恢复
+
+2. **恢复流程**：
+   - 每导出 N 条记录自动保存进度
+   - 中断后重新运行相同命令，自动检测并加载检查点
+   - 导出完成后自动清理检查点文件
+
+3. **并行模式支持**：
+   - Scroll 并行（sliced scroll）：每个 slice 有独立检查点
+   - Sampling 并行：每个 worker 有独立检查点
+
+**预期效果：**
+- 大数据量导出中断后无需从头开始
+- 节省时间和网络带宽
+- 检查点文件小巧（仅保存进度信息）
+
+### 7. 预估性能提升
 
 | 优化项 | 预期提升 |
 |-------|---------|
@@ -252,7 +301,9 @@ python metrics_exporter.py --slim
     "scrollKeepalive": "5m",
     "maxRetries": 3,
     "retryDelay": 5,
-    "skipEstimation": false
+    "skipEstimation": false,
+    "checkpointInterval": 10000,
+    "enableCheckpoint": true
   },
   "timeRangeHours": 168,
   "shardSize": 100000,
@@ -281,6 +332,8 @@ python metrics_exporter.py --slim
 | `execution.parallelDegree` | int | 单指标内并行度（默认 1） |
 | `execution.batchSize` | int | 批次大小（null=自适应） |
 | `execution.skipEstimation` | bool | 跳过数据量预估（加速启动） |
+| `execution.checkpointInterval` | int | 检查点保存间隔（条数，默认 10000） |
+| `execution.enableCheckpoint` | bool | 是否启用断点续传（默认 true） |
 | `timeRangeHours` | int | 时间范围（小时） |
 | `startTime` | string | 开始时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
 | `endTime` | string | 结束时间（支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"） |
@@ -646,6 +699,8 @@ timestamp       - 时间戳
 | `--mask-ip` | 脱敏 IP 地址（隐藏前两个 octet） | false |
 | `--sampling-interval` | 抽样时间间隔（如 1h, 5m） | - |
 | `--no-alerts` | 不导出告警 | false |
+| `--checkpoint-interval` | 检查点保存间隔（条数），设为 0 禁用 | 10000 |
+| `--no-checkpoint` | 禁用断点续传 | false |
 | `--list-clusters` | 列出集群 | false |
 
 ---

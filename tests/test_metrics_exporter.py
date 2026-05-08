@@ -2561,17 +2561,19 @@ class TestExportCheckpoint(unittest.TestCase):
             query = {"query": {"match_all": {}}}
             output_file = os.path.join(temp_dir, "test_output")
 
+            # 先加载初始化 _query_hash 和 _checkpoint_path
+            checkpoint.load(query)
+
             # 保存检查点
             checkpoint.save(
                 output_file,
                 exported_count=500,
                 last_sort_values=[12345, "abc"],
-                query=query,
                 force=True,
             )
 
             # 加载检查点
-            loaded = checkpoint.load(output_file, query)
+            loaded = checkpoint.load(query)
 
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["exported_count"], 500)
@@ -2587,11 +2589,14 @@ class TestExportCheckpoint(unittest.TestCase):
             query2 = {"query": {"match": {"field": "value"}}}
             output_file = os.path.join(temp_dir, "test_output")
 
-            # 用 query1 保存检查点
-            checkpoint.save(output_file, 500, query=query1, force=True)
+            # 先加载初始化
+            checkpoint.load(query1)
 
-            # 用 query2 加载应该返回 None（查询变化）
-            loaded = checkpoint.load(output_file, query2)
+            # 用 query1 保存检查点
+            checkpoint.save(output_file, 500, force=True)
+
+            # 用 query2 加载应该返回 None（查询变化，生成不同的检查点文件）
+            loaded = checkpoint.load(query2)
             self.assertIsNone(loaded)
 
     def test_checkpoint_interval_check(self):
@@ -2626,14 +2631,17 @@ class TestExportCheckpoint(unittest.TestCase):
             query = {"query": {"match_all": {}}}
             output_file = os.path.join(temp_dir, "test_output")
 
+            # 先加载初始化
+            checkpoint.load(query)
+
             # 保存检查点
-            checkpoint.save(output_file, 500, query=query, force=True)
+            checkpoint.save(output_file, 500, force=True)
 
             # 清除检查点
-            checkpoint.clear(output_file)
+            checkpoint.clear()
 
             # 加载应该返回 None
-            loaded = checkpoint.load(output_file, query)
+            loaded = checkpoint.load(query)
             self.assertIsNone(loaded)
 
     def test_checkpoint_sampling_after_key(self):
@@ -2645,21 +2653,45 @@ class TestExportCheckpoint(unittest.TestCase):
             output_file = os.path.join(temp_dir, "test_output")
             after_key = {"group_0": "cluster1", "time_bucket": 1234567890000}
 
+            # 先加载初始化
+            checkpoint.load(query)
+
             # 保存检查点（sampling 模式）
             checkpoint.save(
                 output_file,
                 exported_count=1000,
                 sampling_after_key=after_key,
-                query=query,
                 force=True,
             )
 
             # 加载检查点
-            loaded = checkpoint.load(output_file, query)
+            loaded = checkpoint.load(query)
 
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["sampling_after_key"], after_key)
 
+    def test_checkpoint_filename_based_on_query_hash(self):
+        """测试检查点文件名基于查询哈希而非输出文件名"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+
+            query = {"query": {"match_all": {}}}
+            output_file1 = os.path.join(temp_dir, "test_output_20260101_100000")
+            output_file2 = os.path.join(temp_dir, "test_output_20260101_110000")  # 不同时间戳
+
+            # 先加载初始化
+            checkpoint.load(query)
+
+            # 用第一个输出文件名保存
+            checkpoint.save(output_file1, 500, force=True)
+
+            # 清除后重新加载（模拟新运行）
+            checkpoint2 = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+            loaded = checkpoint2.load(query)
+
+            # 即使输出文件名不同，相同查询也能恢复
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["exported_count"], 500)
 
 if __name__ == "__main__":
     unittest.main()

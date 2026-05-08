@@ -515,6 +515,8 @@ class ExportCheckpoint:
         "query_hash": "abc123",  # 用于验证查询是否变化
         "sampling_after_key": {...},  # sampling 模式的 after_key
     }
+
+    检查点文件命名：基于 metric_type 和查询哈希，确保同一任务可恢复
     """
 
     def __init__(
@@ -527,31 +529,33 @@ class ExportCheckpoint:
         self.metric_type = metric_type
         self.checkpoint_interval = checkpoint_interval
         self._checkpoint_path: Optional[str] = None
+        self._query_hash: Optional[str] = None
         self._last_save_count = 0
 
     def _get_query_hash(self, query: Dict) -> str:
         """计算查询的哈希值，用于验证查询是否变化"""
         query_str = json.dumps(query, sort_keys=True)
-        return hashlib.md5(query_str.encode()).hexdigest()[:8]
+        return hashlib.md5(query_str.encode()).hexdigest()[:12]
 
-    def get_checkpoint_path(self, output_file: str) -> str:
-        """获取检查点文件路径"""
-        # 基于输出文件名生成检查点文件名
-        base_name = os.path.basename(output_file)
-        return os.path.join(self.checkpoint_dir, f"{base_name}{CHECKPOINT_FILE_SUFFIX}")
+    def _get_checkpoint_path(self) -> str:
+        """获取检查点文件路径（基于 metric_type 和查询哈希）"""
+        return os.path.join(
+            self.checkpoint_dir,
+            f"{self.metric_type}_{self._query_hash}{CHECKPOINT_FILE_SUFFIX}"
+        )
 
-    def load(self, output_file: str, query: Dict) -> Optional[Dict]:
+    def load(self, query: Dict) -> Optional[Dict]:
         """
         加载检查点
 
         Args:
-            output_file: 输出文件路径
-            query: 当前查询（用于验证）
+            query: 当前查询（用于计算哈希和验证）
 
         Returns:
             检查点数据，如果不存在或无效则返回 None
         """
-        self._checkpoint_path = self.get_checkpoint_path(output_file)
+        self._query_hash = self._get_query_hash(query)
+        self._checkpoint_path = self._get_checkpoint_path()
 
         if not os.path.exists(self._checkpoint_path):
             return None
@@ -570,12 +574,6 @@ class ExportCheckpoint:
                 print(f"    检查点 metric_type 不匹配，忽略")
                 return None
 
-            # 验证查询是否变化
-            current_hash = self._get_query_hash(query)
-            if checkpoint.get("query_hash") != current_hash:
-                print(f"    查询条件已变化，忽略检查点")
-                return None
-
             return checkpoint
 
         except Exception as e:
@@ -589,26 +587,26 @@ class ExportCheckpoint:
         last_sort_values: Optional[List] = None,
         scroll_id: Optional[str] = None,
         sampling_after_key: Optional[Dict] = None,
-        query: Optional[Dict] = None,
         force: bool = False,
     ) -> None:
         """
         保存检查点
 
         Args:
-            output_file: 输出文件路径
+            output_file: 输出文件路径（记录在检查点中，用于信息展示）
             exported_count: 已导出的文档数
             last_sort_values: 最后一条记录的排序值
             scroll_id: scroll ID（scroll 模式）
             sampling_after_key: sampling 模式的 after_key
-            query: 查询条件（用于生成哈希）
             force: 是否强制保存（忽略间隔检查）
         """
         # 检查是否需要保存
         if not force and (exported_count - self._last_save_count) < self.checkpoint_interval:
             return
 
-        self._checkpoint_path = self.get_checkpoint_path(output_file)
+        # 确保检查点路径已初始化
+        if not self._checkpoint_path:
+            return
 
         # 确保目录存在
         os.makedirs(os.path.dirname(self._checkpoint_path) or ".", exist_ok=True)
@@ -620,6 +618,7 @@ class ExportCheckpoint:
             "exported_count": exported_count,
             "last_sort_values": last_sort_values,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "query_hash": self._query_hash,
         }
 
         if scroll_id:
@@ -628,9 +627,6 @@ class ExportCheckpoint:
         if sampling_after_key:
             checkpoint["sampling_after_key"] = sampling_after_key
 
-        if query:
-            checkpoint["query_hash"] = self._get_query_hash(query)
-
         try:
             with open(self._checkpoint_path, "w", encoding="utf-8") as f:
                 json.dump(checkpoint, f, ensure_ascii=False, indent=2)
@@ -638,12 +634,11 @@ class ExportCheckpoint:
         except Exception as e:
             print(f"    保存检查点失败: {e}")
 
-    def clear(self, output_file: str) -> None:
+    def clear(self) -> None:
         """清除检查点文件"""
-        checkpoint_path = self.get_checkpoint_path(output_file)
-        if os.path.exists(checkpoint_path):
+        if self._checkpoint_path and os.path.exists(self._checkpoint_path):
             try:
-                os.remove(checkpoint_path)
+                os.remove(self._checkpoint_path)
             except Exception:
                 pass
 
@@ -1082,7 +1077,7 @@ class MetricsExporter:
 
         # 尝试从检查点恢复
         if checkpoint:
-            checkpoint_data = checkpoint.load(output_file, query)
+            checkpoint_data = checkpoint.load(query)
             if checkpoint_data:
                 resumed_from_checkpoint = True
                 total_exported = checkpoint_data.get("exported_count", 0)
@@ -1156,7 +1151,6 @@ class MetricsExporter:
                             total_exported,
                             last_sort_values,
                             scroll_id,
-                            query=query,
                         )
 
                     if progress_callback:
@@ -1186,7 +1180,6 @@ class MetricsExporter:
                                     output_file,
                                     total_exported,
                                     last_sort_values,
-                                    query=query,
                                     force=True,
                                 )
                             break
@@ -1209,7 +1202,7 @@ class MetricsExporter:
 
         # 清理检查点（导出完成）
         if checkpoint:
-            checkpoint.clear(output_file)
+            checkpoint.clear()
 
         return total_exported, writer.get_file_paths()
 
@@ -1774,7 +1767,7 @@ class MetricsExporter:
                 resumed = False
                 worker_after_key = None
                 if worker_checkpoint:
-                    checkpoint_data = worker_checkpoint.load(worker_output, worker_query)
+                    checkpoint_data = worker_checkpoint.load(worker_query)
                     if checkpoint_data:
                         resumed = True
                         local_count = checkpoint_data.get("exported_count", 0)
@@ -1808,7 +1801,6 @@ class MetricsExporter:
                                     worker_output,
                                     local_count,
                                     sampling_after_key=next_after,
-                                    query=worker_query,
                                 )
 
                             if not next_future:
@@ -1823,7 +1815,7 @@ class MetricsExporter:
 
                 # 清理检查点（导出完成）
                 if worker_checkpoint:
-                    worker_checkpoint.clear(worker_output)
+                    worker_checkpoint.clear()
 
                 return local_count, writer.get_file_paths()
 
@@ -1846,7 +1838,7 @@ class MetricsExporter:
         # 单线程路径：支持断点续传
         resumed_from_checkpoint = False
         if checkpoint:
-            checkpoint_data = checkpoint.load(output_file, query)
+            checkpoint_data = checkpoint.load(query)
             if checkpoint_data:
                 resumed_from_checkpoint = True
                 total_exported = checkpoint_data.get("exported_count", 0)
@@ -1880,7 +1872,6 @@ class MetricsExporter:
                             output_file,
                             total_exported,
                             sampling_after_key=after_key,
-                            query=query,
                         )
 
                     if progress_callback:
@@ -1898,7 +1889,7 @@ class MetricsExporter:
 
         # 清理检查点（导出完成）
         if checkpoint:
-            checkpoint.clear(output_file)
+            checkpoint.clear()
 
         return total_exported, writer.get_file_paths()
 
