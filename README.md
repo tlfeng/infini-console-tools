@@ -11,6 +11,7 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 | **cluster-report** | 集群报告工具 - 收集集群基本信息和统计 | `cluster-report/` |
 | **query-report** | 查询报告工具 - 执行查询并生成 Markdown 报告 | `query-report/` |
 | **test-runner** | 测试运行工具 - 查询性能测试和对比 | `test-runner/` |
+| **hot-threads** | Hot Threads 采集工具 - 定时抓取 ES hot threads 并写入 JSONL | `hot-threads/` |
 
 ## 快速开始
 
@@ -49,6 +50,14 @@ python query-report/es_query_report.py -c http://localhost:9000 -u admin -p pass
 
 # 测试运行
 python test-runner/es_test_runner.py config.json
+
+# Hot Threads 定时采集
+python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p password \
+  --cluster-id xxx --poll-interval 10 --count 30
+
+# Hot Threads 稳定运行 1 小时（推荐）
+python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p password \
+  --cluster-id xxx --poll-interval 10 --duration-minutes 60 --retries 2 --retry-delay 1
 ```
 
 ## 统一配置方式
@@ -169,6 +178,61 @@ python query-report/es_query_report.py --config config.json -i queries.txt
 
 **输出文件：**
 - `cluster_report_YYYYMMDD_HHMMSS.csv` - 详细报告
+
+### Hot Threads Collector (Hot Threads 采集工具)
+
+按固定间隔调用 Elasticsearch `/_nodes/hot_threads` API，将每次抓取结果逐行写入 JSONL 文件，适合短期排障与持续观测。
+
+**功能：**
+- 支持全节点或指定节点（`--node-id`）抓取
+- 支持按次数（`--count`）或按时长（`--duration-minutes`）自动停止
+- 支持失败自动重试（`--retries`, `--retry-delay`）
+- 使用固定节拍采集，降低长期运行时的时间漂移
+- 每条记录包含抓取时间、耗时、请求路径、响应或错误信息
+
+**参数：**
+```bash
+--cluster-id ID         目标集群 ID
+--cluster-name NAME     目标集群名称（可选，不指定 cluster-id 时可用）
+--node-id NODE_IDS      节点 ID/名称，逗号分隔（为空表示全节点）
+
+--poll-interval SEC     抓取间隔(秒)，默认 10
+--duration-minutes MIN  运行时长(分钟)，默认 0（不限时）
+--count N               抓取次数，默认 0（不限次数）
+--retries N             单次失败重试次数，默认 2
+--retry-delay SEC       重试间隔(秒)，默认 1
+
+--threads N             返回线程数，默认 3
+--snapshots N           采样次数，默认 10
+--sample-interval TIME  hot threads 采样间隔（如 500ms, 1s）
+--type TYPE             采样类型: cpu/wait/block（默认 cpu）
+--api-timeout TIME      hot threads API 超时（如 30s）
+--include-idle-threads  包含空闲线程（默认忽略）
+```
+
+**推荐用法（运行 1 小时）：**
+```bash
+python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p password \
+  --cluster-id xxx --poll-interval 10 --duration-minutes 60 --retries 2 --retry-delay 1
+```
+
+**输出文件：**
+- `exports/hot_threads_YYYYMMDD_HHMMSS.jsonl`（默认）
+
+**JSONL 字段示例：**
+```json
+{
+  "sequence": 1,
+  "attempt": 1,
+  "fetch_time": "2026-05-19T00:58:15.911819+00:00",
+  "elapsed_ms": 664.95,
+  "cluster_id": "d82k4s5vlvcc737void0",
+  "api_path": "/_nodes/hot_threads?threads=3&snapshots=10&ignore_idle_threads=true&type=cpu",
+  "response": "..."
+}
+```
+
+更多说明见 `hot-threads/README.md`。
 
 ### Metrics Exporter (监控数据导出工具)
 
