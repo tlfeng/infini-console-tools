@@ -2693,5 +2693,329 @@ class TestExportCheckpoint(unittest.TestCase):
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["exported_count"], 500)
 
+
+class TestJSONLinesWriterAppend(unittest.TestCase):
+    """测试 JSONLinesWriter 追加模式"""
+
+    def test_append_to_existing_file(self):
+        """追加模式应在已有文件末尾继续写入"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = os.path.join(temp_dir, "test.jsonl")
+
+            # 先写入 2 条记录
+            with JSONLinesWriter(file_path) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+
+            # 追加模式写入 3 条记录
+            with JSONLinesWriter(file_path, append=True) as writer:
+                self.assertEqual(writer.count, 2)  # 已有 2 行
+                writer.write_doc({"id": 3})
+                writer.write_doc({"id": 4})
+                writer.write_doc({"id": 5})
+                self.assertEqual(writer.count, 5)  # 总计 5 行
+
+            # 验证文件内容
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 5)
+            self.assertEqual(json.loads(lines[0])["id"], 1)
+            self.assertEqual(json.loads(lines[4])["id"], 5)
+
+    def test_append_to_nonexistent_file(self):
+        """追加模式对不存在的文件应正常工作"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = os.path.join(temp_dir, "new.jsonl")
+
+            with JSONLinesWriter(file_path, append=True) as writer:
+                self.assertEqual(writer.count, 0)  # 无已有行
+                writer.write_doc({"id": 1})
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 1)
+
+    def test_overwrite_mode(self):
+        """非追加模式应覆盖已有文件"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = os.path.join(temp_dir, "test.jsonl")
+
+            # 先写入 2 条记录
+            with JSONLinesWriter(file_path) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+
+            # 覆盖模式（默认）
+            with JSONLinesWriter(file_path) as writer:
+                writer.write_doc({"id": 10})
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["id"], 10)
+
+
+class TestShardedJSONLinesWriterResume(unittest.TestCase):
+    """测试 ShardedJSONLinesWriter 断点续写"""
+
+    def test_resume_single_shard(self):
+        """续写单个分片文件"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 第一次写入 3 条记录
+            with ShardedJSONLinesWriter(base_path, shard_size=5) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+                writer.write_doc({"id": 3})
+
+            # 续写 2 条记录
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=5,
+                resume=True, resume_exported_count=3,
+            ) as writer:
+                writer.write_doc({"id": 4})
+                writer.write_doc({"id": 5})
+
+            # 验证：应该在同一个文件中
+            file_path = f"{base_path}.jsonl"
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 5)
+            for i, line in enumerate(lines):
+                self.assertEqual(json.loads(line)["id"], i + 1)
+
+    def test_resume_with_truncation(self):
+        """续写时截断检查点之后的多余行"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 写入 5 条记录
+            with ShardedJSONLinesWriter(base_path, shard_size=10) as writer:
+                for i in range(5):
+                    writer.write_doc({"id": i + 1})
+
+            # 模拟：文件有 5 行，但检查点只记录了 3 条
+            # 续写时应该截断最后 2 行，然后追加
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=10,
+                resume=True, resume_exported_count=3,
+            ) as writer:
+                # 截断后文件应该只有 3 行
+                self.assertEqual(writer.total_count, 3)
+                writer.write_doc({"id": 4})
+                writer.write_doc({"id": 5})
+
+            # 验证文件
+            file_path = f"{base_path}.jsonl"
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 5)
+            # 前三条是原始的 1,2,3，后两条是续写的 4,5
+            self.assertEqual(json.loads(lines[0])["id"], 1)
+            self.assertEqual(json.loads(lines[2])["id"], 3)
+            self.assertEqual(json.loads(lines[3])["id"], 4)
+            self.assertEqual(json.loads(lines[4])["id"], 5)
+
+    def test_resume_multiple_shards(self):
+        """续写多个分片文件"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 写入 5 条记录，shard_size=2，应产生 3 个分片
+            with ShardedJSONLinesWriter(base_path, shard_size=2) as writer:
+                for i in range(5):
+                    writer.write_doc({"id": i + 1})
+
+            # 续写 3 条记录
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=2,
+                resume=True, resume_exported_count=5,
+            ) as writer:
+                # 第三个分片（索引 2）有 1 条记录，未满
+                self.assertEqual(writer.current_shard, 2)
+                self.assertEqual(writer.shard_counts[2], 1)
+                writer.write_doc({"id": 6})  # 填满第三个分片
+                writer.write_doc({"id": 7})  # 开始第四个分片
+                writer.write_doc({"id": 8})  # 第四个分片第 2 条
+
+            # 验证所有文件
+            with open(f"{base_path}.jsonl", "r") as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_1.jsonl", "r") as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_2.jsonl", "r") as f:
+                lines = f.readlines()
+                self.assertEqual(len(lines), 2)
+                self.assertEqual(json.loads(lines[0])["id"], 5)
+                self.assertEqual(json.loads(lines[1])["id"], 6)
+            with open(f"{base_path}_3.jsonl", "r") as f:
+                lines = f.readlines()
+                self.assertEqual(len(lines), 2)
+                self.assertEqual(json.loads(lines[0])["id"], 7)
+                self.assertEqual(json.loads(lines[1])["id"], 8)
+
+    def test_resume_no_existing_files(self):
+        """续写但无已有文件时应从新文件开始"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=10,
+                resume=True, resume_exported_count=0,
+            ) as writer:
+                writer.write_doc({"id": 1})
+                writer.write_doc({"id": 2})
+
+            file_path = f"{base_path}.jsonl"
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+
+    def test_resume_delete_extra_shard_files(self):
+        """续写时删除检查点之后的多余分片文件"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 写入 5 条记录，shard_size=2，产生 3 个分片
+            with ShardedJSONLinesWriter(base_path, shard_size=2) as writer:
+                for i in range(5):
+                    writer.write_doc({"id": i + 1})
+
+            # 确认 3 个文件都存在
+            self.assertTrue(os.path.exists(f"{base_path}.jsonl"))
+            self.assertTrue(os.path.exists(f"{base_path}_1.jsonl"))
+            self.assertTrue(os.path.exists(f"{base_path}_2.jsonl"))
+
+            # 检查点只记录了 2 条（第一个分片），续写应删除多余文件
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=2,
+                resume=True, resume_exported_count=2,
+            ) as writer:
+                # 第一个分片已满(2=shard_size)，新写入进入新分片
+                writer.write_doc({"id": 10})
+                writer.write_doc({"id": 11})
+
+            # _2.jsonl 应该被删除（检查点之后的多余文件）
+            self.assertFalse(os.path.exists(f"{base_path}_2.jsonl"))
+
+            # 第一个分片保留原始 2 条
+            with open(f"{base_path}.jsonl", "r") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[0])["id"], 1)
+            self.assertEqual(json.loads(lines[1])["id"], 2)
+
+            # 新建的第二个分片有 2 条新数据
+            with open(f"{base_path}_1.jsonl", "r") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[0])["id"], 10)
+            self.assertEqual(json.loads(lines[1])["id"], 11)
+
+    def test_resume_full_last_shard(self):
+        """最后一个分片已满时应创建新分片"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 写入 4 条记录，shard_size=2
+            with ShardedJSONLinesWriter(base_path, shard_size=2) as writer:
+                for i in range(4):
+                    writer.write_doc({"id": i + 1})
+
+            # 续写
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=2,
+                resume=True, resume_exported_count=4,
+            ) as writer:
+                writer.write_doc({"id": 5})
+                writer.write_doc({"id": 6})
+
+            # 应有 3 个分片文件
+            with open(f"{base_path}.jsonl", "r") as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_1.jsonl", "r") as f:
+                self.assertEqual(len(f.readlines()), 2)
+            with open(f"{base_path}_2.jsonl", "r") as f:
+                lines = f.readlines()
+                self.assertEqual(len(lines), 2)
+                self.assertEqual(json.loads(lines[0])["id"], 5)
+                self.assertEqual(json.loads(lines[1])["id"], 6)
+
+    def test_resume_preserves_all_original_data(self):
+        """续写不应丢失已有数据"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = os.path.join(temp_dir, "test")
+
+            # 写入数据
+            docs = [{"id": i, "value": f"v{i}"} for i in range(10)]
+            with ShardedJSONLinesWriter(base_path, shard_size=4) as writer:
+                for doc in docs:
+                    writer.write_doc(doc)
+
+            # 续写
+            more_docs = [{"id": i, "value": f"v{i}"} for i in range(10, 15)]
+            with ShardedJSONLinesWriter(
+                base_path, shard_size=4,
+                resume=True, resume_exported_count=10,
+            ) as writer:
+                for doc in more_docs:
+                    writer.write_doc(doc)
+
+            # 验证所有数据
+            all_docs = []
+            for suffix in ["", "_1", "_2", "_3"]:
+                file_path = f"{base_path}{suffix}.jsonl"
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            all_docs.append(json.loads(line))
+
+            self.assertEqual(len(all_docs), 15)
+            for i, doc in enumerate(all_docs):
+                self.assertEqual(doc["id"], i)
+
+
+class TestCheckpointResumeOutputFile(unittest.TestCase):
+    """测试断点续传时使用检查点的 output_file"""
+
+    def setUp(self):
+        self.ExportCheckpoint = metrics_exporter.ExportCheckpoint
+
+    def test_checkpoint_saves_output_file(self):
+        """检查点应保存 output_file 路径"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+            query = {"query": {"match_all": {}}}
+            output_file = os.path.join(temp_dir, "node_stats_20260610_120000")
+
+            checkpoint.load(query)
+            checkpoint.save(output_file, exported_count=500, force=True)
+
+            loaded = checkpoint.load(query)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["output_file"], output_file)
+
+    def test_resume_uses_checkpoint_output_file(self):
+        """续写时应使用检查点记录的 output_file"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_output = os.path.join(temp_dir, "node_stats_20260610_120000")
+            new_output = os.path.join(temp_dir, "node_stats_20260610_143052")
+
+            # 模拟第一次运行：保存检查点
+            checkpoint = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+            query = {"query": {"match_all": {}}}
+            checkpoint.load(query)
+            checkpoint.save(old_output, exported_count=500, force=True)
+
+            # 模拟第二次运行：加载检查点，获取旧 output_file
+            checkpoint2 = self.ExportCheckpoint(temp_dir, "test_metric", checkpoint_interval=100)
+            loaded = checkpoint2.load(query)
+            self.assertIsNotNone(loaded)
+            # 关键：检查点记录了旧的 output_file，续写时应使用它
+            self.assertEqual(loaded["output_file"], old_output)
+            # 即使新的 output_file 不同，续写也应使用旧的
+            self.assertNotEqual(loaded["output_file"], new_output)
+
 if __name__ == "__main__":
     unittest.main()

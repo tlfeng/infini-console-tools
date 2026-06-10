@@ -42,7 +42,7 @@ from common.config import (
     add_common_args, get_config_value,
     AppConfig, MetricsJobConfig, ConfigValidationError,
     SamplingConfig, SlimConfig,
-    FieldAggStrategy, METRIC_FIELD_AGG_CONFIG,
+    METRIC_FIELD_AGG_CONFIG,
 )
 
 
@@ -167,7 +167,8 @@ class FieldAggregator:
             current = current[part]
         current[parts[-1]] = value
 
-    def _get_nested_value(self, doc: Dict, field_path: str) -> Optional[Any]:
+    @staticmethod
+    def _get_nested_value(doc: Dict, field_path: str) -> Optional[Any]:
         """获取嵌套字段值"""
         parts = field_path.split(".")
         value = doc
@@ -305,16 +306,30 @@ class FieldAggregator:
 class JSONLinesWriter:
     """JSON Lines 写入器 - 每行一个 JSON 对象，支持流式读取"""
 
-    def __init__(self, file_path: str, buffer_size: int = 100):
+    def __init__(self, file_path: str, buffer_size: int = 100, append: bool = False):
         self.file_path = file_path
         self.file = None
         self.count = 0
         self.buffer: List[str] = []
         self.buffer_size = buffer_size
+        self.append = append
 
     def __enter__(self):
-        self.file = open(self.file_path, "w", encoding="utf-8")
+        if self.append:
+            # 续写模式：先计数已有行数，再以追加模式打开
+            self.count = self._count_existing_lines()
+            self.file = open(self.file_path, "a", encoding="utf-8")
+        else:
+            self.file = open(self.file_path, "w", encoding="utf-8")
         return self
+
+    def _count_existing_lines(self) -> int:
+        """统计文件中已有的行数"""
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                return sum(1 for _ in f)
+        except (FileNotFoundError, OSError):
+            return 0
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # 写入缓冲区剩余数据
@@ -350,17 +365,21 @@ class JSONLinesWriter:
 
 
 class ShardedJSONLinesWriter:
-    """分片 JSON Lines 写入器 - 当文档数超过阈值时自动创建新文件"""
+    """分片 JSON Lines 写入器 - 当文档数超过阈值时自动创建新文件，支持断点续写"""
 
     def __init__(
         self,
         base_path: str,  # 基础路径，如 "output/node_stats_20260402_143052"（不含 .jsonl）
         shard_size: int = 100000,  # 每个分片的最大文档数
         buffer_size: int = 100,
+        resume: bool = False,  # 是否从已有文件续写
+        resume_exported_count: int = 0,  # 检查点记录的已导出文档数（用于截断多余行）
     ):
         self.base_path = base_path
         self.shard_size = shard_size
         self.buffer_size = buffer_size
+        self.resume = resume
+        self.resume_exported_count = resume_exported_count
         self.current_writer: Optional[JSONLinesWriter] = None
         self.current_shard = 0
         self.total_count = 0
@@ -368,7 +387,10 @@ class ShardedJSONLinesWriter:
         self.file_paths: List[str] = []  # 所有生成的文件路径（完整路径）
 
     def __enter__(self):
-        self._start_new_shard()
+        if self.resume:
+            self._resume_existing_shards()
+        else:
+            self._start_new_shard()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -395,6 +417,110 @@ class ShardedJSONLinesWriter:
         if self.current_writer:
             self.current_writer.__exit__(None, None, None)
             self.current_writer = None
+
+    def _resume_existing_shards(self):
+        """从已有分片文件续写，截断检查点之后的多余行以避免重复"""
+        # 探测已有的分片文件
+        existing: List[Tuple[str, int]] = []  # (file_path, line_count)
+        shard_idx = 0
+        while True:
+            if shard_idx == 0:
+                file_path = f"{self.base_path}.jsonl"
+            else:
+                file_path = f"{self.base_path}_{shard_idx}.jsonl"
+
+            if not os.path.exists(file_path):
+                break
+
+            count = self._count_lines_in_file(file_path)
+            existing.append((file_path, count))
+            shard_idx += 1
+
+        if not existing:
+            # 无已有文件，从新文件开始
+            self._start_new_shard()
+            return
+
+        # 按 resume_exported_count 截断多余行（检查点之后的写入可能是未完成的）
+        remaining = self.resume_exported_count
+        for file_path, actual_count in existing:
+            if remaining <= 0:
+                # 已超出检查点记录的数量，删除多余文件
+                self._remove_file(file_path)
+                continue
+
+            if actual_count <= remaining:
+                # 保留此文件
+                self.file_paths.append(file_path)
+                self.shard_counts.append(actual_count)
+                self.total_count += actual_count
+                remaining -= actual_count
+            else:
+                # 文件行数超出检查点预期，截断
+                self._truncate_file_to_line_count(file_path, remaining)
+                self.file_paths.append(file_path)
+                self.shard_counts.append(remaining)
+                self.total_count += remaining
+                remaining = 0
+
+        if not self.file_paths:
+            # 所有文件都被删除，从新文件开始
+            self._start_new_shard()
+            return
+
+        # 定位当前分片
+        self.current_shard = len(self.file_paths) - 1
+
+        if self.shard_counts[self.current_shard] >= self.shard_size:
+            # 最后一个分片已满，开始新分片
+            self.current_shard += 1
+            self._start_new_shard()
+        else:
+            # 最后一个分片未满，以追加模式打开
+            self.current_writer = JSONLinesWriter(
+                self.file_paths[self.current_shard], self.buffer_size, append=True
+            )
+            self.current_writer.__enter__()
+
+    @staticmethod
+    def _count_lines_in_file(file_path: str) -> int:
+        """统计文件行数"""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return sum(1 for _ in f)
+        except (FileNotFoundError, OSError):
+            return 0
+
+    @staticmethod
+    def _truncate_file_to_line_count(file_path: str, line_count: int) -> None:
+        """截断文件，只保留前 line_count 行"""
+        if line_count <= 0:
+            with open(file_path, "w", encoding="utf-8") as _:
+                pass
+            return
+
+        try:
+            with open(file_path, "rb") as f:
+                lines_found = 0
+                while lines_found < line_count:
+                    line = f.readline()
+                    if not line:
+                        return  # 行数不足，无需截断
+                    lines_found += 1
+                truncate_pos = f.tell()
+
+            with open(file_path, "r+b") as f:
+                f.truncate(truncate_pos)
+        except (FileNotFoundError, OSError):
+            pass
+
+    @staticmethod
+    def _remove_file(file_path: str) -> None:
+        """删除文件"""
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
     def write_doc(self, doc: Dict):
         """写入文档，自动处理分片"""
@@ -770,8 +896,6 @@ class MetricsExporter:
     @staticmethod
     def _mask_doc(value: Any) -> Any:
         """递归脱敏文档中的IP地址，隐藏前两个octet (如 192.168.1.1 -> *.*.1.1)"""
-        import re
-        
         if isinstance(value, str):
             # 匹配并替换IPv4地址
             ipv4_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
@@ -893,7 +1017,6 @@ class MetricsExporter:
             ],
             "_source": source_fields if source_fields else True,
         }
-        return query
 
     def build_alert_query(
         self,
@@ -952,7 +1075,7 @@ class MetricsExporter:
         index_pattern: str,
         query: Dict,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        max_docs: int = 100000,
+        max_docs: int = 0,
     ) -> tuple:
         """
         使用 scroll API 初始化搜索，返回第一批结果和 scroll_id
@@ -1074,6 +1197,7 @@ class MetricsExporter:
         scroll_id = None
         last_sort_values = None  # 用于恢复时继续查询
         resumed_from_checkpoint = False
+        effective_output_file = output_file  # 断点续传时从检查点覆盖
 
         # 尝试从检查点恢复
         if checkpoint:
@@ -1082,7 +1206,11 @@ class MetricsExporter:
                 resumed_from_checkpoint = True
                 total_exported = checkpoint_data.get("exported_count", 0)
                 last_sort_values = checkpoint_data.get("last_sort_values")
-                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录")
+                # 使用检查点记录的输出文件路径，确保续写到原文件
+                checkpoint_output_file = checkpoint_data.get("output_file")
+                if checkpoint_output_file:
+                    effective_output_file = checkpoint_output_file
+                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录，续写到 {os.path.basename(effective_output_file)}.jsonl")
 
                 # 使用 search_after 恢复查询
                 first_batch, scroll_id, total_count = self._resume_with_search_after(
@@ -1093,6 +1221,7 @@ class MetricsExporter:
                     print("    检查点恢复失败，从头开始导出")
                     resumed_from_checkpoint = False
                     total_exported = 0
+                    effective_output_file = output_file  # 重置为原始路径
                     first_batch, scroll_id, total_count = self.search_with_scroll(
                         index_pattern, query, batch_size, 0
                     )
@@ -1109,9 +1238,9 @@ class MetricsExporter:
 
         if not first_batch and not resumed_from_checkpoint:
             # 创建空文件
-            with JSONLinesWriter(f"{output_file}.jsonl"):
+            with JSONLinesWriter(f"{effective_output_file}.jsonl"):
                 pass
-            return 0, [f"{os.path.basename(output_file)}.jsonl"]
+            return 0, [f"{os.path.basename(effective_output_file)}.jsonl"]
 
         # 预取下一页，和当前批次写盘并行
         def _start_prefetch(
@@ -1122,15 +1251,12 @@ class MetricsExporter:
                 return None, None
             return executor.submit(self.scroll_next, current_scroll_id), current_scroll_id
 
-        # 使用分片写入器
-        with ShardedJSONLinesWriter(output_file, shard_size) as writer:
-            # 如果从检查点恢复，需要先读取已有文件的内容计数
-            if resumed_from_checkpoint and total_exported > 0:
-                # 检查点已记录 exported_count，writer 需要同步这个计数
-                # 通过读取已有文件来确定当前分片状态
-                existing_files = writer.get_file_paths()
-                # 简化处理：从检查点恢复时，writer 从新文件开始
-                # 已有数据会在最后合并处理
+        # 使用分片写入器（支持续写已有文件）
+        with ShardedJSONLinesWriter(
+            effective_output_file, shard_size,
+            resume=resumed_from_checkpoint,
+            resume_exported_count=total_exported if resumed_from_checkpoint else 0,
+        ) as writer:
 
             current_batch = first_batch
             with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
@@ -1147,7 +1273,7 @@ class MetricsExporter:
                     # 保存检查点（定期）
                     if checkpoint and checkpoint.should_save(total_exported):
                         checkpoint.save(
-                            output_file,
+                            effective_output_file,
                             total_exported,
                             last_sort_values,
                             scroll_id,
@@ -1177,7 +1303,7 @@ class MetricsExporter:
                             # 保存最终检查点，以便下次恢复
                             if checkpoint:
                                 checkpoint.save(
-                                    output_file,
+                                    effective_output_file,
                                     total_exported,
                                     last_sort_values,
                                     force=True,
@@ -1405,7 +1531,8 @@ class MetricsExporter:
 
         return valid_fields
 
-    def _get_nested_value(self, doc: Dict, field_path: str) -> Any:
+    @staticmethod
+    def _get_nested_value(doc: Dict, field_path: str) -> Any:
         """获取嵌套字段的值"""
         parts = field_path.split(".")
         value = doc
@@ -1772,9 +1899,17 @@ class MetricsExporter:
                         resumed = True
                         local_count = checkpoint_data.get("exported_count", 0)
                         worker_after_key = checkpoint_data.get("sampling_after_key")
-                        print(f"    [worker{worker_id}] 从检查点恢复: 已导出 {local_count:,} 条记录")
+                        # 使用检查点记录的输出文件路径，确保续写到原文件
+                        checkpoint_output_file = checkpoint_data.get("output_file")
+                        if checkpoint_output_file:
+                            worker_output = checkpoint_output_file
+                        print(f"    [worker{worker_id}] 从检查点恢复: 已导出 {local_count:,} 条记录，续写到 {os.path.basename(worker_output)}.jsonl")
 
-                with ShardedJSONLinesWriter(worker_output, shard_size) as writer:
+                with ShardedJSONLinesWriter(
+                    worker_output, shard_size,
+                    resume=resumed,
+                    resume_exported_count=local_count if resumed else 0,
+                ) as writer:
                     if not resumed:
                         current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
                     else:
@@ -1837,15 +1972,25 @@ class MetricsExporter:
 
         # 单线程路径：支持断点续传
         resumed_from_checkpoint = False
+        effective_output_file = output_file  # 断点续传时从检查点覆盖
+
         if checkpoint:
             checkpoint_data = checkpoint.load(query)
             if checkpoint_data:
                 resumed_from_checkpoint = True
                 total_exported = checkpoint_data.get("exported_count", 0)
                 after_key = checkpoint_data.get("sampling_after_key")
-                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录")
+                # 使用检查点记录的输出文件路径，确保续写到原文件
+                checkpoint_output_file = checkpoint_data.get("output_file")
+                if checkpoint_output_file:
+                    effective_output_file = checkpoint_output_file
+                print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录，续写到 {os.path.basename(effective_output_file)}.jsonl")
 
-        with ShardedJSONLinesWriter(output_file, shard_size) as writer:
+        with ShardedJSONLinesWriter(
+            effective_output_file, shard_size,
+            resume=resumed_from_checkpoint,
+            resume_exported_count=total_exported if resumed_from_checkpoint else 0,
+        ) as writer:
             if not resumed_from_checkpoint:
                 current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
             else:
@@ -1869,7 +2014,7 @@ class MetricsExporter:
                     # 保存检查点（定期）
                     if checkpoint and checkpoint.should_save(total_exported):
                         checkpoint.save(
-                            output_file,
+                            effective_output_file,
                             total_exported,
                             sampling_after_key=after_key,
                         )
@@ -2392,7 +2537,6 @@ class MetricsExporter:
 
         # 仅在未指定集群筛选时才提前获取集群列表（用于摘要展示）
         # 如果已指定 cluster_ids 或 cluster_id_filter，则跳过此步骤避免额外网络请求
-        clusters = []
         if not cluster_ids and not cluster_id_filter:
             progress_reporter.stage("\n正在获取有监控数据的集群列表...")
             clusters = self.get_available_clusters(time_range_hours, start_time, end_time, tz)
@@ -2534,9 +2678,7 @@ class MetricsExporter:
 
         # 解析集群筛选
         cluster_ids = None
-        cluster_filter_specified = False  # 标记用户是否指定了集群过滤
         if job.targets and job.targets.clusters:
-            cluster_filter_specified = True
             all_clusters = self.get_available_clusters(job.time_range_hours, job.start_time, job.end_time, job.timezone)
             cluster_ids = [
                 c['cluster_id'] for c in all_clusters
