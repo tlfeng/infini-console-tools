@@ -700,6 +700,7 @@ class ExportCheckpoint:
                 print(f"    检查点 metric_type 不匹配，忽略")
                 return None
 
+            self._last_save_count = checkpoint.get("exported_count", 0)
             return checkpoint
 
         except Exception as e:
@@ -1252,75 +1253,87 @@ class MetricsExporter:
             return executor.submit(self.scroll_next, current_scroll_id), current_scroll_id
 
         # 使用分片写入器（支持续写已有文件）
-        with ShardedJSONLinesWriter(
-            effective_output_file, shard_size,
-            resume=resumed_from_checkpoint,
-            resume_exported_count=total_exported if resumed_from_checkpoint else 0,
-        ) as writer:
+        try:
+            with ShardedJSONLinesWriter(
+                effective_output_file, shard_size,
+                resume=resumed_from_checkpoint,
+                resume_exported_count=total_exported if resumed_from_checkpoint else 0,
+            ) as writer:
 
-            current_batch = first_batch
-            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
-                next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
+                current_batch = first_batch
+                with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+                    next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
 
-                while current_batch:
-                    self._write_docs(writer, current_batch, slim_config, mask_ip)
-                    writer.flush()
-                    total_exported += len(current_batch)
+                    while current_batch:
+                        self._write_docs(writer, current_batch, slim_config, mask_ip)
+                        writer.flush()
+                        total_exported += len(current_batch)
 
-                    # 更新最后排序值（用于恢复）
-                    last_sort_values = current_batch[-1].get("sort")
+                        # 更新最后排序值（用于恢复）
+                        last_sort_values = current_batch[-1].get("sort")
 
-                    # 保存检查点（定期）
-                    if checkpoint and checkpoint.should_save(total_exported):
-                        checkpoint.save(
-                            effective_output_file,
-                            total_exported,
-                            last_sort_values,
-                            scroll_id,
-                        )
+                        # 保存检查点（定期）
+                        if checkpoint and checkpoint.should_save(total_exported):
+                            checkpoint.save(
+                                effective_output_file,
+                                total_exported,
+                                last_sort_values,
+                                scroll_id,
+                            )
 
-                    if progress_callback:
-                        progress_callback(total_exported, total_count)
+                        if progress_callback:
+                            progress_callback(total_exported, total_count)
 
-                    if not next_future:
-                        break
-
-                    scroll_result = next_future.result()
-
-                    # scroll context 过期，尝试恢复
-                    if scroll_result is None:
-                        print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
-                        if requested_scroll_id:
-                            self.clear_scroll(requested_scroll_id)
-
-                        # 使用 search_after 恢复查询
-                        current_batch, scroll_id, _ = self._resume_with_search_after(
-                            index_pattern, query, batch_size, last_sort_values
-                        )
-
-                        if current_batch is None:
-                            print("    恢复失败，停止导出")
-                            # 保存最终检查点，以便下次恢复
-                            if checkpoint:
-                                checkpoint.save(
-                                    effective_output_file,
-                                    total_exported,
-                                    last_sort_values,
-                                    force=True,
-                                )
+                        if not next_future:
                             break
 
-                        print(f"    恢复成功，继续导出...")
+                        scroll_result = next_future.result()
+
+                        # scroll context 过期，尝试恢复
+                        if scroll_result is None:
+                            print(f"\n    Scroll context 过期，正在从位置 {total_exported:,} 恢复...")
+                            if requested_scroll_id:
+                                self.clear_scroll(requested_scroll_id)
+
+                            # 使用 search_after 恢复查询
+                            current_batch, scroll_id, _ = self._resume_with_search_after(
+                                index_pattern, query, batch_size, last_sort_values
+                            )
+
+                            if current_batch is None:
+                                print("    恢复失败，停止导出")
+                                # 保存最终检查点，以便下次恢复
+                                if checkpoint:
+                                    checkpoint.save(
+                                        effective_output_file,
+                                        total_exported,
+                                        last_sort_values,
+                                        force=True,
+                                    )
+                                break
+
+                            print(f"    恢复成功，继续导出...")
+                            next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
+                            continue
+
+                        current_batch, next_scroll_id = scroll_result
+                        scroll_id = next_scroll_id or scroll_id
+
+                        if not current_batch:
+                            break
+
                         next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
-                        continue
-
-                    current_batch, next_scroll_id = scroll_result
-                    scroll_id = next_scroll_id or scroll_id
-
-                    if not current_batch:
-                        break
-
-                    next_future, requested_scroll_id = _start_prefetch(prefetch_executor, scroll_id)
+        except KeyboardInterrupt:
+            if checkpoint:
+                checkpoint.save(
+                    effective_output_file,
+                    total_exported,
+                    last_sort_values,
+                    scroll_id,
+                    force=True,
+                )
+            print(f"\n    导出被中断，已保存检查点（{total_exported:,} 条）")
+            raise
 
         # 清理 scroll
         if scroll_id:
@@ -1880,6 +1893,7 @@ class MetricsExporter:
                 )
                 local_count = 0
                 worker_output = f"{output_file}_worker{worker_id}"
+                worker_resume_after_key = None
 
                 # 每个 worker 有独立的检查点
                 worker_checkpoint = None
@@ -1899,54 +1913,67 @@ class MetricsExporter:
                         resumed = True
                         local_count = checkpoint_data.get("exported_count", 0)
                         worker_after_key = checkpoint_data.get("sampling_after_key")
+                        worker_resume_after_key = worker_after_key
                         # 使用检查点记录的输出文件路径，确保续写到原文件
                         checkpoint_output_file = checkpoint_data.get("output_file")
                         if checkpoint_output_file:
                             worker_output = checkpoint_output_file
                         print(f"    [worker{worker_id}] 从检查点恢复: 已导出 {local_count:,} 条记录，续写到 {os.path.basename(worker_output)}.jsonl")
 
-                with ShardedJSONLinesWriter(
-                    worker_output, shard_size,
-                    resume=resumed,
-                    resume_exported_count=local_count if resumed else 0,
-                ) as writer:
-                    if not resumed:
-                        current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
-                    else:
-                        current_docs, next_after = _fetch_sampling_page(worker_query, worker_after_key, worker_aggregator)
+                try:
+                    with ShardedJSONLinesWriter(
+                        worker_output, shard_size,
+                        resume=resumed,
+                        resume_exported_count=local_count if resumed else 0,
+                    ) as writer:
+                        if not resumed:
+                            current_docs, next_after = _fetch_sampling_page(worker_query, None, worker_aggregator)
+                        else:
+                            current_docs, next_after = _fetch_sampling_page(worker_query, worker_after_key, worker_aggregator)
 
-                    with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
-                        next_future = (
-                            prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, worker_aggregator)
-                            if next_after
-                            else None
-                        )
-
-                        while current_docs:
-                            for doc in current_docs:
-                                writer.write_doc(doc)
-                                local_count += 1
-
-                            writer.flush()
-                            _report_worker_progress(worker_id, local_count)
-
-                            # 保存检查点（定期）
-                            if worker_checkpoint and worker_checkpoint.should_save(local_count):
-                                worker_checkpoint.save(
-                                    worker_output,
-                                    local_count,
-                                    sampling_after_key=next_after,
-                                )
-
-                            if not next_future:
-                                break
-
-                            current_docs, next_after = next_future.result()
+                        with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                             next_future = (
                                 prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, worker_aggregator)
                                 if next_after
                                 else None
                             )
+
+                            while current_docs:
+                                for doc in current_docs:
+                                    writer.write_doc(doc)
+                                    local_count += 1
+
+                                writer.flush()
+                                _report_worker_progress(worker_id, local_count)
+
+                                # 保存检查点（定期）
+                                if worker_checkpoint and worker_checkpoint.should_save(local_count):
+                                    worker_checkpoint.save(
+                                        worker_output,
+                                        local_count,
+                                        sampling_after_key=next_after,
+                                    )
+
+                                if not next_future:
+                                    break
+
+                                current_docs, next_after = next_future.result()
+                                worker_resume_after_key = next_after
+                                next_future = (
+                                    prefetch_executor.submit(_fetch_sampling_page, worker_query, next_after, worker_aggregator)
+                                    if next_after
+                                    else None
+                                )
+                except KeyboardInterrupt:
+                    if worker_checkpoint:
+                        worker_checkpoint.save(
+                            worker_output,
+                            local_count,
+                            sampling_after_key=worker_resume_after_key,
+                            force=True,
+                        )
+                    print(f"\n    [worker{worker_id}] 导出被中断，已保存检查点（{local_count:,} 条）")
+                    raise
 
                 # 清理检查点（导出完成）
                 if worker_checkpoint:
@@ -1986,51 +2013,79 @@ class MetricsExporter:
                     effective_output_file = checkpoint_output_file
                 print(f"    从检查点恢复: 已导出 {total_exported:,} 条记录，续写到 {os.path.basename(effective_output_file)}.jsonl")
 
-        with ShardedJSONLinesWriter(
-            effective_output_file, shard_size,
-            resume=resumed_from_checkpoint,
-            resume_exported_count=total_exported if resumed_from_checkpoint else 0,
-        ) as writer:
-            if not resumed_from_checkpoint:
-                current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
-            else:
-                # 从检查点恢复，使用保存的 after_key 继续查询
-                current_docs, after_key = _fetch_sampling_page(query, after_key, field_aggregator)
+        # 用于 KI 处理：记录当前页开始时的状态，确保中断后能正确 re-fetch 当前页
+        # page_start_key   = 用于拉取当前 current_docs 的 after_key（resume 时重拉整页）
+        # page_start_exported = 当前页开始前的已导出数（truncate 到此处再重拉当前页）
+        if not resumed_from_checkpoint:
+            page_start_key: Optional[Dict] = None
+        else:
+            page_start_key = after_key  # checkpoint 保存的 after_key 即为初始拉取 key
+        page_start_exported = total_exported
 
-            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
-                next_future = (
-                    prefetch_executor.submit(_fetch_sampling_page, query, after_key, field_aggregator)
-                    if after_key
-                    else None
-                )
+        try:
+            with ShardedJSONLinesWriter(
+                effective_output_file, shard_size,
+                resume=resumed_from_checkpoint,
+                resume_exported_count=total_exported if resumed_from_checkpoint else 0,
+            ) as writer:
+                if not resumed_from_checkpoint:
+                    current_docs, after_key = _fetch_sampling_page(query, None, field_aggregator)
+                else:
+                    # 从检查点恢复，使用保存的 after_key 继续查询
+                    current_docs, after_key = _fetch_sampling_page(query, after_key, field_aggregator)
 
-                while current_docs:
-                    for doc in current_docs:
-                        writer.write_doc(doc)
-                        total_exported += 1
-
-                    writer.flush()
-
-                    # 保存检查点（定期）
-                    if checkpoint and checkpoint.should_save(total_exported):
-                        checkpoint.save(
-                            effective_output_file,
-                            total_exported,
-                            sampling_after_key=after_key,
-                        )
-
-                    if progress_callback:
-                        progress_callback(total_exported, 0)
-
-                    if not next_future:
-                        break
-
-                    current_docs, after_key = next_future.result()
+                with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
                     next_future = (
                         prefetch_executor.submit(_fetch_sampling_page, query, after_key, field_aggregator)
                         if after_key
                         else None
                     )
+
+                    while current_docs:
+                        for doc in current_docs:
+                            writer.write_doc(doc)
+                        total_exported += len(current_docs)  # 整批计数，避免 KI 时计数不一致
+
+                        writer.flush()
+
+                        # 保存检查点（定期）；after_key 此时是下一页的 key，正好用于正常续传
+                        if checkpoint and checkpoint.should_save(total_exported):
+                            checkpoint.save(
+                                effective_output_file,
+                                total_exported,
+                                sampling_after_key=after_key,
+                            )
+
+                        if progress_callback:
+                            progress_callback(total_exported, 0)
+
+                        if not next_future:
+                            break
+
+                        # 更新 KI 状态：先记录新的 page_start_exported 再更新 key
+                        # 两次赋值之间若触发 KI，会用旧 key 重拉已完成页（少量重复），
+                        # 好于用新 key 跳过未完成页（数据丢失）
+                        page_start_exported = total_exported
+                        page_start_key = after_key  # 即将用于拉取下一页的 key
+
+                        current_docs, after_key = next_future.result()
+                        next_future = (
+                            prefetch_executor.submit(_fetch_sampling_page, query, after_key, field_aggregator)
+                            if after_key
+                            else None
+                        )
+        except KeyboardInterrupt:
+            if checkpoint:
+                # 用 page_start_exported / page_start_key 而非当前值：
+                # 确保 resume 时截断到当前页起点并重拉整页，避免跳过部分数据
+                checkpoint.save(
+                    effective_output_file,
+                    page_start_exported,
+                    sampling_after_key=page_start_key,
+                    force=True,
+                )
+            print(f"\n    导出被中断，已保存检查点（{page_start_exported:,} 条，将从当前页重新拉取）")
+            raise
 
         # 清理检查点（导出完成）
         if checkpoint:
@@ -3161,4 +3216,8 @@ def _run_cli_mode(exporter: 'MetricsExporter', args) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已收到中断信号，程序退出")
+        sys.exit(130)
