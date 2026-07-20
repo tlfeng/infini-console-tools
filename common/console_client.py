@@ -8,14 +8,17 @@ INFINI Console API 客户端公共模块
 - 集群列表获取
 - _proxy API 调用
 - 索引信息查询
+- 便捷的认证辅助函数
 """
 
+import getpass
 import json
 import ssl
+import sys
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 
 class ConsoleAuthError(Exception):
@@ -169,22 +172,15 @@ class ConsoleClient:
         """获取集群索引列表"""
         try:
             # 使用 _proxy 直接查询 ES _cat/indices API 获取完整信息
+            # proxy_request 已经帮我们解析好了 response_body
             result = self.proxy_request(
                 cluster_id, "GET",
                 "/_cat/indices?format=json&h=index,health,status,shards,pri,rep,docs.count,docs.deleted,store.size,pri.store.size"
             )
-            response_body = result.get("response_body") if isinstance(result, dict) else result
-            if isinstance(response_body, str):
-                import json
-                try:
-                    response_body = json.loads(response_body)
-                except json.JSONDecodeError:
-                    response_body = None
-            
-            if isinstance(response_body, list):
-                return {item["index"]: item for item in response_body if "index" in item}
-            elif isinstance(response_body, dict):
-                return response_body
+            if isinstance(result, list):
+                return {item["index"]: item for item in result if "index" in item}
+            elif isinstance(result, dict):
+                return result
             return {}
         except Exception:
             # 回退到 Console 的 indices 接口
@@ -207,7 +203,7 @@ class ConsoleClient:
     ) -> Dict[str, Any]:
         """通过 _proxy API 发送请求到 ES"""
         encoded_path = urllib.parse.quote(path, safe="/-_.:?&=")
-        url = f"{self.base_url}/elasticsearch/{cluster_id}/_proxy?method={method.upper()}&path={encoded_path}"
+        endpoint = f"/elasticsearch/{cluster_id}/_proxy?method={method.upper()}&path={encoded_path}"
 
         data = None
         if body is not None:
@@ -216,30 +212,19 @@ class ConsoleClient:
             else:
                 data = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        # _make_request 会自动处理 Authorization header 和 HTTP 错误
+        result = self._make_request(endpoint, "POST", data=data)
 
-        try:
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-            with urllib.request.urlopen(
-                req, context=self.ssl_context, timeout=self.timeout
-            ) as response:
-                result = json.loads(response.read().decode("utf-8"))
-
-                # 解析 response_body
-                if isinstance(result, dict) and "response_body" in result:
-                    response_body = result["response_body"]
-                    if isinstance(response_body, str):
-                        try:
-                            response_body = json.loads(response_body)
-                        except json.JSONDecodeError:
-                            pass
-                    return response_body
-                return result
-
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8")
-            raise ConsoleAPIError(f"HTTP {e.code}: {error_body}")
+        # 解析 response_body
+        if isinstance(result, dict) and "response_body" in result:
+            response_body = result["response_body"]
+            if isinstance(response_body, str):
+                try:
+                    response_body = json.loads(response_body)
+                except json.JSONDecodeError:
+                    pass
+            return response_body
+        return result
 
     def get_index_mapping(self, cluster_id: str, index_name: str) -> Optional[Dict]:
         """获取索引 mapping"""
@@ -360,3 +345,73 @@ class ConsoleClient:
             parts.append(f"{seconds}s")
 
         return " ".join(parts[:2])
+
+
+def create_authenticated_client(
+    console_url: str,
+    username: str,
+    password: str,
+    timeout: int = 60,
+    verify_ssl: bool = True,
+    prompt_password: bool = True,
+    verbose: bool = True,
+) -> ConsoleClient:
+    """
+    创建 ConsoleClient 并自动完成登录的便捷辅助函数。
+
+    统一处理：
+    - 交互式密码输入（当提供了用户名但没密码时自动提示）
+    - 登录错误处理
+    - 特殊字符密码提示
+
+    Args:
+        console_url: Console 地址
+        username: 用户名
+        password: 密码（如果为空且 prompt_password=True，会交互式询问）
+        timeout: 请求超时秒数
+        verify_ssl: 是否验证 SSL 证书
+        prompt_password: 用户名存在但密码为空时，是否交互式提示输入密码
+        verbose: 是否打印进度信息
+
+    Returns:
+        已登录的 ConsoleClient 实例
+
+    Raises:
+        ConsoleAuthError: 登录失败
+    """
+    # 交互式密码输入
+    if username and not password and prompt_password:
+        password = getpass.getpass(f"请输入用户 {username} 的密码: ")
+
+    client = ConsoleClient(
+        base_url=console_url,
+        username=username,
+        password=password,
+        timeout=timeout,
+        verify_ssl=verify_ssl,
+    )
+
+    if not username or not password:
+        if verbose:
+            print("警告: 未提供用户名/密码，将以匿名方式请求（可能返回 403 Forbidden）", file=sys.stderr)
+        return client
+
+    # 执行登录
+    try:
+        if verbose:
+            print(f"正在登录 {console_url} ...", file=sys.stderr)
+        if not client.login():
+            error_msg = "登录失败：用户名或密码错误"
+            if '!' in password or '$' in password or '`' in password or '\\' in password:
+                error_msg += "\n提示: 如果密码包含特殊字符（! $ ` \\ 等），请在命令行用单引号包裹密码:"
+                error_msg += "\n      -p 'your!password@123'"
+                error_msg += "\n  或者不要在命令行传密码，使用交互式输入。"
+            raise ConsoleAuthError(error_msg)
+        if verbose:
+            print("登录成功", file=sys.stderr)
+    except ConsoleAuthError:
+        raise
+    except Exception as e:
+        raise ConsoleAuthError(f"登录失败: {str(e)}") from e
+
+    return client

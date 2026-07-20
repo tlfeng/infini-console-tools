@@ -37,7 +37,7 @@ from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.config import add_common_args, get_config_value, load_and_merge_config
-from common.console_client import ConsoleAPIError, ConsoleAuthError, ConsoleClient
+from common.console_client import ConsoleAPIError, ConsoleAuthError, ConsoleClient, create_authenticated_client
 
 
 TASK_KINDS = [
@@ -644,6 +644,12 @@ Examples:
   # 直接指定 Console
   python data_tasks_report.py -c https://localhost:9000 -u admin -p password --insecure
 
+  # 密码包含特殊字符（如 !）时，必须用单引号括起来:
+  python data_tasks_report.py -c https://localhost:9000 -u admin -p 'your!password@123' --insecure
+
+  # 不指定密码，交互式输入（避免命令行记录密码）
+  python data_tasks_report.py -c https://localhost:9000 -u admin --insecure
+
   # 只导出数据迁移任务，输出 JSON
   python data_tasks_report.py --config ../config.json --kind migration --format json
 
@@ -695,15 +701,18 @@ def main() -> int:
     timeout = int(get_config_value(str(args.timeout), str(config.get("timeout", 60)), "CONSOLE_TIMEOUT", "60"))
     insecure = bool(args.insecure or config.get("insecure", False))
 
-    client = ConsoleClient(console_url, username, password, timeout=timeout, verify_ssl=not insecure)
-
-    if username and password:
-        try:
-            if not client.login():
-                print(f"警告: 登录失败，将以匿名方式请求 {console_url}", file=sys.stderr)
-        except ConsoleAuthError as e:
-            print(f"登录失败: {e}", file=sys.stderr)
-            return 2
+    try:
+        client = create_authenticated_client(
+            console_url=console_url,
+            username=username,
+            password=password,
+            timeout=timeout,
+            verify_ssl=not insecure,
+            verbose=True,
+        )
+    except ConsoleAuthError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 2
 
     kinds_to_fetch = TASK_KINDS
     if args.kind != "all":
