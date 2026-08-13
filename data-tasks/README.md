@@ -12,8 +12,22 @@
 - `GET /comparison/data/_search`    — 比对任务列表
 - `GET /migration/data/{id}/info`   — 迁移单任务详情（`config_string.indices[]` 会被填 `percent` / `status` / `exported_percent`）
 - `GET /comparison/data/{id}/info`  — 比对单任务详情（`indices[]` 会带 `scroll_percent` / `total_scroll_docs` / `total_diff_docs` / `status`）
+- `GET /migration/data/{id}/info/{index}` — 每索引详情（主任务 `start_time_in_millis` 为 0 时聚合子任务开始/完成时间）
+- `GET /comparison/data/{id}/info/{index}`
 
 不需要每索引进度时可以加 `--no-info` 跳过详情调用，只用列表接口，速度更快。
+
+## 时间与耗时
+
+- `start_time`（开始时间）取自任务记录的 `start_time_in_millis`，时区与 `created` 一致。
+- 主任务自身的 `start_time_in_millis` 经常为 0（该字段要等调度器真正开跑才写入）。
+  此时脚本会按索引逐个调用每索引详情接口，对子任务时间做聚合
+  （`start_time` 取各索引子任务开始时间的最小值，`completed_time` 取最大值），
+  与 Console UI 口径一致。
+- `duration` = 完成时间 − 开始时间（进行中的任务用当前时间 − 开始时间），
+  格式与 UI 一致（`HH:MM:SS`，超过 24 小时为 `1d HH:MM:SS`，不足 1 分钟为 `12.34 s`）。
+- 拿不到开始时间（如从未运行过的任务）时，`start_time` 与 `duration` 留空，
+  不再用“创建时间 → 完成时间”兜底。
 
 ## 输出格式
 
@@ -37,7 +51,7 @@ python3 data_tasks_report.py -c https://localhost:9000 -u admin -p 'Qwer@12345' 
 # 只导出数据迁移任务，输出 JSON
 python3 data_tasks_report.py --config ../config.json --kind migration --format json
 
-# 跳过 /info 详情（快很多，但没每索引进度）
+# 跳过 /info 详情（快很多，但没每索引进度，且不做子任务时间聚合）
 python3 data_tasks_report.py --config ../config.json --no-info
 
 # 输出到指定目录 / 指定文件前缀
@@ -51,7 +65,7 @@ python3 data_tasks_report.py --config ../config.json -o ./exports/tasks   # 会�
 | --------------- | -------------------------------------------------------- |
 | `--kind`        | `migration` / `comparison` / `all`（默认 all）           |
 | `--format`      | `json` / `csv` / `both`（默认 both）                     |
-| `--no-info`     | 跳过 `/info` 详情调用（不再抓每索引的实时进度）           |
+| `--no-info`     | 跳过 `/info` 与每索引详情调用（不再抓每索引的实时进度，也不做子任务时间聚合） |
 | `-o/--output`   | 输出目录或文件名前缀，默认 `./data_tasks_output`         |
 | `--page-size`   | 每次翻页拉取的任务数，默认 200                           |
 | `--config`      | JSON 配置文件路径（`consoleUrl` / `auth` / `insecure`）  |
@@ -71,9 +85,9 @@ python3 data_tasks_report.py --config ../config.json -o ./exports/tasks   # 会�
 | `status`                    | 任务状态（init / ready / running / complete / stopped / pause / error 等） |
 | `task_lifecycle`            | 生命周期状态（not_started / running / complete / ...） |
 | `created`                   | 创建时间                                 |
-| `start_time`                | 开始运行时间（UTC ISO）                  |
+| `start_time`                | 开始运行时间（ISO，与 created 同时区；主任务 start_time_in_millis 为 0 时从子任务聚合） |
 | `completed_time`            | 完成时间                                 |
-| `duration` / `duration_ms`  | 用时（可读 + 毫秒）                      |
+| `duration` / `duration_ms`  | 用时（可读 `HH:MM:SS` + 毫秒；= 完成时间 − 开始时间）|
 | `creator`                   | 创建人                                   |
 | `source_cluster` / `target_cluster` (+ `_id` / `_distribution`) | 源/目标集群 |
 | `task_indices_count`        | 涉及索引数                               |

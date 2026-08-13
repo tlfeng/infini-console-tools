@@ -13,6 +13,8 @@
   GET /comparison/data/_search
   GET /migration/data/{id}/info           # 每个任务的详情（含每个索引的进度和状态）
   GET /comparison/data/{id}/info
+  GET /migration/data/{id}/info/{index}   # 每索引详情（main 任务 start_time_in_millis 为 0 时，
+  GET /comparison/data/{id}/info/{index}  #  用于聚合子任务开始/完成时间）
 
 信息来源：
   - search 响应本身已经被 populateMajorTaskInfo 填了 target_total_docs /
@@ -20,6 +22,12 @@
   - /info 响应里 config_string 的 indices[] 会被填上 percent / status /
     exported_percent (迁移) 或 scroll_percent / total_scroll_docs /
     total_diff_docs (比对)
+
+时间/耗时口径：
+  - start_time_in_millis 为主任务真正开始运行的时间（调度器写入，常为 0）
+  - 为 0 时，由每索引详情的 start_time（子任务开始时间的最小值）兜底
+  - duration = 完成时间 − 开始时间（进行中任务用当前时间 − 开始时间），
+    不再用“创建时间 → 完成时间”兜底
 
 输出：
   - JSON: 完整嵌套结构，字段最全
@@ -31,8 +39,9 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -41,9 +50,9 @@ from common.console_client import ConsoleAPIError, ConsoleAuthError, ConsoleClie
 
 
 TASK_KINDS = [
-    # (list_endpoint, info_endpoint_template, 中文名, kind)
-    ("/migration/data/_search", "/migration/data/{id}/info", "数据迁移", "migration"),
-    ("/comparison/data/_search", "/comparison/data/{id}/info", "数据比对", "comparison"),
+    # (list_endpoint, info_endpoint_template, 中文名, kind, per_index_endpoint_template)
+    ("/migration/data/_search", "/migration/data/{id}/info", "数据迁移", "migration", "/migration/data/{id}/info/{index}"),
+    ("/comparison/data/_search", "/comparison/data/{id}/info", "数据比对", "comparison", "/comparison/data/{id}/info/{index}"),
 ]
 
 
@@ -69,23 +78,27 @@ def format_bytes(n: Optional[int]) -> str:
 
 
 def format_duration_ms(ms: Optional[int]) -> str:
-    """毫秒 → 可读时长（1d 2h 3m 4s）"""
+    """
+    毫秒 → 可读时长，对齐 UI 格式：
+      < 1s    → "800 ms"
+      < 1m    → "12.34 s" (≥10s 保留1位小数，否则2位)
+      ≥ 1m    → "HH:MM:SS"
+      ≥ 24h   → "1d 02:03:04"
+    """
     if ms is None or ms <= 0:
         return ""
+    if ms < 1000:
+        return f"{ms} ms"
+    if ms < 60000:
+        secs = ms / 1000.0
+        return f"{secs:.1f} s" if secs >= 10 else f"{secs:.2f} s"
+
     total_seconds = int(ms) // 1000
     days, rem = divmod(total_seconds, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, seconds = divmod(rem, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}m")
-    if seconds or not parts:
-        parts.append(f"{seconds}s")
-    return " ".join(parts)
+    hhmmss = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}d {hhmmss}" if days else hhmmss
 
 
 def parse_iso_to_ms(s: Optional[str]) -> Optional[int]:
@@ -100,6 +113,41 @@ def parse_iso_to_ms(s: Optional[str]) -> Optional[int]:
         return int(datetime.fromisoformat(clean).timestamp() * 1000)
     except Exception:
         return None
+
+
+def _tz_offset_minutes_from_iso(s: str) -> Optional[int]:
+    """从 ISO 时间串提取时区偏移（分钟），如 +08:00 → 480，-05:30 → -330"""
+    try:
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        offset = dt.utcoffset()
+        return int(offset.total_seconds() // 60) if offset is not None else None
+    except Exception:
+        return None
+
+
+def epoch_ms_to_iso(ms: int, reference_iso: Optional[str] = None) -> str:
+    """
+    将 epoch 毫秒转为 ISO 字符串。
+    时区优先沿用 reference_iso 的偏移（如 +08:00），取不到则用本机时区。
+    """
+    if ms <= 0:
+        return ""
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        # 尝试从 reference_iso 提取时区偏移
+        tz_offset_minutes = _tz_offset_minutes_from_iso(reference_iso) if reference_iso else None
+        if tz_offset_minutes is not None:
+            tz = timezone(timedelta(minutes=tz_offset_minutes))
+        else:
+            tz = datetime.now().astimezone().tzinfo
+
+        dt = datetime.fromtimestamp(ms / 1000, tz=tz)
+        return dt.isoformat()
+    except Exception:
+        return ""
 
 
 def safe_int(v: Any) -> Optional[int]:
@@ -167,6 +215,106 @@ def fetch_task_info(
         # 权限或不存在时静默降级到 search 的数据
         print(f"warn: fetch {path} failed: {e}", file=sys.stderr)
         return None
+
+
+def fetch_index_task_info(
+    client: ConsoleClient, endpoint_tpl: str, task_id: str, unique_index_name: str
+) -> Optional[Dict[str, Any]]:
+    """
+    获取单个索引的 per-index 详情（用于聚合子任务时间）。
+    端点返回 start_time/completed_time/duration 均为 epoch 毫秒。
+    """
+    path = endpoint_tpl.format(id=task_id, index=unique_index_name)
+    try:
+        # 带 progress_size=1&history_size=1 以减小响应体，不影响聚合值
+        query = urlencode({"progress_size": 1, "history_size": 1})
+        info = client._make_request(f"{path}?{query}", "GET")
+        if isinstance(info, dict) and info.get("found") is False:
+            return None
+        return info if isinstance(info, dict) else None
+    except ConsoleAPIError as e:
+        # 静默降级
+        print(f"warn: fetch per-index info {path} failed: {e}", file=sys.stderr)
+        return None
+
+
+def resolve_child_task_times(
+    client: ConsoleClient, per_index_tpl: str, task_id: str, indices: List[Dict[str, Any]]
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    通过 per-index 端点聚合子任务时间，返回 (start_ms, completed_ms)。
+    若无数据则返回 (None, None)。
+    min(start) 按后端 calcMajorTaskInfo 口径：首个值播种，只替换更小的非零值。
+    """
+    if not indices:
+        return None, None
+
+    all_start = []  # 收集所有索引的 start_time（epoch ms）
+    all_completed = []  # 收集所有索引的 completed_time（epoch ms）
+
+    for idx in indices:
+        source_index = idx.get("source_index", "")
+        doc_type = idx.get("doc_type", "")
+        if not source_index:
+            continue
+        # 构造 unique_index_name = "{source_index}:{doc_type}"
+        unique_index_name = f"{source_index}:{doc_type}"
+
+        per_index_info = fetch_index_task_info(client, per_index_tpl, task_id, unique_index_name)
+        if not per_index_info:
+            continue
+
+        # per-index 返回的 start_time/completed_time/duration 均为 epoch 毫秒
+        start_ms = safe_int(per_index_info.get("start_time"))
+        completed_ms = safe_int(per_index_info.get("completed_time"))
+
+        if start_ms and start_ms > 0:
+            all_start.append(start_ms)
+        if completed_ms and completed_ms > 0:
+            all_completed.append(completed_ms)
+
+    if not all_start:
+        return None, None
+
+    # 与后端 calcMajorTaskInfo 口径一致：开始时间取各索引的最小值
+    agg_start = min(all_start)
+    agg_completed = max(all_completed) if all_completed else None
+    return agg_start, agg_completed
+
+
+def apply_child_task_times_fallback(
+    client: ConsoleClient,
+    per_index_tpl: Optional[str],
+    task_id: str,
+    task_detail: Dict[str, Any],
+) -> None:
+    """
+    子任务兜底：当主任务 start_time_in_millis 为 0 时，通过 per-index 端点
+    从子任务聚合开始/完成时间，就地回填 task_detail 的
+    start_time_in_millis / start_time / completed_time / duration。
+    """
+    if task_detail.get("start_time_in_millis") != 0 or not per_index_tpl:
+        return
+    child_start_ms, child_completed_ms = resolve_child_task_times(
+        client, per_index_tpl, task_id, task_detail.get("indices", [])
+    )
+    if child_start_ms is None:
+        return
+    task_detail["start_time_in_millis"] = child_start_ms
+    if child_completed_ms is not None:
+        task_detail["completed_time"] = epoch_ms_to_iso(
+            child_completed_ms, task_detail.get("created")
+        )
+    # 复用同一套时间/耗时计算，保证口径一致
+    start_time_iso, duration_ms = compute_task_times(
+        child_start_ms,
+        child_completed_ms,
+        task_detail.get("status") or "",
+        task_detail.get("created"),
+    )
+    task_detail["start_time"] = start_time_iso
+    task_detail["duration_ms"] = duration_ms
+    task_detail["duration"] = format_duration_ms(duration_ms)
 
 
 # ------------------------- 详情提取 -------------------------
@@ -264,6 +412,30 @@ def _index_entry(idx: Dict[str, Any], kind: str) -> Dict[str, Any]:
     return entry
 
 
+def compute_task_times(
+    start_ms: int,
+    completed_ms: Optional[int],
+    status: str,
+    created: Optional[str],
+) -> Tuple[str, Optional[int]]:
+    """
+    根据开始/完成时间计算 (start_time_iso, duration_ms)：
+      - start + completed → completed - start
+      - start 且任务仍在运行 (running/ready) → now - start
+      - 无 start → start_time 为空串，duration 为 None
+    不再用 created→completed 兜底（与 UI 口径一致）。
+    """
+    start_time_iso = epoch_ms_to_iso(start_ms, created) if start_ms > 0 else ""
+
+    duration_ms: Optional[int] = None
+    if start_ms > 0 and completed_ms:
+        duration_ms = max(0, completed_ms - start_ms)
+    elif start_ms > 0 and status in ("running", "ready"):
+        # 仍在运行：用当前时间 - start
+        duration_ms = max(0, int(time.time() * 1000) - start_ms)
+    return start_time_iso, duration_ms
+
+
 def build_task_detail(
     hit: Dict[str, Any], info: Optional[Dict[str, Any]], kind: str, kind_label: str
 ) -> Dict[str, Any]:
@@ -288,17 +460,10 @@ def build_task_detail(
     start_ms = safe_int(source.get("start_time_in_millis")) or 0
     completed_time = source.get("completed_time")  # ISO 或 None
     completed_ms = parse_iso_to_ms(completed_time) if completed_time else None
-    created_ms = parse_iso_to_ms(created)
-    updated_ms = parse_iso_to_ms(updated)
 
-    duration_ms: Optional[int] = None
-    if start_ms > 0 and completed_ms:
-        duration_ms = max(0, completed_ms - start_ms)
-    elif start_ms > 0 and updated_ms and source.get("status") in ("running", "ready"):
-        duration_ms = max(0, updated_ms - start_ms)
-    elif created_ms and completed_ms:
-        # 兜底：没有 start，用 created → completed
-        duration_ms = max(0, completed_ms - created_ms)
+    start_time_iso, duration_ms = compute_task_times(
+        start_ms, completed_ms, source.get("status") or "", created
+    )
 
     # ---- 索引 ----
     indices_cfg = config.get("indices") if isinstance(config.get("indices"), list) else []
@@ -367,6 +532,7 @@ def build_task_detail(
         "created": created,
         "updated": updated,
         "start_time_in_millis": start_ms,
+        "start_time": start_time_iso,  # 新增：人类可读的开始时间（ISO）
         "completed_time": completed_time,
         "duration_ms": duration_ms,
         "duration": format_duration_ms(duration_ms),
@@ -503,15 +669,6 @@ def write_csv(tasks: List[Dict[str, Any]], out_path: Path) -> None:
             bulk = tuning.get("bulk") or {}
             nodes = exec_.get("nodes") or []
             runtime_group = exec_.get("runtime_group") or {}
-            start_ms = t.get("start_time_in_millis") or 0
-            from datetime import datetime, timezone
-
-            start_str = ""
-            if start_ms > 0:
-                try:
-                    start_str = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
-                except Exception:
-                    start_str = str(start_ms)
 
             base = {
                 "kind": t["kind_label"],
@@ -520,7 +677,7 @@ def write_csv(tasks: List[Dict[str, Any]], out_path: Path) -> None:
                 "status": t["status"],
                 "task_lifecycle": t.get("task_lifecycle") or "",
                 "created": t.get("created") or "",
-                "start_time": start_str,
+                "start_time": t.get("start_time") or "",  # 直接使用已解析的 start_time（ISO）
                 "completed_time": t.get("completed_time") or "",
                 "duration": t.get("duration") or "",
                 "duration_ms": t.get("duration_ms") if t.get("duration_ms") is not None else "",
@@ -719,7 +876,7 @@ def main() -> int:
         kinds_to_fetch = [k for k in TASK_KINDS if k[3] == args.kind]
 
     all_tasks: List[Dict[str, Any]] = []
-    for list_endpoint, info_tpl, label, kind in kinds_to_fetch:
+    for list_endpoint, info_tpl, label, kind, per_index_tpl in kinds_to_fetch:
         print(f"正在获取 {label} 任务列表 ({list_endpoint}) ...", file=sys.stderr)
         try:
             hits = fetch_tasks(client, list_endpoint, page_size=args.page_size)
@@ -733,7 +890,13 @@ def main() -> int:
             info = None
             if not args.no_info and task_id:
                 info = fetch_task_info(client, info_tpl, task_id)
-            all_tasks.append(build_task_detail(hit, info, kind, label))
+            task_detail = build_task_detail(hit, info, kind, label)
+
+            # 子任务兜底：当主任务 start_time_in_millis 为 0 时，从子任务聚合
+            if not args.no_info:
+                apply_child_task_times_fallback(client, per_index_tpl, task_id, task_detail)
+
+            all_tasks.append(task_detail)
             if i % 20 == 0:
                 print(f"    ... {i}/{len(hits)}", file=sys.stderr)
 

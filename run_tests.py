@@ -13,6 +13,7 @@
   python run_tests.py sampler      # 只运行 index_sampler 测试
   python run_tests.py cluster      # 只运行 cluster_report 测试
   python run_tests.py query        # 只运行 query_report 测试
+  python run_tests.py datatasks    # 只运行 data_tasks_report 测试
 """
 
 import sys
@@ -30,6 +31,7 @@ from tests import (
     test_index_sampler,
     test_cluster_report,
     test_query_report,
+    test_data_tasks_report,
 )
 
 
@@ -47,6 +49,7 @@ def run_all_tests(verbosity=1):
     suite.addTests(loader.loadTestsFromModule(test_index_sampler))
     suite.addTests(loader.loadTestsFromModule(test_cluster_report))
     suite.addTests(loader.loadTestsFromModule(test_query_report))
+    suite.addTests(loader.loadTestsFromModule(test_data_tasks_report))
     
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -66,6 +69,7 @@ def run_specific_test(test_name, verbosity=1):
         "sampler": test_index_sampler,
         "cluster": test_cluster_report,
         "query": test_query_report,
+        "datatasks": test_data_tasks_report,
     }
     
     if test_name in test_map:
