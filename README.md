@@ -12,6 +12,7 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 | **query-report** | 查询报告工具 - 执行查询并生成 Markdown 报告 | `query-report/` |
 | **test-runner** | 测试运行工具 - 查询性能测试和对比 | `test-runner/` |
 | **hot-threads** | Hot Threads 采集工具 - 定时抓取 ES hot threads 并写入 JSONL | `hot-threads/` |
+| **cluster-usage-profile** | 集群使用画像工具 - 采集单个集群的使用情况与使用场景 | `cluster-usage-profile/` |
 
 ## 快速开始
 
@@ -58,6 +59,10 @@ python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p
 # Hot Threads 稳定运行 1 小时（推荐）
 python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p password \
   --cluster-id xxx --poll-interval 10 --duration-minutes 60 --retries 2 --retry-delay 1
+
+# 集群使用画像（按集群名，两轮读写采样默认间隔 60s）
+python cluster-usage-profile/cluster_usage_profile.py -c http://localhost:9000 -u admin -p password \
+  --cluster-name my-cluster
 ```
 
 ## 统一配置方式
@@ -233,6 +238,47 @@ python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p
 ```
 
 更多说明见 `hot-threads/README.md`。
+
+### Cluster Usage Profile (集群使用画像工具)
+
+通过 Console `_proxy` 接口采集**单个** Elasticsearch 集群的使用情况与使用场景画像，适用于只能通过 Console 访问集群的场景。兼容 6.8.x / 7.10.x（列缺失自动降级，ILM/_nodes/usage 不可用时跳过）。
+
+**功能：**
+- 集群概览：版本、健康、磁盘水位配置、pending tasks
+- 节点画像：角色分布（data/master/ingest/coordinating）、Heap/CPU/磁盘水位、热点节点
+- 分片画像：状态与大小分布、最大分片、碎片分片占比、节点分片均衡度
+- 索引画像：按命名分组（剥离日期后缀）得到业务域/时间序列占比、别名、closed 归档
+- 读写热度：两轮 `_stats` 采样计算每索引查询/写入速率与活跃度分类
+- API 画像：`_nodes/usage` REST 请求计数，区分 Bulk 写入/Search 检索/Get 点查
+- 治理画像：模板、ILM、快照仓库、slowlog、只读阻断索引
+- 自动生成风险检查（磁盘超水位/只读阻断/超大分片等）与使用场景推断
+
+**参数：**
+```bash
+--cluster-id ID          目标集群 ID（环境变量: CONSOLE_CLUSTER_ID）
+--cluster-name NAME      目标集群名称，支持部分匹配（环境变量: CONSOLE_CLUSTER_NAME）
+--sample-interval SEC    两轮读写采样间隔秒数，0 关闭速率采样 (默认: 60)
+--include-system-indices 包含系统索引(以 . 开头)
+--top N                  TOP 列表条数 (默认: 20)
+```
+
+**用法示例：**
+```bash
+# 按集群名采集
+python cluster-usage-profile/cluster_usage_profile.py -c http://localhost:9000 \
+  -u admin -p password --cluster-name my-cluster
+
+# 静态画像（不等采样）
+python cluster-usage-profile/cluster_usage_profile.py --config config.json \
+  --cluster-name my-cluster --sample-interval 0
+```
+
+**输出文件：**
+- `exports/usage_profile_<集群名>_<时间戳>.md` - Markdown 画像报告
+- `exports/usage_profile_<集群名>_<时间戳>_indices.csv` - 索引级明细
+- `exports/usage_profile_<集群名>_<时间戳>.json` - 完整采集结果
+
+**详细文档：** 参见 [cluster-usage-profile/README.md](cluster-usage-profile/README.md)
 
 ### Metrics Exporter (监控数据导出工具)
 

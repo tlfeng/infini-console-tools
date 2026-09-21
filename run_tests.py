@@ -14,6 +14,7 @@
   python run_tests.py cluster      # 只运行 cluster_report 测试
   python run_tests.py query        # 只运行 query_report 测试
   python run_tests.py datatasks    # 只运行 data_tasks_report 测试
+  python run_tests.py usage        # 只运行 cluster_usage_profile 测试
 """
 
 import sys
@@ -32,6 +33,7 @@ from tests import (
     test_cluster_report,
     test_query_report,
     test_data_tasks_report,
+    test_cluster_usage_profile,
 )
 
 
@@ -50,6 +52,7 @@ def run_all_tests(verbosity=1):
     suite.addTests(loader.loadTestsFromModule(test_cluster_report))
     suite.addTests(loader.loadTestsFromModule(test_query_report))
     suite.addTests(loader.loadTestsFromModule(test_data_tasks_report))
+    suite.addTests(loader.loadTestsFromModule(test_cluster_usage_profile))
     
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -70,6 +73,7 @@ def run_specific_test(test_name, verbosity=1):
         "cluster": test_cluster_report,
         "query": test_query_report,
         "datatasks": test_data_tasks_report,
+        "usage": test_cluster_usage_profile,
     }
     
     if test_name in test_map:
