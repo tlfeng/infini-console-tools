@@ -1387,9 +1387,10 @@ class UsageProfiler:
 # 命令行入口
 # ---------------------------------------------------------------------------
 
-def list_clusters_and_exit(client: ConsoleClient):
+def list_clusters_and_exit(client: ConsoleClient, clusters: Optional[List[Dict]] = None):
     """未指定目标集群时，列出可选集群"""
-    clusters = client.get_clusters()
+    if clusters is None:
+        clusters = client.get_clusters()
     print("\n未指定目标集群，可用的集群（--cluster-id 或 --cluster-name）:")
     print(f"{'ID':<28} {'名称':<36} 版本")
     for c in clusters:
@@ -1501,22 +1502,53 @@ def main():
     # 解析目标集群
     if not cluster_id and not cluster_name:
         list_clusters_and_exit(client)
+
+    # 拉取集群列表用于名称解析与 ID 校验（列表接口不可用时跳过，交给预检兜底）
+    try:
+        clusters = client.get_clusters()
+    except ConsoleAPIError:
+        clusters = []
+
     if not cluster_id and cluster_name:
         try:
             cluster_id = client.resolve_cluster_id_by_name(cluster_name)
             print(f"已根据 clusterName 解析 clusterId: {cluster_name} -> {cluster_id}")
         except ConsoleAPIError as e:
             print(f"解析集群失败: {e}")
-            sys.exit(1)
+            list_clusters_and_exit(client, clusters)
+    elif cluster_id and clusters:
+        # 校验传入的 cluster-id；不匹配时尝试按名称纠正
+        # （常见误用：把 Console 显示的集群名称当成了 ID）
+        if not any(c.get("id") == cluster_id for c in clusters):
+            print(f"警告: cluster-id '{cluster_id}' 不在 Console 集群列表中，"
+                  "尝试按名称解析...")
+            try:
+                resolved = client.resolve_cluster_id_by_name(cluster_id)
+                print(f"已按名称解析: {cluster_id} -> {resolved}")
+                cluster_id = resolved
+            except ConsoleAPIError:
+                print(f"按名称也解析失败，请核对集群 ID（可先不带集群参数运行查看列表）")
+                list_clusters_and_exit(client, clusters)
 
-    # 检查集群可用性
+    # 可用性预检：直接走 _proxy 访问集群根路径。
+    # 不依赖 /elasticsearch/{id}/status —— 部分老版本 Console 没有该接口（会 404），
+    # 且 _proxy 是后续所有采集真正使用的通道，预检结果最真实。
     try:
-        status = client.get_cluster_status(cluster_id)
-        if not status.get("available", False):
-            print(f"集群不可用（available=false），请检查 Console 中该集群的连接状态")
-            sys.exit(1)
+        root = client.proxy_request(cluster_id, "GET", "/")
+        cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
+        version = ((root.get("version") or {}).get("number", "")
+                   if isinstance(root, dict) else "")
+        print(f"集群可达: {cname or cluster_name or cluster_id} (v{version})")
     except ConsoleAPIError as e:
-        print(f"获取集群状态失败: {e}")
+        msg = str(e)
+        print(f"通过 Console 代理访问集群失败: {msg}")
+        if "404" in msg:
+            print("提示: 集群 ID 不存在或账号无权访问该集群。"
+                  "可用 --cluster-name 按名称指定，或不带集群参数运行以查看集群列表")
+        elif "403" in msg:
+            print("提示: 当前账号没有该集群的访问权限（_proxy 被拒绝）")
+        else:
+            print("提示: 集群可能在 Console 中处于离线状态，或 Console 无法连通集群")
         sys.exit(1)
 
     profiler = UsageProfiler(
