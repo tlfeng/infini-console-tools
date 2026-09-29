@@ -12,13 +12,28 @@ INFINI Console API 客户端公共模块
 """
 
 import getpass
+import http.client
 import json
 import ssl
 import sys
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
 from typing import Dict, List, Optional, Any
+
+# 瞬时性网络错误的最大请求次数（1 次原始请求 + 2 次重试）
+MAX_REQUEST_ATTEMPTS = 3
+
+# 可重试的瞬时网络错误（连接被重置/截断/超时等）
+_TRANSIENT_ERRORS = (
+    urllib.error.URLError,
+    ConnectionError,
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    TimeoutError,
+    OSError,
+)
 
 
 class ConsoleAuthError(Exception):
@@ -54,6 +69,21 @@ class ConsoleClient:
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
 
+    @staticmethod
+    def _decode_response(response) -> str:
+        """读取并解码响应体，编码异常时输出可定位问题的诊断信息"""
+        raw = response.read()
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            content_encoding = response.headers.get("Content-Encoding", "none")
+            content_type = response.headers.get("Content-Type", "unknown")
+            raise ConsoleAPIError(
+                "响应体不是合法的 UTF-8，可能被中间设备（防火墙/代理）改写或压缩: "
+                f"Content-Encoding={content_encoding}, Content-Type={content_type}, "
+                f"size={len(raw)} bytes, 前64字节={raw[:64]!r}。原始错误: {e}"
+            ) from e
+
     def _make_request(
         self,
         endpoint: str,
@@ -61,7 +91,7 @@ class ConsoleClient:
         data: Optional[bytes] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """发送 HTTP 请求"""
+        """发送 HTTP 请求，瞬时网络错误自动重试"""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         req = urllib.request.Request(url, method=method, data=data)
 
@@ -75,17 +105,37 @@ class ConsoleClient:
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
 
-        try:
-            with urllib.request.urlopen(
-                req, context=self.ssl_context, timeout=self.timeout
-            ) as response:
-                response_data = response.read().decode("utf-8")
-                return json.loads(response_data) if response_data else {}
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8")
-            raise ConsoleAPIError(f"HTTP {e.code}: {error_body}")
-        except Exception as e:
-            raise ConsoleAPIError(f"Request failed: {str(e)}")
+        last_error = None
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(
+                    req, context=self.ssl_context, timeout=self.timeout
+                ) as response:
+                    response_data = self._decode_response(response)
+                    return json.loads(response_data) if response_data else {}
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                # 5xx/429 视为瞬时错误重试，其余（4xx 等）直接抛出
+                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_REQUEST_ATTEMPTS:
+                    last_error = e
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                raise ConsoleAPIError(f"HTTP {e.code}: {error_body}")
+            except _TRANSIENT_ERRORS as e:
+                last_error = e
+                if attempt < MAX_REQUEST_ATTEMPTS:
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                break
+            except UnicodeDecodeError as e:
+                # 理论上不会到这里（_decode_response 已转换），保险起见不重试直接抛出
+                raise ConsoleAPIError(f"响应解码失败: {e}")
+            except Exception as e:
+                raise ConsoleAPIError(f"Request failed: {str(e)}")
+
+        raise ConsoleAPIError(
+            f"Request failed after {MAX_REQUEST_ATTEMPTS} attempts: {last_error}"
+        )
 
     def login(self) -> bool:
         """登录获取 JWT Token"""
