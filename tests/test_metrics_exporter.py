@@ -250,6 +250,49 @@ class TestMetricsExporterInit(unittest.TestCase):
         self.assertEqual(exporter.parallel_jobs, 4)
 
 
+class TestSystemClusterDiscovery(unittest.TestCase):
+    """测试系统集群ID获取（客户环境 /elasticsearch/_search 曾偶发连接重置）"""
+
+    def test_explicit_id_skips_cluster_search(self):
+        """显式指定系统集群ID时不再查询集群列表"""
+        mock_client = MagicMock()
+        exporter = MetricsExporter(mock_client, "")
+
+        result = exporter.get_system_cluster_id("infini_default_system_cluster")
+
+        self.assertEqual(result, "infini_default_system_cluster")
+        mock_client.get_clusters.assert_not_called()
+
+    def test_found_in_cluster_list(self):
+        """从集群列表中识别系统集群"""
+        mock_client = MagicMock()
+        mock_client.get_clusters.return_value = [
+            {"id": "abc", "name": "业务集群"},
+            {"id": "infini_default_system_cluster", "name": "INFINI_SYSTEM"},
+        ]
+        exporter = MetricsExporter(mock_client, "")
+
+        self.assertEqual(exporter.get_system_cluster_id(), "infini_default_system_cluster")
+
+    def test_falls_back_to_default_id_on_network_failure(self):
+        """集群列表查询因连接重置失败时降级为默认系统集群ID，不中断导出"""
+        from common.console_client import ConsoleAPIError, DEFAULT_SYSTEM_CLUSTER_ID
+
+        mock_client = MagicMock()
+        mock_client.get_clusters.side_effect = ConsoleAPIError("连接被重置")
+        exporter = MetricsExporter(mock_client, "")
+
+        self.assertEqual(exporter.get_system_cluster_id(), DEFAULT_SYSTEM_CLUSTER_ID)
+
+    def test_get_exporter_uses_explicit_id(self):
+        """_get_exporter 收到显式ID时跳过集群列表查询"""
+        mock_client = MagicMock()
+        exporter = metrics_exporter._get_exporter(mock_client, "custom-system-id")
+
+        self.assertEqual(exporter.system_cluster_id, "custom-system-id")
+        mock_client.get_clusters.assert_not_called()
+
+
 class TestQueryBuilding(unittest.TestCase):
     """测试查询构建"""
 

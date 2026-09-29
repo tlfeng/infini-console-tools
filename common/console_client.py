@@ -4,11 +4,17 @@
 INFINI Console API 客户端公共模块
 
 提供统一的 Console API 访问接口，包括：
-- JWT 认证
+- JWT 认证（挑战-响应 / 明文）
 - 集群列表获取
 - _proxy API 调用
 - 索引信息查询
 - 便捷的认证辅助函数
+
+传输层特性：
+- keep-alive 连接复用（按线程隔离）：避免每个请求都新建 TLS 连接，
+  客户环境里"新建连接被重置"的问题因此大幅减少；连接被对端回收时自动换新连接重发
+- 瞬时网络错误指数退避 + 抖动重试：避免多次重试全部落在同一个抖动窗口里
+- 环境变量 CONSOLE_MAX_ATTEMPTS 调整重试次数
 """
 
 import getpass
@@ -16,26 +22,68 @@ import hashlib
 import hmac
 import http.client
 import json
+import os
+import random
 import ssl
 import sys
+import threading
 import time
-import urllib.request
-import urllib.error
 import urllib.parse
 from typing import Dict, List, Optional, Any
 
-# 瞬时性网络错误的最大请求次数（1 次原始请求 + 2 次重试）
-MAX_REQUEST_ATTEMPTS = 3
+# 瞬时性网络错误的最大尝试次数（1 次原始请求 + N-1 次重试），
+# 客户环境出现过间歇性连接重置（WinError 10054），重试太少覆盖不了抖动窗口
+DEFAULT_MAX_ATTEMPTS = 5
 
-# 可重试的瞬时网络错误（连接被重置/截断/超时等）
+# Console 固定的系统集群ID
+DEFAULT_SYSTEM_CLUSTER_ID = "infini_default_system_cluster"
+
+# 重试退避：1s、2s、4s、8s（上限）再叠加 0-0.5s 抖动
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY = 8.0
+RETRY_JITTER = 0.5
+
+# 需要重试的 HTTP 状态码
+_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+# 可重试的瞬时网络错误（连接被重置/截断/超时等）。
+# Windows 的 WinError 10054（远程主机强迫关闭了一个现有的连接）是 OSError 的子类，
+# ssl.SSLError 也是 OSError 的子类，这里显式列出以便阅读。
 _TRANSIENT_ERRORS = (
-    urllib.error.URLError,
-    ConnectionError,
-    http.client.IncompleteRead,
-    http.client.RemoteDisconnected,
-    TimeoutError,
-    OSError,
+    http.client.HTTPException,  # RemoteDisconnected / IncompleteRead / BadStatusLine
+    ConnectionError,            # ConnectionResetError / ConnectionAbortedError / BrokenPipeError
+    TimeoutError,               # socket 超时
+    ssl.SSLError,               # 连接被掐断时 TLS 层可能报错
+    OSError,                    # socket 层错误兜底（含 WinError 10054）
 )
+
+
+def _is_connection_reset(err: Optional[BaseException]) -> bool:
+    """判断是否为"连接被重置"（服务端未返回任何 HTTP 响应）"""
+    if err is None:
+        return False
+    text = str(err)
+    return isinstance(err, (ConnectionResetError, ConnectionAbortedError)) or any(
+        s in text for s in ("10054", "10053", "forcibly closed", "远程主机强迫关闭", "Connection reset")
+    )
+
+
+def _describe_transient_error(err: Optional[BaseException]) -> str:
+    """描述瞬时网络错误；连接被重置（无 HTTP 响应）时附上定位提示"""
+    if err is None:
+        return "unknown"
+    if _is_connection_reset(err):
+        return (
+            f"{err}。连接被重置且无 HTTP 响应（服务端未返回任何状态码）："
+            "多为服务端异常断开（到 Console 服务器执行 grep -i panic 查看日志）"
+            "或中间设备/网关拦截，可运行 console_diag.py 进一步定位"
+        )
+    return str(err)
+
+
+def _format_attempt_log(attempt: int, elapsed: float, reason: str) -> str:
+    """单次尝试的日志片段，用于失败时还原整个重试过程"""
+    return f"第{attempt}次({elapsed:.1f}s) {reason}"
 
 
 class ConsoleAuthError(Exception):
@@ -58,6 +106,7 @@ class ConsoleClient:
         password: str = "",
         timeout: int = 60,
         verify_ssl: bool = False,
+        max_attempts: Optional[int] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -66,26 +115,172 @@ class ConsoleClient:
         self.token: Optional[str] = None
         self.login_method: Optional[str] = None  # "challenge"（1.31+）或 "plaintext"（旧版本）
 
+        # 重试次数：显式入参 > 环境变量 CONSOLE_MAX_ATTEMPTS > 默认值
+        self.max_attempts = max_attempts or int(
+            os.getenv("CONSOLE_MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))
+        )
+
         # SSL 上下文
         self.ssl_context = ssl.create_default_context()
         if not verify_ssl:
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
 
+        # keep-alive 连接按线程隔离（各工具普遍用线程池并发取数）
+        self._local = threading.local()
+
     @staticmethod
-    def _decode_response(response) -> str:
-        """读取并解码响应体，编码异常时输出可定位问题的诊断信息"""
-        raw = response.read()
+    def _decode_body(raw: bytes, headers=None) -> str:
+        """解码响应体，编码异常时输出可定位问题的诊断信息"""
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as e:
-            content_encoding = response.headers.get("Content-Encoding", "none")
-            content_type = response.headers.get("Content-Type", "unknown")
+            content_encoding = headers.get("Content-Encoding", "none") if headers else "none"
+            content_type = headers.get("Content-Type", "unknown") if headers else "unknown"
             raise ConsoleAPIError(
                 "响应体不是合法的 UTF-8，可能被中间设备（防火墙/代理）改写或压缩: "
                 f"Content-Encoding={content_encoding}, Content-Type={content_type}, "
                 f"size={len(raw)} bytes, 前64字节={raw[:64]!r}。原始错误: {e}"
             ) from e
+
+    # ---------- 连接管理：同线程内复用同一条 keep-alive 连接 ----------
+    #
+    # 每个请求都新建 TLS 连接会放大"新建连接被重置"这类中间设备/网关问题，
+    # 而且握手开销不小（滚动导出动辄成千上万次请求）。这里按线程缓存连接；
+    # 连接被服务端或网关回收时（长连接空闲超时很常见），_send_once 会自动
+    # 换新连接把当前这次请求重发一遍，不消耗重试次数。
+
+    def _connection_key(self) -> tuple:
+        parts = urllib.parse.urlsplit(self.base_url)
+        scheme = (parts.scheme or "http").lower()
+        host = parts.hostname or "localhost"
+        port = parts.port or (443 if scheme == "https" else 80)
+        return scheme, host, port
+
+    def _open_connection(self, scheme: str, host: str, port: int):
+        """建立新连接（测试可替换此方法注入假连接）"""
+        if scheme == "https":
+            return http.client.HTTPSConnection(
+                host, port, timeout=self.timeout, context=self.ssl_context
+            )
+        return http.client.HTTPConnection(host, port, timeout=self.timeout)
+
+    def _release_connection(self) -> None:
+        """丢弃当前线程缓存的连接（只影响本线程）"""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
+        self._local.conn_key = None
+        self._local.conn_reused = False
+
+    def close(self) -> None:
+        """释放当前线程缓存的连接（其余线程的连接随线程结束释放）"""
+        self._release_connection()
+
+    def _get_connection(self):
+        key = self._connection_key()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None and getattr(self._local, "conn_key", None) == key:
+            return conn
+        self._release_connection()
+        conn = self._open_connection(*key)
+        self._local.conn = conn
+        self._local.conn_key = key
+        self._local.conn_reused = False
+        return conn
+
+    def _send_once(
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> tuple:
+        """发送一次请求，返回 (status, body_bytes, response_headers)。
+
+        连接层错误原样抛出，交给调用方决定是否重试。
+        注意：长连接被对端回收时会把当前请求在**新连接**上重发一次，
+        因此这里只适用于读操作（本仓库各工具都是查询/导出，无写副作用）。
+        """
+        path = "/" + endpoint.lstrip("/")
+        # 保持与旧版 urllib 传输一致的请求头，避免改变中间设备/网关看到的请求特征；
+        # Accept-Encoding: identity 确保响应不被压缩（自己解压会掩盖中间设备的改写）
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept-Encoding": "identity",
+            "User-Agent": f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}",
+        }
+        if headers:
+            req_headers.update(headers)
+        if self.token:
+            req_headers["Authorization"] = f"Bearer {self.token}"
+
+        # 第一次用缓存连接；若它已被对端回收（长连接空闲超时），换新连接重发一次
+        for stale_retry in (False, True):
+            conn = self._get_connection()
+            reused = bool(getattr(self._local, "conn_reused", False))
+            try:
+                conn.request(method, path, body=data, headers=req_headers)
+                response = conn.getresponse()
+                raw = response.read()
+                status = response.status
+                response_headers = response.headers
+            except Exception:
+                self._release_connection()
+                if reused and not stale_retry:
+                    continue
+                raise
+            self._local.conn_reused = True
+            if getattr(response, "will_close", False):
+                # 服务端要求关闭连接（如 Connection: close），不要继续复用
+                self._release_connection()
+            return status, raw, response_headers
+        raise ConsoleAPIError("连接重发失败")  # 理论上不可达
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """指数退避 + 抖动：1s、2s、4s…上限 8s，另加 0-0.5s 随机抖动"""
+        delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+        return delay + random.uniform(0, RETRY_JITTER)
+
+    @staticmethod
+    def _describe_exception(err: BaseException) -> str:
+        """把异常归类成便于判断责任方的短语"""
+        text = str(err)
+        if isinstance(err, TimeoutError) or "timed out" in text:
+            return f"超时 {err}"
+        if _is_connection_reset(err):
+            return f"连接被重置 {err}"
+        if isinstance(err, http.client.HTTPException):
+            return f"响应不完整 {err}"
+        return f"{type(err).__name__}: {text}"
+
+    def _raise_request_failed(
+        self,
+        endpoint: str,
+        attempts: List[str],
+        elapsed: float,
+        last_error: Optional[BaseException] = None,
+    ) -> None:
+        """重试全部失败：抛出带逐次尝试明细的错误"""
+        detail = "; ".join(attempts)
+        reset_hint = ""
+        if _is_connection_reset(last_error):
+            reset_hint = f"\n{_describe_transient_error(last_error)}"
+        raise ConsoleAPIError(
+            f"请求 {endpoint} 连续 {len(attempts)} 次失败（共 {elapsed:.1f}s）: {detail}{reset_hint}\n"
+            "提示: 连接被重置/超时通常来自网络中间设备（防火墙/代理/负载均衡）或服务端短时抖动，"
+            "而不是接口本身返回错误。可依次排查:\n"
+            "  1) 到 Console 宿主机上访问 http://127.0.0.1:<Console端口> 复测同一请求；\n"
+            "  2) 抓包看 RST 报文的 TTL 是否与正常报文一致（不一致多为中间设备伪造）；\n"
+            "  3) 确认 Console 前面的网关/负载均衡没有健康检查抖动或连接数限制；\n"
+            "  4) 调整重试预算: 环境变量 CONSOLE_MAX_ATTEMPTS（当前 "
+            f"{self.max_attempts}）"
+        )
 
     def _make_request(
         self,
@@ -94,51 +289,44 @@ class ConsoleClient:
         data: Optional[bytes] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """发送 HTTP 请求，瞬时网络错误自动重试"""
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        req = urllib.request.Request(url, method=method, data=data)
+        """发送 HTTP 请求，瞬时网络错误按指数退避 + 抖动重试"""
+        attempt_logs: List[str] = []
+        started = time.time()
+        last_error: Optional[BaseException] = None
 
-        # 设置默认 headers
-        req.add_header("Content-Type", "application/json")
-        if headers:
-            for key, value in headers.items():
-                req.add_header(key, value)
-
-        # 添加认证头
-        if self.token:
-            req.add_header("Authorization", f"Bearer {self.token}")
-
-        last_error = None
-        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
+            attempt_started = time.time()
             try:
-                with urllib.request.urlopen(
-                    req, context=self.ssl_context, timeout=self.timeout
-                ) as response:
-                    response_data = self._decode_response(response)
-                    return json.loads(response_data) if response_data else {}
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode("utf-8", errors="replace")
-                # 5xx/429 视为瞬时错误重试，其余（4xx 等）直接抛出
-                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_REQUEST_ATTEMPTS:
-                    last_error = e
-                    time.sleep(2 ** (attempt - 1))
-                    continue
-                raise ConsoleAPIError(f"HTTP {e.code}: {error_body}")
+                status, raw, response_headers = self._send_once(method, endpoint, data, headers)
             except _TRANSIENT_ERRORS as e:
                 last_error = e
-                if attempt < MAX_REQUEST_ATTEMPTS:
-                    time.sleep(2 ** (attempt - 1))
+                attempt_logs.append(
+                    _format_attempt_log(
+                        attempt, time.time() - attempt_started, self._describe_exception(e)
+                    )
+                )
+                if attempt < self.max_attempts:
+                    time.sleep(self._retry_delay(attempt))
                     continue
                 break
-            except UnicodeDecodeError as e:
-                # 理论上不会到这里（_decode_response 已转换），保险起见不重试直接抛出
-                raise ConsoleAPIError(f"响应解码失败: {e}")
+            except ConsoleAPIError:
+                raise
             except Exception as e:
-                raise ConsoleAPIError(f"Request failed: {str(e)}")
+                raise ConsoleAPIError(f"请求 {endpoint} 失败: {e}") from e
 
-        raise ConsoleAPIError(
-            f"Request failed after {MAX_REQUEST_ATTEMPTS} attempts: {last_error}"
-        )
+            body_text = self._decode_body(raw, response_headers)
+            # 5xx/429 视为瞬时错误重试，其余（4xx 等）直接抛出
+            if status in _RETRYABLE_STATUS and attempt < self.max_attempts:
+                attempt_logs.append(
+                    _format_attempt_log(attempt, time.time() - attempt_started, f"HTTP {status}")
+                )
+                time.sleep(self._retry_delay(attempt))
+                continue
+            if status >= 400:
+                raise ConsoleAPIError(f"请求 {endpoint} 失败: HTTP {status}: {body_text}")
+            return json.loads(body_text) if body_text else {}
+
+        self._raise_request_failed(endpoint, attempt_logs, time.time() - started, last_error)
 
     def _raw_request(
         self,
@@ -149,37 +337,38 @@ class ConsoleClient:
     ) -> tuple:
         """底层请求，返回 (status, parsed_body)；HTTP 错误码原样返回不抛异常，
         供登录流程按状态码降级。瞬时网络错误自动重试。"""
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
         data = json.dumps(body).encode("utf-8") if body is not None else None
+        attempt_logs: List[str] = []
+        started = time.time()
+        last_error: Optional[BaseException] = None
 
-        last_error = None
-        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            if headers:
-                for key, value in headers.items():
-                    req.add_header(key, value)
+        for attempt in range(1, self.max_attempts + 1):
+            attempt_started = time.time()
             try:
-                with urllib.request.urlopen(
-                    req, context=self.ssl_context, timeout=self.timeout
-                ) as response:
-                    raw = response.read()
-                    return response.status, json.loads(raw) if raw else {}
-            except urllib.error.HTTPError as e:
-                raw = e.read().decode("utf-8", errors="replace")
-                try:
-                    return e.code, json.loads(raw)
-                except json.JSONDecodeError:
-                    return e.code, raw
+                status, raw, _ = self._send_once(method, endpoint, data, headers)
             except _TRANSIENT_ERRORS as e:
                 last_error = e
-                if attempt < MAX_REQUEST_ATTEMPTS:
-                    time.sleep(2 ** (attempt - 1))
-                    continue
-                raise ConsoleAPIError(
-                    f"Request failed after {MAX_REQUEST_ATTEMPTS} attempts: {last_error}"
+                attempt_logs.append(
+                    _format_attempt_log(
+                        attempt, time.time() - attempt_started, self._describe_exception(e)
+                    )
                 )
-        raise ConsoleAPIError(f"Request failed: {last_error}")
+                if attempt < self.max_attempts:
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                break
+            except ConsoleAPIError:
+                raise
+            except Exception as e:
+                raise ConsoleAPIError(f"请求 {endpoint} 失败: {e}") from e
+
+            text = raw.decode("utf-8", errors="replace") if raw else ""
+            try:
+                return status, json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                return status, text
+
+        self._raise_request_failed(endpoint, attempt_logs, time.time() - started, last_error)
 
     @staticmethod
     def _extract_token(result: Any) -> Optional[str]:
@@ -268,27 +457,51 @@ class ConsoleClient:
             return True
         return False
 
-    def get_clusters(self) -> List[Dict[str, Any]]:
-        """获取所有集群列表"""
-        query = {"size": 1000, "query": {"match_all": {}}}
-        result = self._make_request(
-            "/elasticsearch/_search", "POST", json.dumps(query).encode("utf-8")
-        )
+    def get_clusters(self, page_size: int = 500) -> List[Dict[str, Any]]:
+        """获取所有集群列表（自动翻页，直到取完 total 条）
 
-        clusters = []
-        hits = result.get("hits", {}).get("hits", [])
-        for hit in hits:
-            source = hit.get("_source", {})
-            clusters.append(
-                {
-                    "id": hit.get("_id"),
-                    "name": source.get("name", "Unknown"),
-                    "version": source.get("version", "Unknown"),
-                    "endpoint": source.get("endpoint", ""),
-                    "enabled": source.get("enabled", False),
-                    "monitored": source.get("monitored", False),
-                }
-            )
+        注意：Console 的 /elasticsearch/_search 只解析 URL 查询参数（size/from），
+        POST body 里的分页条件会被完全忽略——所以分页参数必须放在查询串上，
+        否则不管传什么 size 都只能拿到默认的 20 条，集群数超过 20 时
+        系统集群可能被挤掉，导致"未找到系统集群"。
+        """
+        clusters: List[Dict[str, Any]] = []
+        seen_ids = set()
+        offset = 0
+
+        while True:
+            endpoint = f"/elasticsearch/_search?size={page_size}&from={offset}"
+            result = self._make_request(endpoint, "GET")
+
+            hits_block = result.get("hits", {}) if isinstance(result, dict) else {}
+            hits = hits_block.get("hits", []) or []
+            total = hits_block.get("total")
+            if isinstance(total, dict):
+                total = total.get("value")
+
+            for hit in hits:
+                source = hit.get("_source", {}) or {}
+                cluster_id = hit.get("_id")
+                if cluster_id in seen_ids:
+                    continue
+                seen_ids.add(cluster_id)
+                clusters.append(
+                    {
+                        "id": cluster_id,
+                        "name": source.get("name", "Unknown"),
+                        "version": source.get("version", "Unknown"),
+                        "endpoint": source.get("endpoint", ""),
+                        "enabled": source.get("enabled", False),
+                        "monitored": source.get("monitored", False),
+                    }
+                )
+
+            if len(hits) < page_size:
+                break
+            offset += len(hits)
+            if isinstance(total, int) and offset >= total:
+                break
+
         return clusters
 
     def get_cluster_status(self, cluster_id: str) -> Dict[str, Any]:
@@ -435,7 +648,7 @@ class ConsoleClient:
     @staticmethod
     def is_system_cluster(cluster_id: str, cluster_name: str) -> bool:
         """判断是否为系统集群"""
-        system_ids = ["infini_default_system_cluster"]
+        system_ids = [DEFAULT_SYSTEM_CLUSTER_ID]
         system_name_patterns = ["INFINI_SYSTEM", "Slingshot"]
 
         if cluster_id in system_ids:

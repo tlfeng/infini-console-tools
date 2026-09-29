@@ -515,6 +515,48 @@ pip install -r requirements.txt
 
 如需包含系统集群，请使用 `--include-console-cluster` 参数。
 
+获取系统集群ID需要先查询 Console 的集群列表（`GET /elasticsearch/_search`）。该接口在客户环境
+出现过间歇性连接重置，会导致工具在启动阶段就退出，因此：
+
+- 集群列表查询失败时，导出工具降级使用默认系统集群ID `infini_default_system_cluster` 继续导出；
+- 也可以显式指定，完全跳过这次查询：
+
+```json
+{
+  "consoleUrl": "https://10.139.130.34:7474",
+  "systemClusterId": "infini_default_system_cluster"
+}
+```
+
+```bash
+# 命令行等价写法（或设置环境变量 CONSOLE_SYSTEM_CLUSTER_ID）
+python metrics-exporter/metrics_exporter.py --config metrics_export.json \
+  --system-cluster-id infini_default_system_cluster
+```
+
+## 连接被重置（WinError 10054）排查
+
+`[WinError 10054] 远程主机强迫关闭了一个现有的连接` 是 TCP 层被对端重置（服务端没有返回任何
+HTTP 响应），不是接口返回的业务错误。用仓库根目录的 `console_diag.py` 量化并定位责任方：
+
+```bash
+# 同一请求重复 5 次（每次新建连接）+ 同一条 keep-alive 连接上连打 5 次，输出失败率与结论
+python console_diag.py -c metrics_export_4windows.json
+python console_diag.py -u https://10.139.130.34:7474 -U admin -P '密码' --repeat 20
+```
+
+脚本会区分：接口/权限/版本问题（返回 4xx/5xx）、按路径被中间设备确定性拦截、只有新建连接
+会失败、以及短时抖动导致的间歇性重置，并给出下一步（Console 端日志、换机器复测、抓包看
+RST 的 TTL 等）。
+
+客户端侧已做的加固（`common/console_client.py`，所有工具共用）：
+
+- **keep-alive 连接复用**：按线程复用同一条连接，不再每个请求新建 TLS 连接；长连接被对端
+  回收时自动换新连接重发当前请求（不消耗重试次数）
+- **指数退避 + 抖动重试**：1s、2s、4s、8s（上限）再叠加 0-0.5s 抖动，默认 5 次尝试；
+  可用环境变量 `CONSOLE_MAX_ATTEMPTS` 调整（Windows: `set CONSOLE_MAX_ATTEMPTS=8`）
+- 失败时输出逐次尝试的耗时与错误类型，便于区分「秒级快速 RST」和「慢超时」
+
 ## 许可证
 
 MIT License

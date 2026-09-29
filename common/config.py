@@ -757,6 +757,7 @@ class GlobalConfig:
     password: str = ""
     timeout: int = 60
     insecure: bool = False
+    system_cluster_id: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'GlobalConfig':
@@ -767,7 +768,8 @@ class GlobalConfig:
             username=auth.get('username', ''),
             password=auth.get('password', ''),
             timeout=data.get('timeout', 60),
-            insecure=data.get('insecure', False)
+            insecure=data.get('insecure', False),
+            system_cluster_id=data.get('systemClusterId', ''),
         )
 
 

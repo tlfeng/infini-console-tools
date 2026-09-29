@@ -37,7 +37,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common.console_client import ConsoleClient, ConsoleAuthError, ConsoleAPIError
+from common.console_client import (
+    ConsoleClient, ConsoleAuthError, ConsoleAPIError, DEFAULT_SYSTEM_CLUSTER_ID,
+)
 from common.config import (
     add_common_args, get_config_value,
     AppConfig, MetricsJobConfig, ConfigValidationError,
@@ -962,9 +964,24 @@ class MetricsExporter:
         else:
             return value
 
-    def get_system_cluster_id(self) -> Optional[str]:
-        """获取系统集群ID"""
-        clusters = self.client.get_clusters()
+    def get_system_cluster_id(self, preferred_id: Optional[str] = None) -> Optional[str]:
+        """获取系统集群ID
+
+        preferred_id（配置 systemClusterId 或 --system-cluster-id）优先，
+        此时完全不发集群列表查询——客户环境里这一步曾因中间设备重置连接而失败，
+        导致整个导出在开跑前就退出。
+        """
+        if preferred_id:
+            return preferred_id
+
+        try:
+            clusters = self.client.get_clusters()
+        except ConsoleAPIError as e:
+            # Console 侧偶发连接重置等网络问题不影响 _proxy 通道（已实测），
+            # 系统集群ID为固定值，跳过预检继续导出
+            print(f"警告: 获取集群列表失败({e})", file=sys.stderr)
+            print(f"警告: 降级使用默认系统集群ID {DEFAULT_SYSTEM_CLUSTER_ID} 继续导出", file=sys.stderr)
+            return DEFAULT_SYSTEM_CLUSTER_ID
         for cluster in clusters:
             if ConsoleClient.is_system_cluster(cluster["id"], cluster["name"]):
                 return cluster["id"]
@@ -2933,6 +2950,13 @@ Examples:
         help="只导出指定集群ID的数据",
     )
     parser.add_argument(
+        "--system-cluster-id",
+        type=str,
+        default=None,
+        help="Console 系统集群ID（默认自动获取；指定后跳过集群列表查询，"
+             "可避开该接口偶发连接重置导致启动失败，环境变量: CONSOLE_SYSTEM_CLUSTER_ID）",
+    )
+    parser.add_argument(
         "--metric-types",
         type=str,
         default=None,
@@ -3038,8 +3062,17 @@ def main():
     # 连接 Console
     client = _connect_console(console_url, username, password, timeout, insecure)
 
+    # 系统集群ID：显式指定（CLI/配置文件/环境变量）时跳过集群列表查询
+    # getattr 兜底：只复制了本文件、没同步 common/config.py 时也不会 AttributeError
+    explicit_system_cluster_id = get_config_value(
+        args.system_cluster_id,
+        getattr(app_config.global_config, 'system_cluster_id', '') if app_config else None,
+        'CONSOLE_SYSTEM_CLUSTER_ID',
+        '',
+    )
+
     # 获取系统集群
-    exporter = _get_exporter(client)
+    exporter = _get_exporter(client, explicit_system_cluster_id)
 
     # --list-clusters
     if args.list_clusters:
@@ -3094,11 +3127,16 @@ def _connect_console(console_url: str, username: str, password: str, timeout: in
     return client
 
 
-def _get_exporter(client: ConsoleClient) -> 'MetricsExporter':
+def _get_exporter(client: ConsoleClient, system_cluster_id: Optional[str] = None) -> 'MetricsExporter':
     """获取初始化的 MetricsExporter"""
-    print("正在获取系统集群...")
     exporter = MetricsExporter(client, "")
-    system_cluster_id = exporter.get_system_cluster_id()
+    if system_cluster_id:
+        print(f"使用指定的系统集群ID: {system_cluster_id}（跳过集群列表查询）")
+    else:
+        # /elasticsearch/_search 偶发连接重置时，
+        # get_system_cluster_id 内部会降级为固定默认值（该ID为 reserved 常量），不阻断导出
+        print("正在获取系统集群...")
+    system_cluster_id = exporter.get_system_cluster_id(system_cluster_id)
 
     if not system_cluster_id:
         print("未找到系统集群，请确保 Console 系统集群已配置")
