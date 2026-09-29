@@ -847,13 +847,23 @@ class MetricsExporter:
             minutes = int(offset_match.group(3))
             return timezone(timedelta(hours=sign * hours, minutes=sign * minutes))
 
-        # IANA 时区名称
-        try:
-            return ZoneInfo(tz)
-        except Exception as exc:
-            raise ValueError(
-                f"无效时区: {tz}，支持 IANA 名称（如 Asia/Shanghai）或 UTC 偏移（如 +08:00）"
-            ) from exc
+        # IANA 时区名称（key 区分大小写；Windows 的 Python 没有系统时区库，
+        # 未安装 tzdata 包时 ZoneInfo 不可用，只能走上面的 UTC 偏移格式）
+        candidates = [tz]
+        # 宽限大小写: "asia/shanghai" -> "Asia/Shanghai"（Linux 时区库大小写敏感）
+        normalized = "/".join(part.capitalize() for part in tz.split("/"))
+        if normalized != tz:
+            candidates.append(normalized)
+        for candidate in candidates:
+            try:
+                return ZoneInfo(candidate)
+            except Exception:
+                continue
+        raise ValueError(
+            f"无效时区: {tz}，支持 IANA 名称（如 Asia/Shanghai）或 UTC 偏移（如 +08:00）。"
+            "注意: Windows 的 Python 未内置时区数据库，使用 IANA 名称前需先执行 pip install tzdata，"
+            "否则请改用 UTC 偏移格式（如 +08:00）"
+        )
 
     def _resolve_time_window(
         self,

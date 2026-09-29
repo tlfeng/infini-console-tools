@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -520,6 +521,15 @@ class TestQueryBuilding(unittest.TestCase):
         # 7月是 EDT (UTC-4，夏令时)
         summer = datetime(2026, 7, 15, 12, 0, 0, tzinfo=tz)
         self.assertEqual(summer.astimezone(timezone.utc).hour, 16)
+
+    def test_resolve_tz_iana_case_insensitive_fallback(self):
+        """小写 IANA 名称（如 asia/shanghai）应通过大小写归一解析成功"""
+        # ZoneInfo 的相等比较按 key 字符串，这里用同一时刻换算成 UTC 来断言
+        expected = datetime(2026, 6, 1, 12, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")).astimezone(timezone.utc)
+        for raw in ("asia/shanghai", "ASIA/SHANGHAI"):
+            tz = MetricsExporter._resolve_tz(raw)
+            actual = datetime(2026, 6, 1, 12, 0, 0, tzinfo=tz).astimezone(timezone.utc)
+            self.assertEqual(actual, expected, f"解析 {raw!r} 得到错误的时区偏移")
 
     def test_parse_time_input_builtin_offset_overrides_tz_param(self):
         """时间字符串自带时区偏移时，忽略 tz 参数"""
