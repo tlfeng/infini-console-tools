@@ -12,6 +12,8 @@ INFINI Console API 客户端公共模块
 """
 
 import getpass
+import hashlib
+import hmac
 import http.client
 import json
 import ssl
@@ -62,6 +64,7 @@ class ConsoleClient:
         self.password = password
         self.timeout = timeout
         self.token: Optional[str] = None
+        self.login_method: Optional[str] = None  # "challenge"（1.31+）或 "plaintext"（旧版本）
 
         # SSL 上下文
         self.ssl_context = ssl.create_default_context()
@@ -137,47 +140,133 @@ class ConsoleClient:
             f"Request failed after {MAX_REQUEST_ATTEMPTS} attempts: {last_error}"
         )
 
+    def _raw_request(
+        self,
+        method: str,
+        endpoint: str,
+        body: Optional[Any] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> tuple:
+        """底层请求，返回 (status, parsed_body)；HTTP 错误码原样返回不抛异常，
+        供登录流程按状态码降级。瞬时网络错误自动重试。"""
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+
+        last_error = None
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            req = urllib.request.Request(url, data=data, method=method)
+            req.add_header("Content-Type", "application/json")
+            if headers:
+                for key, value in headers.items():
+                    req.add_header(key, value)
+            try:
+                with urllib.request.urlopen(
+                    req, context=self.ssl_context, timeout=self.timeout
+                ) as response:
+                    raw = response.read()
+                    return response.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", errors="replace")
+                try:
+                    return e.code, json.loads(raw)
+                except json.JSONDecodeError:
+                    return e.code, raw
+            except _TRANSIENT_ERRORS as e:
+                last_error = e
+                if attempt < MAX_REQUEST_ATTEMPTS:
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                raise ConsoleAPIError(
+                    f"Request failed after {MAX_REQUEST_ATTEMPTS} attempts: {last_error}"
+                )
+        raise ConsoleAPIError(f"Request failed: {last_error}")
+
+    @staticmethod
+    def _extract_token(result: Any) -> Optional[str]:
+        """从登录响应的不同字段结构中提取 token，找不到返回 None"""
+        if not isinstance(result, dict):
+            return None
+        token = result.get("token") or result.get("access_token")
+        if not token and isinstance(result.get("data"), dict):
+            token = result["data"].get("token") or result["data"].get("access_token")
+        return token
+
     def login(self) -> bool:
-        """登录获取 JWT Token"""
+        """登录获取 JWT Token。
+        Console 1.31+ 为挑战-响应登录（密码不明文出网，带防重放 nonce）；
+        挑战接口不可用（旧版本）时自动降级为明文登录。"""
         if not self.username or not self.password:
             return False
 
-        url = f"{self.base_url}/account/login"
-        login_data = {"username": self.username, "password": self.password}
-
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(login_data).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            if self._login_challenge():
+                return True
+        except ConsoleAPIError:
+            raise
+        except Exception:
+            pass  # 挑战接口不存在（旧版本 Console），降级明文
+        return self._login_plaintext()
+
+    def _login_challenge(self) -> bool:
+        """Console 1.31+ 挑战-响应登录，对齐前端 buildPasswordProof 算法"""
+        s, ch = self._raw_request(
+            "POST", "/account/login/challenge", {"username": self.username}
+        )
+        if s != 200 or not isinstance(ch, dict) or ch.get("method") != "challenge":
+            return False
+
+        verifier = hashlib.pbkdf2_hmac(
+            "sha256", self.password.encode("utf-8"),
+            ch["salt"].encode("utf-8"), ch["iterations"], dklen=32,
+        )
+        msg = f"{self.username}:{ch['challenge_id']}:{ch['nonce']}".encode("utf-8")
+        proof = hmac.new(verifier, msg, hashlib.sha256).hexdigest()
+
+        nonce = None
+        try:
+            rn_s, rn = self._raw_request(
+                "POST", "/account/replay_nonce",
+                {"method": "POST", "path": "/account/login"},
             )
+            if rn_s == 200 and isinstance(rn, dict):
+                nonce = rn.get("nonce")
+        except Exception:
+            nonce = None
 
-            with urllib.request.urlopen(
-                req, context=self.ssl_context, timeout=self.timeout
-            ) as response:
-                result = json.loads(response.read().decode("utf-8"))
+        headers = {"X-Request-Nonce": nonce} if nonce else None
+        s, result = self._raw_request(
+            "POST", "/account/login",
+            {
+                "userName": self.username,
+                "type": "account",
+                "challenge_id": ch["challenge_id"],
+                "proof": proof,
+            },
+            headers=headers,
+        )
+        if s != 200:
+            return False
+        token = self._extract_token(result)
+        if token:
+            self.token = token
+            self.login_method = "challenge"
+            return True
+        return False
 
-                # 尝试从不同字段获取 token
-                token = result.get("token") or result.get("access_token")
-                if not token and "data" in result and isinstance(result["data"], dict):
-                    token = result["data"].get("token") or result["data"].get("access_token")
-
-                if token:
-                    self.token = token
-                    return True
-
-                # 尝试检查 status
-                if result.get("status") == "ok":
-                    token = result.get("access_token")
-                    if token:
-                        self.token = token
-                        return True
-
-                return False
-
-        except Exception as e:
-            raise ConsoleAuthError(f"Login failed: {str(e)}")
+    def _login_plaintext(self) -> bool:
+        """旧版本 Console 明文登录"""
+        s, result = self._raw_request(
+            "POST", "/account/login",
+            {"username": self.username, "password": self.password},
+        )
+        if s != 200:
+            return False
+        token = self._extract_token(result)
+        if token:
+            self.token = token
+            self.login_method = "plaintext"
+            return True
+        return False
 
     def get_clusters(self) -> List[Dict[str, Any]]:
         """获取所有集群列表"""
