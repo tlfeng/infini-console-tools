@@ -187,5 +187,43 @@ class TestClusterReporter(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
 
+class TestCsvReport(unittest.TestCase):
+    """测试 CSV 报告输出"""
+
+    def setUp(self):
+        self.reporter = ClusterReporter(MagicMock())
+
+    def test_csv_contains_cluster_id_column(self):
+        """CSV 报告应包含 Console 集群 ID 列"""
+        import csv
+        import tempfile
+
+        data = [
+            ClusterInfo(
+                cluster_name="es-prod",
+                display_name="Prod ES",
+                cluster_id="d95mgfdi30p6p3vig8e0",
+                version="7.10.1",
+            ),
+            ClusterInfo(
+                cluster_name="es-test",
+                display_name="Test ES",
+                cluster_id="abc123",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = str(Path(d) / "report.csv")
+            self.reporter.generate_csv_report(data, out)
+            with open(out, "r", encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f))
+
+        self.assertEqual(rows[0][1], "Console集群ID")
+        self.assertEqual(rows[1][1], "d95mgfdi30p6p3vig8e0")
+        self.assertEqual(rows[2][1], "abc123")
+        # 每行列数与表头一致
+        for row in rows:
+            self.assertEqual(len(row), len(rows[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

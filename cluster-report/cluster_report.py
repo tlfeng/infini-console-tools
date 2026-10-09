@@ -33,6 +33,7 @@ class ClusterInfo:
     """集群信息数据类"""
     cluster_name: str = ""
     display_name: str = ""
+    cluster_id: str = ""
     version: str = ""
     health_status: str = ""
     available: bool = False
@@ -120,6 +121,7 @@ class ClusterReporter:
             info = ClusterInfo(
                 cluster_name=summary.get("cluster_name") or cluster["name"],
                 display_name=cluster["name"],
+                cluster_id=cid,
                 version=version,
                 health_status=summary.get("status") or health.get("status", "unknown"),
                 available=status_info.get("available", False),
@@ -157,7 +159,7 @@ class ClusterReporter:
             output_file = f"cluster_report_{timestamp}.csv"
 
         headers = [
-            "Console显示名称", "集群名称", "集群版本", "健康状态", "可用性",
+            "Console显示名称", "Console集群ID", "集群名称", "集群版本", "健康状态", "可用性",
             "在线时长", "节点数", "索引数", "主分片数", "总分片数",
             "未分配分片", "文档数", "存储已用", "存储总量",
             "JVM已用", "JVM总量", "JVM使用率%", "采集时间",
@@ -169,7 +171,7 @@ class ClusterReporter:
 
             for item in data:
                 row = [
-                    item.display_name, item.cluster_name, item.version,
+                    item.display_name, item.cluster_id, item.cluster_name, item.version,
                     item.health_status, "是" if item.available else "否",
                     item.uptime, item.nodes_count, item.indices_count,
                     item.primary_shards, item.total_shards, item.unassigned_shards,
