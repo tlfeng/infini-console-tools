@@ -578,6 +578,21 @@ class ConsoleClient:
             return response_body
         return result
 
+    def request(self, endpoint: str, method: str = "GET",
+                body: Optional[Any] = None) -> Dict[str, Any]:
+        """调用任意 Console API（自动带登录态），失败抛 ConsoleAPIError。
+
+        供工具访问尚未封装的 Console 接口（如 /queue/stats、
+        /elasticsearch/<id>/_collection_stats 等）。
+        """
+        data = None
+        if body is not None:
+            if isinstance(body, str):
+                data = body.encode("utf-8")
+            else:
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return self._make_request(endpoint, method, data=data)
+
     def get_index_mapping(self, cluster_id: str, index_name: str) -> Optional[Dict]:
         """获取索引 mapping"""
         try:

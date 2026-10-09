@@ -12,7 +12,8 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 | **query-report** | 查询报告工具 - 执行查询并生成 Markdown 报告 | `query-report/` |
 | **test-runner** | 测试运行工具 - 查询性能测试和对比 | `test-runner/` |
 | **hot-threads** | Hot Threads 采集工具 - 定时抓取 ES hot threads 并写入 JSONL | `hot-threads/` |
-| **cluster-usage-profile** | 集群使用画像工具 - 采集单个集群的使用情况与使用场景 | `cluster-usage-profile/` |
+| **cluster-usage-profile** | 集群使用画像工具 - 采集单个或所有集群的使用情况与使用场景 | `cluster-usage-profile/` |
+| **console-queue-delay** | Console 指标写入延迟排查工具 - 定位图表延迟/状态灯全红的根因 | `console-queue-delay/` |
 
 ## 快速开始
 
@@ -268,6 +269,10 @@ python hot-threads/hot_threads_collector.py -c http://localhost:9000 -u admin -p
 python cluster-usage-profile/cluster_usage_profile.py -c http://localhost:9000 \
   -u admin -p password --cluster-name my-cluster
 
+# 一次采集 Console 中所有集群（默认跳过 Console 系统集群）
+python cluster-usage-profile/cluster_usage_profile.py --config config.json \
+  --all-clusters -o ./exports
+
 # 静态画像（不等采样）
 python cluster-usage-profile/cluster_usage_profile.py --config config.json \
   --cluster-name my-cluster --sample-interval 0
@@ -279,6 +284,36 @@ python cluster-usage-profile/cluster_usage_profile.py --config config.json \
 - `exports/usage_profile_<集群名>_<时间戳>.json` - 完整采集结果
 
 **详细文档：** 参见 [cluster-usage-profile/README.md](cluster-usage-profile/README.md)
+
+### Console Queue Delay (指标写入延迟排查工具)
+
+排查 Console 监控图表延迟、"非探针"状态灯全红的根因。只需要 Console 账号权限，
+不需要 ES 集群密码——所有检查都通过 Console 自身接口完成。
+
+**功能：**
+- 检查 Console 本地磁盘队列积压（/queue/stats 的 lag/depth、消费者活跃度）
+- 采集各集群红绿灯状态（_collection_stats）与指标新鲜度（.infini_metrics 实际最新时间戳）
+- 缺席二次诊断：对报 absent 的集群直查系统 ES 实际数据，判别是写入积压、
+  采集停止，还是 Console 状态接口 bug（数据新鲜却报缺席）
+- 系统 ES 负载检查（write 线程池拒绝、磁盘/CPU）——积压的常见根因
+- `--watch` 趋势观察模式
+
+**用法示例：**
+```bash
+# 基础排查，出报告
+python console-queue-delay/console_queue_delay.py -c https://console:9000 \
+  -u admin -p '<密码>'
+
+# 趋势观察：每 10s 采样，持续 10 分钟
+python console-queue-delay/console_queue_delay.py -c ... --watch --duration 600 --interval 10
+```
+
+**输出文件：**
+- `exports/console_delay_report_<时间戳>.md` - 人读报告（含结论与判读建议）
+- `exports/console_delay_raw_<时间戳>.json` - 原始数据
+- `exports/console_delay_trend_<时间戳>.csv` - watch 模式趋势采样
+
+**详细文档：** 参见 [console-queue-delay/README.md](console-queue-delay/README.md)
 
 ### Metrics Exporter (监控数据导出工具)
 

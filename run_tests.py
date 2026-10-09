@@ -34,6 +34,7 @@ from tests import (
     test_query_report,
     test_data_tasks_report,
     test_cluster_usage_profile,
+    test_console_queue_delay,
 )
 
 
@@ -53,6 +54,7 @@ def run_all_tests(verbosity=1):
     suite.addTests(loader.loadTestsFromModule(test_query_report))
     suite.addTests(loader.loadTestsFromModule(test_data_tasks_report))
     suite.addTests(loader.loadTestsFromModule(test_cluster_usage_profile))
+    suite.addTests(loader.loadTestsFromModule(test_console_queue_delay))
     
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -74,6 +76,7 @@ def run_specific_test(test_name, verbosity=1):
         "query": test_query_report,
         "datatasks": test_data_tasks_report,
         "usage": test_cluster_usage_profile,
+        "queue": test_console_queue_delay,
     }
     
     if test_name in test_map:
