@@ -26,6 +26,7 @@ from cluster_usage_profile import (
     match_action_family,
     aggregate_rest_actions,
     infer_scenario_labels,
+    filter_profile_targets,
     UsageProfiler,
 )
 
@@ -216,6 +217,46 @@ class TestInferScenarioLabels(unittest.TestCase):
             active_write_count=0, total_open_count=50, sample_interval=0)
         text = "\n".join(labels)
         self.assertIn("未启用速率采样", text)
+
+
+class TestFilterProfileTargets(unittest.TestCase):
+    """测试全集群模式的目标过滤"""
+
+    def test_skips_system_cluster_by_default(self):
+        clusters = [
+            {"id": "abc123", "name": "prod-cluster"},
+            {"id": "infini_default_system_cluster", "name": "INFINI System"},
+        ]
+        targets, skipped = filter_profile_targets(clusters, include_console_cluster=False)
+        self.assertEqual(skipped, 1)
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["cluster_id"], "abc123")
+        self.assertEqual(targets[0]["display_name"], "prod-cluster")
+
+    def test_include_console_cluster_keeps_system(self):
+        clusters = [
+            {"id": "abc123", "name": "prod-cluster"},
+            {"id": "infini_default_system_cluster", "name": "INFINI System"},
+        ]
+        targets, skipped = filter_profile_targets(clusters, include_console_cluster=True)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(targets), 2)
+
+    def test_display_name_falls_back_to_id(self):
+        clusters = [{"id": "id-only", "name": ""}]
+        targets, skipped = filter_profile_targets(clusters)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(targets[0]["display_name"], "id-only")
+
+    def test_skips_entries_without_id(self):
+        clusters = [{"id": "", "name": "no-id"}, {"name": "no-id-key"}]
+        targets, skipped = filter_profile_targets(clusters)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(targets, [])
+
+    def test_empty_and_none_input(self):
+        self.assertEqual(filter_profile_targets([]), ([], 0))
+        self.assertEqual(filter_profile_targets(None), ([], 0))
 
 
 class TestUsageProfiler(unittest.TestCase):

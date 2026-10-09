@@ -1,7 +1,8 @@
 # Cluster Usage Profile — 集群使用画像工具
 
-通过 INFINI Console 代理接口（`_proxy`）采集**单个** Elasticsearch 集群的使用情况与使用场景画像。
-适用于只能通过 Console 访问集群、无法直连 9200 的场景。
+通过 INFINI Console 代理接口（`_proxy`）采集 Elasticsearch 集群的使用情况与使用场景画像。
+适用于只能通过 Console 访问集群、无法直连 9200 的场景。支持单集群采集，也支持
+`--all-clusters` 一次采集 Console 中的所有集群。
 
 ## 采集内容
 
@@ -34,7 +35,16 @@ python cluster-usage-profile/cluster_usage_profile.py --config config.json \
 python cluster-usage-profile/cluster_usage_profile.py --config config.json \
   --cluster-name my-cluster --sample-interval 0
 
-# 不带 --cluster-id/--cluster-name 时会列出 Console 中所有可选集群
+# 一次采集 Console 中所有集群（顺序执行，默认跳过 Console 系统集群，
+# 单个集群离线/失败不影响其余集群，结束时输出汇总表）
+python cluster-usage-profile/cluster_usage_profile.py --config config.json \
+  --all-clusters -o ./exports
+
+# 全集群静态画像，跳过读写速率采样（加快批量采集）
+python cluster-usage-profile/cluster_usage_profile.py --config config.json \
+  --all-clusters --sample-interval 0
+
+# 不带 --cluster-id/--cluster-name/--all-clusters 时会列出 Console 中所有可选集群
 python cluster-usage-profile/cluster_usage_profile.py --config config.json
 ```
 
@@ -43,6 +53,8 @@ python cluster-usage-profile/cluster_usage_profile.py --config config.json
 | 参数 | 说明 |
 |------|------|
 | `--cluster-id` / `--cluster-name` | 目标集群（二选一，name 支持部分匹配），环境变量 `CONSOLE_CLUSTER_ID` / `CONSOLE_CLUSTER_NAME` |
+| `--all-clusters` | 一次采集 Console 中所有集群（顺序执行），不能与 `--cluster-id`/`--cluster-name` 同用 |
+| `--include-console-cluster` | 配合 `--all-clusters` 使用，包含 Console 系统集群（默认跳过） |
 | `--sample-interval` | 两轮读写采样间隔秒数，默认 60，`0` 关闭速率采样 |
 | `--include-system-indices` | 包含 `.` 开头的系统索引（默认排除） |
 | `--top` | 报告中 TOP 列表条数，默认 20 |
@@ -61,3 +73,4 @@ python cluster-usage-profile/cluster_usage_profile.py --config config.json
 - 读写速率为**分片级 primaries 口径**（每个分片的 query/index 执行次数），客户端真实 QPS ≈ 采样值 ÷ 索引分片数，用于索引间横向对比和读写比例判断最合适。
 - `_nodes/usage` 计数自节点重启起累计，受节点 uptime 影响，家族占比仅作参考。
 - 两轮采样会对集群产生极轻量压力（2 次 `/_all/_stats`）；超大规模集群建议 `--timeout 120`。
+- `--all-clusters` 模式为顺序采集，默认采样间隔下 N 个集群约需 N 分钟以上；批量采集建议 `--sample-interval 0`。

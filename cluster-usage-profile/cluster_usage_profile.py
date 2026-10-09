@@ -3,7 +3,7 @@
 """
 Cluster Usage Profile - 集群使用画像工具
 
-通过 INFINI Console 代理接口（_proxy）采集单个 Elasticsearch 集群的
+通过 INFINI Console 代理接口（_proxy）采集 Elasticsearch 集群的
 使用情况与使用场景画像，适用于只能通过 Console 访问集群的场景：
 
 - 集群概览：版本、健康、磁盘水位配置、pending tasks
@@ -13,6 +13,11 @@ Cluster Usage Profile - 集群使用画像工具
 - 读写热度：两轮采样计算每个索引的查询/写入速率
 - API 画像：_nodes/usage REST 请求计数，区分 bulk 写入/检索/点查
 - 治理画像：模板、ILM、快照仓库、slowlog、只读阻断
+
+支持两种模式：
+- 单集群模式：--cluster-id / --cluster-name 指定目标集群
+- 全集群模式：--all-clusters 一次顺序采集 Console 中所有集群
+  （默认跳过 Console 系统集群，单个集群失败不影响其余集群）
 
 兼容 6.8.x / 7.10.x：列缺失时自动降级，ILM/usage 不可用时跳过。
 
@@ -24,6 +29,9 @@ Cluster Usage Profile - 集群使用画像工具
 
   python cluster_usage_profile.py --config config.json --cluster-id xxx \\
       --sample-interval 120 -o ./exports
+
+  # 一次采集所有集群
+  python cluster_usage_profile.py --config config.json --all-clusters -o ./exports
 """
 
 import argparse
@@ -316,6 +324,31 @@ def infer_scenario_labels(qps_total: float, ips_total: float,
             "个 open 索引有写入，其余大概率是只读历史/归档数据")
 
     return labels
+
+
+def filter_profile_targets(clusters: List[Dict],
+                           include_console_cluster: bool = False
+                           ) -> Tuple[List[Dict[str, str]], int]:
+    """
+    从 Console 集群列表中过滤出要画像的目标，默认跳过 Console 系统集群。
+
+    返回 ([{cluster_id, display_name}, ...], 跳过的系统集群数)
+    """
+    targets: List[Dict[str, str]] = []
+    skipped = 0
+    for c in clusters or []:
+        cluster_id = str(c.get("id") or "")
+        name = str(c.get("name") or "")
+        if not cluster_id:
+            continue
+        if not include_console_cluster and ConsoleClient.is_system_cluster(cluster_id, name):
+            skipped += 1
+            continue
+        targets.append({
+            "cluster_id": cluster_id,
+            "display_name": name or cluster_id,
+        })
+    return targets, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -1391,7 +1424,7 @@ def list_clusters_and_exit(client: ConsoleClient, clusters: Optional[List[Dict]]
     """未指定目标集群时，列出可选集群"""
     if clusters is None:
         clusters = client.get_clusters()
-    print("\n未指定目标集群，可用的集群（--cluster-id 或 --cluster-name）:")
+    print("\n未指定目标集群，可用的集群（--cluster-id 或 --cluster-name，或 --all-clusters 采集全部）:")
     print(f"{'ID':<28} {'名称':<36} 版本")
     for c in clusters:
         print(f"{str(c.get('id', '')):<28} {str(c.get('name', '')):<36} "
@@ -1399,9 +1432,170 @@ def list_clusters_and_exit(client: ConsoleClient, clusters: Optional[List[Dict]]
     sys.exit(1)
 
 
+def check_cluster_reachable(client: ConsoleClient, cluster_id: str) -> Tuple[bool, str]:
+    """
+    通过 _proxy 访问集群根路径做可用性预检。
+
+    返回 (是否可达, 成功时为 "集群名 (v版本)"，失败时为错误信息)
+    """
+    try:
+        root = client.proxy_request(cluster_id, "GET", "/")
+    except ConsoleAPIError as e:
+        return False, str(e)
+    cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
+    version = ((root.get("version") or {}).get("number", "")
+               if isinstance(root, dict) else "")
+    return True, f"{cname or cluster_id} (v{version})"
+
+
+def profile_one_cluster(client: ConsoleClient, cluster_id: str, display_name: str,
+                        *, include_system: bool, top_n: int, sample_interval: int,
+                        output_dir: Path, timestamp: str) -> Dict[str, Any]:
+    """
+    对单个集群执行完整画像并写出 md/csv/json。
+
+    返回结果摘要: {ok, cluster_id, display_name, error, files, summary}
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "cluster_id": cluster_id,
+        "display_name": display_name,
+        "error": "",
+        "files": [],
+        "summary": {},
+    }
+
+    profiler = UsageProfiler(
+        client, cluster_id,
+        display_name=display_name,
+        include_system_indices=include_system,
+        top_n=top_n,
+        sample_interval=sample_interval,
+    )
+
+    try:
+        profiler.collect()
+    except ConsoleAPIError as e:
+        result["error"] = str(e)
+        print(f"\n采集失败: {e}")
+        return result
+
+    profiler.print_summary()
+
+    safe_name = re.sub(r"[^\w.-]+", "_", profiler.display_name)
+    base = f"usage_profile_{safe_name}_{timestamp}"
+
+    md_file = output_dir / f"{base}.md"
+    md_file.write_text(profiler.generate_markdown(), encoding="utf-8")
+    csv_file = profiler.generate_csv(str(output_dir / f"{base}_indices.csv"))
+    json_file = output_dir / f"{base}.json"
+    json_file.write_text(
+        json.dumps(profiler.report, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8")
+
+    print(f"\nMarkdown 报告: {md_file}")
+    print(f"索引明细 CSV: {csv_file}")
+    print(f"JSON 明细:    {json_file}")
+
+    report = profiler.report
+    result.update(
+        ok=True,
+        files=[str(md_file), str(csv_file), str(json_file)],
+        summary={
+            "cluster_name": report.get("cluster", {}).get("cluster_name", ""),
+            "version": report.get("cluster", {}).get("version", ""),
+            "status": report.get("overview", {}).get("status", ""),
+            "nodes": report.get("overview", {}).get("number_of_nodes", 0),
+            "indices": len(report.get("index_records", [])),
+            "shards": report.get("shards_analysis", {}).get("total_shards", 0),
+            "risks": len(report.get("risks", [])),
+        },
+    )
+    return result
+
+
+def run_all_clusters(client: ConsoleClient, *, include_system: bool, top_n: int,
+                     sample_interval: int, output_dir: Path,
+                     include_console_cluster: bool) -> List[Dict[str, Any]]:
+    """全集群模式：顺序采集 Console 中所有集群，单个失败不影响其余"""
+    print("获取集群列表...")
+    try:
+        clusters = client.get_clusters()
+    except ConsoleAPIError as e:
+        print(f"获取集群列表失败: {e}")
+        sys.exit(1)
+
+    targets, skipped = filter_profile_targets(clusters, include_console_cluster)
+    if skipped:
+        print(f"已跳过 {skipped} 个 Console 系统集群（--include-console-cluster 可包含）")
+    if not targets:
+        print("过滤后没有可采集的集群")
+        sys.exit(1)
+
+    print(f"共 {len(targets)} 个集群待采集（顺序执行，采样间隔 {sample_interval}s）")
+    if sample_interval > 0:
+        print(f"提示: 每个集群需等待采样间隔，预计总耗时约 "
+              f"{len(targets) * sample_interval // 60} 分钟以上；--sample-interval 0 可跳过采样")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results: List[Dict[str, Any]] = []
+    for i, target in enumerate(targets, 1):
+        print(f"\n[{i}/{len(targets)}] ========== 集群: {target['display_name']} =========")
+        # 预检：离线/无权限的集群直接标记失败，继续下一个
+        reachable, info = check_cluster_reachable(client, target["cluster_id"])
+        if not reachable:
+            print(f"  集群不可达，跳过: {info}")
+            results.append({
+                "ok": False,
+                "cluster_id": target["cluster_id"],
+                "display_name": target["display_name"],
+                "error": info,
+                "files": [],
+                "summary": {},
+            })
+            continue
+        print(f"集群可达: {info}")
+        results.append(profile_one_cluster(
+            client, target["cluster_id"], target["display_name"],
+            include_system=include_system,
+            top_n=top_n,
+            sample_interval=sample_interval,
+            output_dir=output_dir,
+            timestamp=timestamp,
+        ))
+
+    print_batch_summary(results)
+    return results
+
+
+def print_batch_summary(results: List[Dict[str, Any]]):
+    """全集群模式结束后的汇总表"""
+    ok_results = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"]]
+
+    print()
+    print("=" * 72)
+    print(f"全集群画像完成: 成功 {len(ok_results)} 个，失败 {len(failed)} 个")
+    print("=" * 72)
+    if ok_results:
+        print(f"{'集群':<26} {'版本':<10} {'健康':<8} {'节点':>4} {'索引':>6} {'分片':>6} {'风险':>4}  报告文件")
+        for r in ok_results:
+            s = r["summary"]
+            md_file = r["files"][0] if r["files"] else "-"
+            print(f"{r['display_name'][:24]:<26} {str(s.get('version', ''))[:9]:<10} "
+                  f"{str(s.get('status', '')):<8} {s.get('nodes', 0):>4} "
+                  f"{s.get('indices', 0):>6} {s.get('shards', 0):>6} "
+                  f"{s.get('risks', 0):>4}  {md_file}")
+    if failed:
+        print("\n失败明细:")
+        for r in failed:
+            print(f"  - {r['display_name']} ({r['cluster_id']}): {r['error']}")
+    print("=" * 72)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Cluster Usage Profile - 采集单个 ES 集群的使用情况与使用场景画像",
+        description="Cluster Usage Profile - 采集 ES 集群的使用情况与使用场景画像（支持单集群或全集群）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1412,6 +1606,13 @@ Examples:
   # 按集群 ID 采集，采样 120s，输出到指定目录
   python cluster_usage_profile.py --config config.json --cluster-id xxx \\
       --sample-interval 120 -o ./exports
+
+  # 一次采集 Console 中所有集群（默认跳过 Console 系统集群）
+  python cluster_usage_profile.py --config config.json --all-clusters -o ./exports
+
+  # 全集群静态画像，不等采样
+  python cluster_usage_profile.py --config config.json --all-clusters \\
+      --sample-interval 0
 
   # 不等待采样（只做静态画像）
   python cluster_usage_profile.py --config config.json --cluster-name my-cluster \\
@@ -1428,14 +1629,23 @@ Environment Variables:
 
     parser = add_common_args(parser)
 
-    parser.add_argument(
+    target_group = parser.add_argument_group('目标集群参数（三选一：--cluster-id / --cluster-name / --all-clusters）')
+    target_group.add_argument(
         "--cluster-id",
         default="",
         help="目标集群 ID (环境变量: CONSOLE_CLUSTER_ID)")
-    parser.add_argument(
+    target_group.add_argument(
         "--cluster-name",
         default="",
         help="目标集群名称（Console 显示名，支持部分匹配）(环境变量: CONSOLE_CLUSTER_NAME)")
+    target_group.add_argument(
+        "--all-clusters",
+        action="store_true",
+        help="一次采集 Console 中所有集群（顺序执行，默认跳过 Console 系统集群）")
+    target_group.add_argument(
+        "--include-console-cluster",
+        action="store_true",
+        help="配合 --all-clusters 使用，包含 Console 系统集群")
     parser.add_argument(
         "--sample-interval",
         type=int,
@@ -1472,6 +1682,9 @@ def main():
         args.cluster_id, config.get('clusterId'), 'CONSOLE_CLUSTER_ID', '')
     cluster_name = get_config_value(
         args.cluster_name, config.get('clusterName'), 'CONSOLE_CLUSTER_NAME', '')
+    all_clusters_flag = args.all_clusters or bool(config.get('allClusters', False))
+    include_console_cluster = args.include_console_cluster or config.get(
+        'includeConsoleCluster', False)
     sample_interval = int(get_config_value(
         str(args.sample_interval), str(config.get('sampleInterval')),
         'CONSOLE_SAMPLE_INTERVAL', '60'))
@@ -1480,6 +1693,10 @@ def main():
     top_n = int(get_config_value(str(args.top), str(config.get('top')), '', '20'))
 
     output = args.output or config.get('output') or "exports"
+
+    if all_clusters_flag and (cluster_id or cluster_name):
+        print("--all-clusters 不能与 --cluster-id/--cluster-name 同时使用")
+        sys.exit(1)
 
     import getpass
     if username and not password:
@@ -1499,7 +1716,22 @@ def main():
             print(f"登录失败: {e}")
             sys.exit(1)
 
-    # 解析目标集群
+    output_dir = Path(output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------- 全集群模式 ----------------
+    if all_clusters_flag:
+        results = run_all_clusters(
+            client,
+            include_system=include_system,
+            top_n=top_n,
+            sample_interval=sample_interval,
+            output_dir=output_dir,
+            include_console_cluster=include_console_cluster,
+        )
+        sys.exit(0 if any(r["ok"] for r in results) else 1)
+
+    # ---------------- 单集群模式 ----------------
     if not cluster_id and not cluster_name:
         list_clusters_and_exit(client)
 
@@ -1533,14 +1765,9 @@ def main():
     # 可用性预检：直接走 _proxy 访问集群根路径。
     # 不依赖 /elasticsearch/{id}/status —— 部分老版本 Console 没有该接口（会 404），
     # 且 _proxy 是后续所有采集真正使用的通道，预检结果最真实。
-    try:
-        root = client.proxy_request(cluster_id, "GET", "/")
-        cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
-        version = ((root.get("version") or {}).get("number", "")
-                   if isinstance(root, dict) else "")
-        print(f"集群可达: {cname or cluster_name or cluster_id} (v{version})")
-    except ConsoleAPIError as e:
-        msg = str(e)
+    reachable, info = check_cluster_reachable(client, cluster_id)
+    if not reachable:
+        msg = info
         print(f"通过 Console 代理访问集群失败: {msg}")
         if "404" in msg:
             print("提示: 集群 ID 不存在或账号无权访问该集群。"
@@ -1550,41 +1777,18 @@ def main():
         else:
             print("提示: 集群可能在 Console 中处于离线状态，或 Console 无法连通集群")
         sys.exit(1)
+    print(f"集群可达: {info}")
 
-    profiler = UsageProfiler(
-        client, cluster_id,
-        display_name=cluster_name or cluster_id,
-        include_system_indices=include_system,
+    result = profile_one_cluster(
+        client, cluster_id, cluster_name or cluster_id,
+        include_system=include_system,
         top_n=top_n,
         sample_interval=sample_interval,
+        output_dir=output_dir,
+        timestamp=datetime.now().strftime("%Y%m%d_%H%M%S"),
     )
-
-    try:
-        profiler.collect()
-    except ConsoleAPIError as e:
-        print(f"\n采集失败: {e}")
+    if not result["ok"]:
         sys.exit(1)
-
-    profiler.print_summary()
-
-    # 输出文件
-    output_dir = Path(output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^\w.-]+", "_", profiler.display_name)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"usage_profile_{safe_name}_{timestamp}"
-
-    md_file = output_dir / f"{base}.md"
-    md_file.write_text(profiler.generate_markdown(), encoding="utf-8")
-    csv_file = profiler.generate_csv(str(output_dir / f"{base}_indices.csv"))
-    json_file = output_dir / f"{base}.json"
-    json_file.write_text(
-        json.dumps(profiler.report, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8")
-
-    print(f"\nMarkdown 报告: {md_file}")
-    print(f"索引明细 CSV: {csv_file}")
-    print(f"JSON 明细:    {json_file}")
 
 
 if __name__ == "__main__":
