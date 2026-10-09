@@ -2154,7 +2154,7 @@ class MetricsExporter:
 
         try:
             # 先获取原始文档数
-            print(f"    正在查询原始数据量...")
+            print(f"    [{metric_type}] 正在查询原始数据量...")
             count_body = {"query": query.get("query", {"match_all": {}})}
             count_result = self.client.proxy_request(
                 self.system_cluster_id,
@@ -2163,11 +2163,11 @@ class MetricsExporter:
                 count_body,
             )
             total_docs = count_result.get("count", 0)
-            print(f"    原始数据量: {total_docs:,} 条")
+            print(f"    [{metric_type}] 原始数据量: {total_docs:,} 条")
 
             # interval 抽样时，使用轻量估算：分组基数 * 时间桶数
             if sampling and sampling.interval:
-                print(f"    正在预估抽样数据量 (interval={sampling.interval})...")
+                print(f"    [{metric_type}] 正在预估抽样数据量 (interval={sampling.interval})...")
                 if not effective_group_fields:
                     group_fields = self._get_sampling_group_fields(metric_type, config)
                     effective_group_fields = self._resolve_effective_group_fields(
@@ -2217,14 +2217,14 @@ class MetricsExporter:
                 bucket_count = max(0, (end_ms // interval_ms) - (start_ms // interval_ms) + 1)
 
                 sampled_estimate = min(total_docs, group_count * bucket_count)
-                print(f"    估算分组数: {group_count:,}，时间桶数: {bucket_count:,}")
+                print(f"    [{metric_type}] 估算分组数: {group_count:,}，时间桶数: {bucket_count:,}")
 
                 return (total_docs, sampled_estimate)
             else:
                 # 无抽样时，两个值相同
                 return (total_docs, total_docs)
         except Exception as e:
-            print(f"    预估数据量失败: {e}")
+            print(f"    [{metric_type}] 预估数据量失败: {e}")
             return (-1, -1)
 
     def _make_progress_callback(self, metric_type: str, reporter: Optional[ConsoleProgressReporter] = None):
@@ -2337,13 +2337,13 @@ class MetricsExporter:
                 if total_docs >= 0:
                     # 判断是否有抽样
                     if sampling and sampling.interval and total_docs != sampled_docs:
-                        print(f"    原始数据量: {total_docs:,} 条，抽样后: {sampled_docs:,} 条")
+                        print(f"    [{metric_type}] 原始数据量: {total_docs:,} 条，抽样后: {sampled_docs:,} 条")
                     else:
-                        print(f"    预估需要导出约 {total_docs:,} 条记录")
+                        print(f"    [{metric_type}] 预估需要导出约 {total_docs:,} 条记录")
                     if sampled_docs > shard_size:
-                        print(f"    将自动分文件存储 (每文件最多 {shard_size:,} 条)")
+                        print(f"    [{metric_type}] 将自动分文件存储 (每文件最多 {shard_size:,} 条)")
             else:
-                print(f"    已跳过数据量预估，直接开始导出...")
+                print(f"    [{metric_type}] 已跳过数据量预估，直接开始导出...")
 
             progress_callback = self._make_progress_callback(metric_type, progress_reporter)
             metric_parallel_degree = (
