@@ -134,5 +134,11 @@
     "clusterName": "",
     "input": "queries.txt",
     "output": "query-report.md"
+  },
+
+  "clusterConfigDumpOptions": {
+    "output": "./cluster_config_dump",
+    "groups": "",
+    "skipHeavy": false
   }
 }
