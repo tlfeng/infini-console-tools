@@ -593,6 +593,39 @@ class ConsoleClient:
                 data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         return self._make_request(endpoint, method, data=data)
 
+    def write_request(self, endpoint: str, method: str = "POST",
+                      body: Optional[Any] = None) -> Dict[str, Any]:
+        """调用 Console 的写操作 API（POST/PUT/DELETE）。
+
+        Console 1.31+ 对写操作强制要求防重放 nonce（401 "missing replay
+        nonce"），这里自动先取 nonce 再附带 X-Request-Nonce 头重放；
+        旧版本 Console 没有 nonce 接口，取不到时按原样发送。
+        """
+        method = method.upper()
+        if method not in ("POST", "PUT", "DELETE"):
+            raise ConsoleAPIError(f"write_request 仅支持写方法，收到 {method}")
+
+        data = None
+        if body is not None:
+            if isinstance(body, str):
+                data = body.encode("utf-8")
+            else:
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        # nonce 的 path 参数是 URL 路径（不含查询串），与登录接口的约定一致
+        path = "/" + endpoint.lstrip("/").split("?", 1)[0]
+        nonce = None
+        try:
+            s, rn = self._raw_request(
+                "POST", "/account/replay_nonce", {"method": method, "path": path})
+            if s == 200 and isinstance(rn, dict):
+                nonce = rn.get("nonce")
+        except ConsoleAPIError:
+            nonce = None  # 旧版本无此接口，直接发送
+
+        headers = {"X-Request-Nonce": nonce} if nonce else None
+        return self._make_request(endpoint, method, data=data, headers=headers)
+
     def get_index_mapping(self, cluster_id: str, index_name: str) -> Optional[Dict]:
         """获取索引 mapping"""
         try:
