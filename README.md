@@ -14,7 +14,7 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 | **hot-threads** | Hot Threads 采集工具 - 定时抓取 ES hot threads 并写入 JSONL | `hot-threads/` |
 | **cluster-usage-profile** | 集群使用画像工具 - 采集单个或所有集群的使用情况与使用场景 | `cluster-usage-profile/` |
 | **console-queue-delay** | Console 指标写入延迟排查工具 - 定位图表延迟/状态灯全红的根因 | `console-queue-delay/` |
-| **cluster-config-dump** | 集群配置采集工具 - 按类别批量执行只读 GET API 并落盘，生成健康体检摘要，支持变更 diff | `cluster-config-dump/` |
+| **cluster-config-dump** | 集群配置采集工具 - 按类别批量执行只读 GET API 并落盘，生成健康体检摘要，支持单集群或全集群采集与变更 diff | `cluster-config-dump/` |
 | **cluster-register** | 集群自动注册工具 - 幂等地向 Console 注册 ES/Easysearch 集群并绑定凭据 | `cluster-register/` |
 
 ## 快速开始
@@ -73,6 +73,10 @@ python cluster-config-dump/cluster_config_dump.py -c http://localhost:9000 -u ad
 # 集群配置全量采集（非交互，指定类别，跳过大响应的重接口）
 python cluster-config-dump/cluster_config_dump.py --config config.json \
   --cluster-name my-cluster --groups cluster,cat,index --skip-heavy
+
+# 集群配置全量采集（一次采集 Console 中所有非系统集群，跳过不可达集群）
+python cluster-config-dump/cluster_config_dump.py --config config.json \
+  --all-clusters --groups cluster,cat --skip-heavy
 ```
 
 ## 统一配置方式

@@ -17,6 +17,8 @@ API 目录按类别组织（参考 elasticsearch 7.10 官方文档 Cluster APIs 
 - ml           机器学习（未启用时报错属预期）
 
 支持交互式菜单选择集群与类别；也提供 --groups/--yes/--skip-heavy 非交互参数。
+--all-clusters 可一次顺序采集 Console 中所有非系统集群（跳过不可达集群，
+生成 batch_manifest_<时间戳>.json 批处理清单）。
 
 输出目录结构（清晰分组，manifest 可追溯每条 API 的状态与耗时）:
   <output>/config_dump_<时间戳>_<集群>/
@@ -52,6 +54,7 @@ from common.console_client import (
     ConsoleClient,
     ConsoleAPIError,
     ConsoleAuthError,
+    check_cluster_reachable,
     create_authenticated_client,
 )
 from common.config import add_common_args, load_and_merge_config, get_config_value
@@ -317,18 +320,15 @@ def print_catalog(selected_keys: Optional[List[str]] = None) -> None:
 
 def choose_cluster_interactive(client: ConsoleClient) -> Tuple[str, str]:
     """交互式选择目标集群，返回 (cluster_id, display_name)"""
-    clusters = [
-        c for c in client.get_clusters()
-        if not ConsoleClient.is_system_cluster(str(c.get("id", "")), str(c.get("name", "")))
-    ]
+    clusters = ConsoleClient.select_target_clusters(client.get_clusters())
     if not clusters:
         print("Console 中没有可采集的非系统集群")
         sys.exit(1)
 
     print("\n可采集的集群:")
     for i, c in enumerate(clusters, 1):
-        print(f"  [{i}] {c.get('name', '')}  (v{c.get('version', '')}, "
-              f"id={c.get('id', '')})")
+        print(f"  [{i}] {c['display_name']}  (v{c.get('version', '')}, "
+              f"id={c['id']})")
 
     while True:
         try:
@@ -340,11 +340,11 @@ def choose_cluster_interactive(client: ConsoleClient) -> Tuple[str, str]:
             sys.exit(0)
         if choice.isdigit() and 1 <= int(choice) <= len(clusters):
             picked = clusters[int(choice) - 1]
-            return str(picked["id"]), str(picked["name"])
+            return str(picked["id"]), str(picked["display_name"])
         # 允许直接输入集群名或 ID
         for c in clusters:
-            if choice in (str(c.get("id")), str(c.get("name"))):
-                return str(c["id"]), str(c["name"])
+            if choice in (str(c["id"]), str(c["display_name"])):
+                return str(c["id"]), str(c["display_name"])
         print(f"无效输入: {choice}，请输入列表中的编号")
 
 
@@ -948,37 +948,142 @@ class ConfigDumper:
 # 命令行入口
 # ---------------------------------------------------------------------------
 
-def check_cluster_reachable(client: ConsoleClient,
-                            cluster_id: str) -> Tuple[bool, str]:
-    """通过 _proxy 访问集群根路径做可用性预检"""
-    try:
-        root = client.proxy_request(cluster_id, "GET", "/")
-    except ConsoleAPIError as e:
-        return False, str(e)
-    cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
-    version = ((root.get("version") or {}).get("number", "")
-               if isinstance(root, dict) else "")
-    return True, f"{cname or cluster_id} (v{version})"
-
-
 def list_clusters_and_exit(client: ConsoleClient) -> None:
     """非交互模式下未指定集群时，列出可选集群"""
     try:
-        clusters = [
-            c for c in client.get_clusters()
-            if not ConsoleClient.is_system_cluster(
-                str(c.get("id", "")), str(c.get("name", "")))
-        ]
+        clusters = ConsoleClient.select_target_clusters(client.get_clusters())
     except ConsoleAPIError as e:
         print(f"获取集群列表失败: {e}")
         sys.exit(1)
     print("\n未指定目标集群，可用的集群:")
     print(f"{'ID':<28} {'名称':<36} 版本")
     for c in clusters:
-        print(f"{str(c.get('id', '')):<28} {str(c.get('name', '')):<36} "
+        print(f"{str(c.get('id', '')):<28} {str(c.get('display_name', '')):<36} "
               f"{c.get('version', '')}")
-    print("\n用 --cluster-id / --cluster-name 指定目标集群")
+    print("\n用 --cluster-id / --cluster-name 指定目标集群，"
+          "或 --all-clusters 采集全部")
     sys.exit(1)
+
+
+def dump_one_cluster(client: ConsoleClient, *, cluster_id: str, display_name: str,
+                     selected_keys: List[str], include_heavy: bool,
+                     output_root: Path, timestamp: str,
+                     console_url: str) -> Dict[str, Any]:
+    """对单个集群执行采集并落盘 manifest/summary，返回结果摘要"""
+    safe_name = re.sub(r"[^\w.-]+", "_", display_name)
+    run_dir = output_root / f"config_dump_{timestamp}_{safe_name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    plan = build_plan(selected_keys, include_heavy)
+    dumper = ConfigDumper(client, cluster_id, display_name, plan, run_dir,
+                          console_url=console_url)
+    counts = dumper.run()
+
+    # manifest 与 summary 无论成败都落盘
+    manifest = dumper.build_manifest(selected_keys, include_heavy, counts)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_md = dumper.generate_summary_md(selected_keys, include_heavy, counts)
+    (run_dir / "summary.md").write_text(summary_md, encoding="utf-8")
+
+    return {
+        "ok": counts["ok"] > 0,
+        "cluster_id": cluster_id,
+        "display_name": display_name,
+        "run_dir": run_dir,
+        "counts": counts,
+        "error": "",
+    }
+
+
+def run_all_clusters(client: ConsoleClient, *, selected_keys: List[str],
+                     include_heavy: bool, output_root: Path, timestamp: str,
+                     console_url: str,
+                     include_console_cluster: bool) -> List[Dict[str, Any]]:
+    """全集群模式：顺序采集 Console 中所有集群，单个失败不影响其余"""
+    print("获取集群列表...")
+    try:
+        clusters = client.get_clusters()
+    except ConsoleAPIError as e:
+        print(f"获取集群列表失败: {e}")
+        sys.exit(1)
+
+    # 先剔除缺失 ID 的条目，使跳过数只统计系统集群（与 filter_profile_targets 一致）
+    clusters = [c for c in clusters if str(c.get("id") or "")]
+    targets = ConsoleClient.select_target_clusters(clusters, include_console_cluster)
+    if not include_console_cluster:
+        skipped = len(clusters) - len(targets)
+        if skipped > 0:
+            print(f"已跳过 {skipped} 个 Console 系统集群"
+                  "（--include-console-cluster 可包含）")
+    if not targets:
+        print("过滤后没有可采集的集群")
+        sys.exit(1)
+
+    print(f"共 {len(targets)} 个集群待采集（顺序执行）")
+    results: List[Dict[str, Any]] = []
+    for i, target in enumerate(targets, 1):
+        print(f"\n[{i}/{len(targets)}] ========== 集群: "
+              f"{target['display_name']} =========")
+        # 预检：离线/无权限的集群直接标记失败，继续下一个
+        reachable, info = check_cluster_reachable(client, str(target["id"]))
+        if not reachable:
+            print(f"  集群不可达，跳过: {info}")
+            results.append({
+                "ok": False, "cluster_id": str(target["id"]),
+                "display_name": str(target["display_name"]),
+                "run_dir": None, "counts": None, "error": info,
+            })
+            continue
+        print(f"集群可达: {info}")
+        results.append(dump_one_cluster(
+            client, cluster_id=str(target["id"]),
+            display_name=str(target["display_name"]),
+            selected_keys=selected_keys, include_heavy=include_heavy,
+            output_root=output_root, timestamp=timestamp,
+            console_url=console_url))
+
+    # 批处理清单：记录本批全部集群的产物目录与计数，方便后续整批 diff
+    batch_manifest = {
+        "tool": "cluster-config-dump",
+        "mode": "all-clusters",
+        "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "console_url": console_url,
+        "include_console_cluster": include_console_cluster,
+        "groups_selected": selected_keys,
+        "include_heavy": include_heavy,
+        "clusters": [
+            {
+                "cluster_id": r["cluster_id"],
+                "display_name": r["display_name"],
+                "ok": r["ok"],
+                "error": r.get("error", ""),
+                "counts": r.get("counts"),
+                "run_dir": str(r["run_dir"]) if r.get("run_dir") else "",
+            }
+            for r in results
+        ],
+    }
+    manifest_file = output_root / f"batch_manifest_{timestamp}.json"
+    manifest_file.write_text(
+        json.dumps(batch_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+
+    print()
+    print("=" * 64)
+    ok_n = sum(1 for r in results if r["ok"])
+    print(f"全集群采集完成: 成功 {ok_n} / 失败或跳过 {len(results) - ok_n}"
+          f"（共 {len(results)} 个）")
+    for r in results:
+        counts = r.get("counts") or {}
+        detail = (f"成功 {counts.get('ok', 0)} / ES报错 {counts.get('es_error', 0)}"
+                  f" / 失败 {counts.get('failed', 0)}") if counts \
+            else r.get("error", "")
+        print(f"  [{'OK  ' if r['ok'] else 'FAIL'}] "
+              f"{r['display_name']:<30} {detail}")
+    print(f"批处理清单: {manifest_file}")
+    print("=" * 64)
+    return results
 
 
 def parse_args():
@@ -995,6 +1100,10 @@ Examples:
   python cluster_config_dump.py --config config.json --cluster-name prod \\
       --groups cluster,cat,index --skip-heavy
 
+  # 采集 Console 中所有集群（跳过系统集群与不可达集群）
+  python cluster_config_dump.py --config config.json --all-clusters \\
+      --groups cluster,cat --skip-heavy
+
   # 全部类别（含重接口）
   python cluster_config_dump.py -c http://localhost:9000 -u admin -p 'pw' \\
       --cluster-id xxx --yes
@@ -1010,13 +1119,20 @@ Environment Variables:
 
     parser = add_common_args(parser)
 
-    target_group = parser.add_argument_group("目标集群参数（二选一：--cluster-id / --cluster-name）")
+    target_group = parser.add_argument_group(
+        "目标集群参数（三选一：--cluster-id / --cluster-name / --all-clusters）")
     target_group.add_argument(
         "--cluster-id", default="", help="目标集群 ID (环境变量: CONSOLE_CLUSTER_ID)")
     target_group.add_argument(
         "--cluster-name", default="",
         help="目标集群名称（Console 显示名，支持部分匹配）"
              " (环境变量: CONSOLE_CLUSTER_NAME)")
+    target_group.add_argument(
+        "--all-clusters", action="store_true",
+        help="采集 Console 中所有非系统集群（顺序执行，单个失败不影响其余）")
+    target_group.add_argument(
+        "--include-console-cluster", action="store_true",
+        help="配合 --all-clusters 使用，包含 Console 系统集群")
 
     parser.add_argument(
         "--groups", "-g", default="",
@@ -1056,12 +1172,22 @@ def main():
         args.cluster_id, config.get("clusterId"), "CONSOLE_CLUSTER_ID", "")
     cluster_name = get_config_value(
         args.cluster_name, config.get("clusterName"), "CONSOLE_CLUSTER_NAME", "")
+    all_clusters_flag = args.all_clusters or bool(options.get("allClusters", False))
+    include_console_cluster = args.include_console_cluster or bool(
+        options.get("includeConsoleCluster", False))
 
     # 类别选择：CLI > 配置文件 > 环境变量；--yes 表示全选
     groups_spec = get_config_value(
         args.groups, options.get("groups"), "CONSOLE_DUMP_GROUPS", "")
     skip_heavy = args.skip_heavy or bool(options.get("skipHeavy", False))
     non_interactive = bool(groups_spec) or args.yes
+
+    if all_clusters_flag and (cluster_id or cluster_name):
+        print("--all-clusters 不能与 --cluster-id/--cluster-name 同时使用")
+        sys.exit(1)
+    if all_clusters_flag and not non_interactive and not sys.stdin.isatty():
+        print("非交互环境下使用 --all-clusters 需显式指定 --groups（或 --yes）")
+        sys.exit(1)
 
     output = args.output or options.get("output") or "./cluster_config_dump"
 
@@ -1077,51 +1203,53 @@ def main():
         print(f"登录失败: {e}")
         sys.exit(1)
 
-    # ---------------- 目标集群 ----------------
-    try:
-        clusters = client.get_clusters()
-    except ConsoleAPIError:
-        clusters = []
-
-    if not cluster_id and not cluster_name:
-        if non_interactive or not sys.stdin.isatty():
-            list_clusters_and_exit(client)
-        cluster_id, cluster_name = choose_cluster_interactive(client)
-    elif not cluster_id and cluster_name:
-        try:
-            cluster_id = client.resolve_cluster_id_by_name(cluster_name)
-            print(f"已根据 clusterName 解析 clusterId: {cluster_name} -> {cluster_id}")
-        except ConsoleAPIError as e:
-            print(f"解析集群失败: {e}")
-            list_clusters_and_exit(client)
-    elif cluster_id and clusters:
-        # 校验 cluster-id；不匹配时尝试按名称纠正
-        if not any(c.get("id") == cluster_id for c in clusters):
-            print(f"警告: cluster-id '{cluster_id}' 不在 Console 集群列表中，尝试按名称解析...")
-            try:
-                resolved = client.resolve_cluster_id_by_name(cluster_id)
-                print(f"已按名称解析: {cluster_id} -> {resolved}")
-                cluster_id = resolved
-            except ConsoleAPIError:
-                list_clusters_and_exit(client)
-
+    # ---------------- 目标集群（单集群模式） ----------------
+    clusters: List[Dict[str, Any]] = []
     display_name = cluster_name or cluster_id
-    for c in clusters:
-        if c.get("id") == cluster_id:
-            display_name = c.get("name") or cluster_id
-            break
+    if not all_clusters_flag:
+        try:
+            clusters = client.get_clusters()
+        except ConsoleAPIError:
+            clusters = []
 
-    reachable, info = check_cluster_reachable(client, cluster_id)
-    if not reachable:
-        print(f"通过 Console 代理访问集群失败: {info}")
-        if "404" in info:
-            print("提示: 集群 ID 不存在或账号无权访问该集群")
-        elif "403" in info:
-            print("提示: 当前账号没有该集群的 _proxy 访问权限")
-        else:
-            print("提示: 集群可能在 Console 中处于离线状态，或 Console 无法连通集群")
-        sys.exit(1)
-    print(f"集群可达: {info}")
+        if not cluster_id and not cluster_name:
+            if non_interactive or not sys.stdin.isatty():
+                list_clusters_and_exit(client)
+            cluster_id, cluster_name = choose_cluster_interactive(client)
+        elif not cluster_id and cluster_name:
+            try:
+                cluster_id = client.resolve_cluster_id_by_name(cluster_name)
+                print(f"已根据 clusterName 解析 clusterId: {cluster_name} -> {cluster_id}")
+            except ConsoleAPIError as e:
+                print(f"解析集群失败: {e}")
+                list_clusters_and_exit(client)
+        elif cluster_id and clusters:
+            # 校验 cluster-id；不匹配时尝试按名称纠正
+            if not any(c.get("id") == cluster_id for c in clusters):
+                print(f"警告: cluster-id '{cluster_id}' 不在 Console 集群列表中，尝试按名称解析...")
+                try:
+                    resolved = client.resolve_cluster_id_by_name(cluster_id)
+                    print(f"已按名称解析: {cluster_id} -> {resolved}")
+                    cluster_id = resolved
+                except ConsoleAPIError:
+                    list_clusters_and_exit(client)
+
+        for c in clusters:
+            if c.get("id") == cluster_id:
+                display_name = c.get("name") or cluster_id
+                break
+
+        reachable, info = check_cluster_reachable(client, cluster_id)
+        if not reachable:
+            print(f"通过 Console 代理访问集群失败: {info}")
+            if "404" in info:
+                print("提示: 集群 ID 不存在或账号无权访问该集群")
+            elif "403" in info:
+                print("提示: 当前账号没有该集群的 _proxy 访问权限")
+            else:
+                print("提示: 集群可能在 Console 中处于离线状态，或 Console 无法连通集群")
+            sys.exit(1)
+        print(f"集群可达: {info}")
 
     # ---------------- 类别选择 ----------------
     try:
@@ -1152,35 +1280,33 @@ def main():
     print(f"\n执行计划: {len(selected_keys)} 类 {len(plan)} 个 API"
           f"（{'包含' if include_heavy else '不含'}重接口）")
 
-    # ---------------- 采集 ----------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = re.sub(r"[^\w.-]+", "_", display_name)
     output_root = Path(output)
     output_root.mkdir(parents=True, exist_ok=True)
-    run_dir = output_root / f"config_dump_{timestamp}_{safe_name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
 
-    dumper = ConfigDumper(
-        client, cluster_id, display_name, plan, run_dir, console_url=console_url)
-    counts = dumper.run()
+    # ---------------- 全集群模式 ----------------
+    if all_clusters_flag:
+        results = run_all_clusters(
+            client, selected_keys=selected_keys, include_heavy=include_heavy,
+            output_root=output_root, timestamp=timestamp, console_url=console_url,
+            include_console_cluster=include_console_cluster)
+        sys.exit(0 if any(r["ok"] for r in results) else 1)
 
-    # manifest 与 summary 无论成败都落盘
-    manifest = dumper.build_manifest(selected_keys, include_heavy, counts)
-    manifest_file = run_dir / "manifest.json"
-    manifest_file.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    summary_md = dumper.generate_summary_md(selected_keys, include_heavy, counts)
-    summary_file = run_dir / "summary.md"
-    summary_file.write_text(summary_md, encoding="utf-8")
+    # ---------------- 单集群采集 ----------------
+    result = dump_one_cluster(
+        client, cluster_id=cluster_id, display_name=display_name,
+        selected_keys=selected_keys, include_heavy=include_heavy,
+        output_root=output_root, timestamp=timestamp, console_url=console_url)
+    counts = result["counts"]
+    run_dir = result["run_dir"]
 
     print()
     print("=" * 64)
     print(f"采集完成: 成功 {counts['ok']} / ES 报错 {counts['es_error']} / "
           f"失败 {counts['failed']} / 按预期跳过 {counts['skipped']}")
     print(f"输出目录:   {run_dir}")
-    print(f"总清单:     {manifest_file}")
-    print(f"体检摘要:   {summary_file}")
+    print(f"总清单:     {run_dir / 'manifest.json'}")
+    print(f"体检摘要:   {run_dir / 'summary.md'}")
     print("=" * 64)
 
     sys.exit(0 if counts["ok"] > 0 else 1)

@@ -41,16 +41,32 @@ python cluster_config_dump.py --config config.json --cluster-name prod \
 python cluster_config_dump.py -c http://localhost:9000 -u admin -p 'pw' \
     --cluster-id xxx --yes
 
+# 全集群模式：一次采集 Console 中所有非系统集群（跳过不可达集群）
+python cluster_config_dump.py --config config.json --all-clusters \
+    --groups cluster,cat --skip-heavy
+
 # 只查看 API 目录（76 个 API 及说明）
 python cluster_config_dump.py --list
 ```
 
 类别参数支持编号或 key，如 `--groups 1,2,3`、`--groups cluster,cat`、`--groups all`。
 
+全集群模式说明：
+
+- 目标参数三选一：`--cluster-id` / `--cluster-name` / `--all-clusters`
+  （`--all-clusters` 与前两者互斥）
+- 顺序执行，逐个预检可达性；离线/无权限的集群标记失败后继续下一个
+- 所有集群共用同一时间戳，每个集群一个独立的 `config_dump_<时间戳>_<集群名>/` 目录，
+  便于整批与上一次运行做 `diff -r`
+- 结束后在输出根目录生成 `batch_manifest_<时间戳>.json`，记录每个集群的
+  状态/计数/产物目录，可作为自动化 diff 的索引
+- 退出码：至少一个集群采集成功即为 0
+
 ## 输出结构
 
 ```
 cluster_config_dump/
+├── batch_manifest_<时间戳>.json   # 全集群模式的批处理清单（单集群模式无此文件）
 └── config_dump_<时间戳>_<集群名>/
     ├── manifest.json              # 全部 API 的状态/耗时/大小/错误（总清单）
     ├── summary.md                 # 自动体检摘要（健康信号/模块状态/统计）
@@ -106,4 +122,5 @@ cluster_config_dump/
 `CONSOLE_CLUSTER_ID` / `CONSOLE_CLUSTER_NAME` / `CONSOLE_DUMP_GROUPS` /
 `CONSOLE_MAX_ATTEMPTS`（网络重试次数，见 common/console_client.py）
 
-也可在 `config.json` 的 `clusterConfigDumpOptions` 段配置 `output` / `groups` / `skipHeavy`。
+也可在 `config.json` 的 `clusterConfigDumpOptions` 段配置 `output` / `groups` /
+`skipHeavy` / `allClusters` / `includeConsoleCluster`。

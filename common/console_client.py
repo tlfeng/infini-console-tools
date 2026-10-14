@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 # 瞬时性网络错误的最大尝试次数（1 次原始请求 + N-1 次重试），
 # 客户环境出现过间歇性连接重置（WinError 10054），重试太少覆盖不了抖动窗口
@@ -710,6 +710,29 @@ class ConsoleClient:
         return False
 
     @staticmethod
+    def select_target_clusters(clusters: List[Dict[str, Any]],
+                               include_system: bool = False
+                               ) -> List[Dict[str, Any]]:
+        """从集群列表筛出可操作的目标集群（"全集群采集"类工具共用）。
+
+        默认跳过 Console 系统集群和缺失 ID 的条目；返回原条目副本
+        （id 规范化为字符串），并补充 display_name（名称为空时回退为 ID）。
+        """
+        targets: List[Dict[str, Any]] = []
+        for c in clusters or []:
+            cluster_id = str(c.get("id") or "")
+            if not cluster_id:
+                continue
+            name = str(c.get("name") or "")
+            if not include_system and ConsoleClient.is_system_cluster(cluster_id, name):
+                continue
+            entry = dict(c)
+            entry["id"] = cluster_id
+            entry["display_name"] = name or cluster_id
+            targets.append(entry)
+        return targets
+
+    @staticmethod
     def format_bytes(bytes_val: int) -> str:
         """将字节转换为可读格式"""
         if bytes_val is None or bytes_val == 0:
@@ -815,3 +838,20 @@ def create_authenticated_client(
         raise ConsoleAuthError(f"登录失败: {str(e)}") from e
 
     return client
+
+
+def check_cluster_reachable(client: "ConsoleClient",
+                            cluster_id: str) -> Tuple[bool, str]:
+    """
+    通过 _proxy 访问集群根路径做可用性预检（多集群采集类工具共用）。
+
+    返回 (是否可达, 成功时为 "集群名 (v版本)"，失败时为错误信息)。
+    """
+    try:
+        root = client.proxy_request(cluster_id, "GET", "/")
+    except ConsoleAPIError as e:
+        return False, str(e)
+    cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
+    version = ((root.get("version") or {}).get("number", "")
+               if isinstance(root, dict) else "")
+    return True, f"{cname or cluster_id} (v{version})"

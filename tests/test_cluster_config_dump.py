@@ -10,12 +10,16 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "cluster-config-dump"))
 
-from common.console_client import ConsoleAPIError
+from common.console_client import (
+    ConsoleAPIError,
+    ConsoleClient,
+    DEFAULT_SYSTEM_CLUSTER_ID,
+)
 from cluster_config_dump import (
     API_GROUPS,
     GROUP_KEYS,
@@ -25,6 +29,8 @@ from cluster_config_dump import (
     print_catalog,
     evaluate_findings,
     ConfigDumper,
+    dump_one_cluster,
+    run_all_clusters,
 )
 
 
@@ -406,6 +412,114 @@ class TestConfigDumperRun(unittest.TestCase):
         counts = dumper.run()
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(counts["skipped"], 0)
+
+
+class TestSelectTargetClusters(unittest.TestCase):
+    """测试公共的目标集群筛选（common/console_client.py）"""
+
+    def test_filters_system_clusters(self):
+        clusters = [
+            {"id": "c1", "name": "prod", "version": "7.10.2"},
+            {"id": DEFAULT_SYSTEM_CLUSTER_ID, "name": "INFINI SYSTEM"},
+            {"id": "c2", "name": "my slingshot cluster"},
+            {"id": "", "name": "no-id"},
+        ]
+        targets = ConsoleClient.select_target_clusters(clusters)
+        self.assertEqual([t["id"] for t in targets], ["c1"])
+        self.assertEqual(targets[0]["display_name"], "prod")
+
+    def test_include_system_keeps_all(self):
+        clusters = [
+            {"id": "c1", "name": "prod"},
+            {"id": DEFAULT_SYSTEM_CLUSTER_ID, "name": "INFINI SYSTEM"},
+        ]
+        targets = ConsoleClient.select_target_clusters(clusters,
+                                                       include_system=True)
+        self.assertEqual(len(targets), 2)
+
+    def test_display_name_fallback_and_keys_preserved(self):
+        targets = ConsoleClient.select_target_clusters(
+            [{"id": "c9", "version": "7.10.2"}])
+        self.assertEqual(targets[0]["display_name"], "c9")
+        self.assertEqual(targets[0]["version"], "7.10.2")
+
+    def test_none_and_empty_input(self):
+        self.assertEqual(ConsoleClient.select_target_clusters(None), [])
+        self.assertEqual(ConsoleClient.select_target_clusters([]), [])
+
+
+class TestRunAllClusters(unittest.TestCase):
+    """全集群模式：过滤系统集群、跳过不可达集群、落盘批处理清单"""
+
+    def _client(self):
+        client = MagicMock()
+        client.get_clusters.return_value = [
+            {"id": "c1", "name": "es-prod", "version": "7.10.2"},
+            {"id": "c2", "name": "es-dev", "version": "6.8.2"},
+            {"id": DEFAULT_SYSTEM_CLUSTER_ID, "name": "INFINI SYSTEM"},
+        ]
+        client.proxy_request.side_effect = lambda cid, method, path: {
+            "path": path, "cluster_name": f"cluster-{cid}"}
+        return client
+
+    def test_batch_dump(self):
+        client = self._client()
+        # c2 不可达 → 跳过；c1 正常采集
+        with patch("cluster_config_dump.check_cluster_reachable",
+                   side_effect=lambda c, cid:
+                   (True, f"cluster-{cid} (v7.10.2)") if cid == "c1"
+                   else (False, "HTTP 404: not found")):
+            with tempfile.TemporaryDirectory() as tmp:
+                results = run_all_clusters(
+                    client, selected_keys=["license"], include_heavy=True,
+                    output_root=Path(tmp), timestamp="20260101_000000",
+                    console_url="http://console:9000",
+                    include_console_cluster=False)
+
+                # 系统集群被过滤，只剩 2 个目标
+                self.assertEqual(len(results), 2)
+                by_id = {r["cluster_id"]: r for r in results}
+                # c1 采集成功，产物齐备
+                self.assertTrue(by_id["c1"]["ok"])
+                run_dir = by_id["c1"]["run_dir"]
+                self.assertEqual(run_dir.name,
+                                 "config_dump_20260101_000000_es-prod")
+                self.assertTrue((run_dir / "manifest.json").exists())
+                self.assertTrue((run_dir / "summary.md").exists())
+                # c2 不可达，标记失败
+                self.assertFalse(by_id["c2"]["ok"])
+                self.assertIn("404", by_id["c2"]["error"])
+                self.assertIsNone(by_id["c2"]["run_dir"])
+
+                # 批处理清单
+                manifest_file = Path(tmp) / "batch_manifest_20260101_000000.json"
+                self.assertTrue(manifest_file.exists())
+                manifest = json.loads(manifest_file.read_text())
+                self.assertEqual(manifest["mode"], "all-clusters")
+                self.assertEqual(len(manifest["clusters"]), 2)
+                self.assertEqual(manifest["groups_selected"], ["license"])
+                entry = {c["cluster_id"]: c for c in manifest["clusters"]}
+                self.assertTrue(entry["c1"]["ok"])
+                self.assertIn("config_dump_20260101_000000_es-prod",
+                              entry["c1"]["run_dir"])
+                self.assertFalse(entry["c2"]["ok"])
+                self.assertEqual(entry["c2"]["counts"], None)
+
+    def test_dump_one_cluster_outputs(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = dump_one_cluster(
+                client, cluster_id="c1", display_name="es/prod:1",
+                selected_keys=["license"], include_heavy=True,
+                output_root=Path(tmp), timestamp="20260101_000000",
+                console_url="http://console:9000")
+            self.assertTrue(result["ok"])
+            run_dir = result["run_dir"]
+            # 显示名中的特殊字符被替换为下划线
+            self.assertEqual(run_dir.name, "config_dump_20260101_000000_es_prod_1")
+            self.assertTrue((run_dir / "manifest.json").exists())
+            self.assertTrue((run_dir / "summary.md").exists())
+            self.assertTrue((run_dir / "04_license").exists())
 
 
 if __name__ == "__main__":
