@@ -96,6 +96,43 @@ class ConsoleAPIError(Exception):
     pass
 
 
+class ProxyResponseError(ConsoleAPIError):
+    """通过 _proxy 访问集群，集群侧返回了非 2xx。
+
+    Console 把集群的状态码原样透传，响应体包装成
+    {request_header, response_header, response_body}，所以这是集群返回的
+    业务错误而不是请求层失败，错误体本身就是诊断信息。
+    """
+
+    def __init__(self, message: str, es_status: int, es_body: Any):
+        super().__init__(message)
+        self.es_status = es_status
+        self.es_body = es_body
+
+
+def parse_proxy_error(endpoint: str, status: int,
+                      body_text: str) -> Optional[ProxyResponseError]:
+    """把 _proxy 的非 2xx 响应解成 ProxyResponseError；不是代理响应时返回 None"""
+    if "_proxy" not in endpoint:
+        return None
+    try:
+        wrapper = json.loads(body_text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(wrapper, dict):
+        return None
+    if "response_body" not in wrapper or "response_header" not in wrapper:
+        return None
+    body = wrapper["response_body"]
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            pass
+    message = f"请求 {endpoint} 失败: HTTP {status}: {body_text}"
+    return ProxyResponseError(message, status, body)
+
+
 class ConsoleClient:
     """INFINI Console API 客户端"""
 
@@ -323,6 +360,9 @@ class ConsoleClient:
                 time.sleep(self._retry_delay(attempt))
                 continue
             if status >= 400:
+                proxy_error = parse_proxy_error(endpoint, status, body_text)
+                if proxy_error is not None:
+                    raise proxy_error
                 raise ConsoleAPIError(f"请求 {endpoint} 失败: HTTP {status}: {body_text}")
             return json.loads(body_text) if body_text else {}
 

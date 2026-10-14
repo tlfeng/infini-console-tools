@@ -54,6 +54,7 @@ from common.console_client import (
     ConsoleClient,
     ConsoleAPIError,
     ConsoleAuthError,
+    ProxyResponseError,
     check_cluster_reachable,
     create_authenticated_client,
 )
@@ -636,12 +637,26 @@ class ConfigDumper:
         执行单条 API。
 
         返回 (payload, status, error, es_error_status)。
-        status: ok=正常响应；es_error=ES 返回了错误体（仍是有效 JSON 诊断信息）；
-        failed=请求层面失败（网络/Console 拒绝）。
+        status: ok=正常响应；es_error=集群返回了错误响应（含非 2xx，错误体仍是
+        有效 JSON 诊断信息）；failed=请求层面失败（网络/Console 拒绝）。
         """
         t0 = time.time()
         try:
             payload = self.client.proxy_request(self.cluster_id, "GET", item["path"])
+        except ProxyResponseError as e:
+            # 集群侧非 2xx：Console 透传状态码并带回错误体，按 es_error 记账，
+            # 落盘的是错误体本身而不是代理包装
+            if e.es_status in item.get("expected_status", []):
+                return ({"_skipped": True, "expected_status": e.es_status,
+                         "reason": f"集群返回 {e.es_status}", "es_response": e.es_body,
+                         "_requested_path": item["path"]},
+                        "skipped", f"预期状态码 {e.es_status}，按预期跳过", None)
+            if isinstance(e.es_body, (dict, list)):
+                payload = e.es_body
+            else:
+                payload = {"_es_error_body": e.es_body,
+                           "_requested_path": item["path"]}
+            return payload, "es_error", f"ES 返回错误 {e.es_status}", e.es_status
         except ConsoleAPIError as e:
             # 目录里标注为"预期"的 HTTP 状态码（如无快照仓库时的 404、
             # 基础 license 下 CCR 的 403）记为 skipped，不算失败
@@ -939,8 +954,9 @@ class ConfigDumper:
                      "两次运行可直接 diff 对比集群变化")
         lines.append("- 各类别子目录 `NN_<类别>/NNN_<api名>.json`: "
                      "每条 API 的完整响应")
-        lines.append("- `es_error` 状态表示 ES 返回了错误响应体（部分属于预期，"
-                     "如 allocation/explain 在无未分配分片时返回 400）")
+        lines.append("- `es_error` 状态表示集群返回了错误响应（含经 `_proxy` 透传的非 "
+                     "2xx，状态码见 `es_error_status`），错误体本身已作为 JSON 落盘；"
+                     "部分属于预期，如 allocation/explain 在无未分配分片时返回 400")
         return "\n".join(lines)
 
 

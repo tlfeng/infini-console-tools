@@ -19,6 +19,7 @@ from common.console_client import (
     ConsoleAPIError,
     ConsoleClient,
     DEFAULT_SYSTEM_CLUSTER_ID,
+    ProxyResponseError,
 )
 from cluster_config_dump import (
     API_GROUPS,
@@ -520,6 +521,72 @@ class TestRunAllClusters(unittest.TestCase):
             self.assertTrue((run_dir / "manifest.json").exists())
             self.assertTrue((run_dir / "summary.md").exists())
             self.assertTrue((run_dir / "04_license").exists())
+
+
+class TestProxyErrorRecordedAsEsError(unittest.TestCase):
+    """集群侧非 2xx（经 _proxy 透传）记 es_error 并把集群错误体落盘，不再算请求失败"""
+
+    @staticmethod
+    def _proxy_error(path: str, status: int, body):
+        return ProxyResponseError(
+            f"请求 /elasticsearch/c1/_proxy?method=GET&path={path} 失败: "
+            f"HTTP {status}: wrapper", status, body)
+
+    def _dump_one(self, group: str, path: str, exc):
+        client = _fake_client({path: exc})
+        plan = [p for p in build_plan([group], include_heavy=True) if p["path"] == path]
+        dumper = ConfigDumper(client, "cid", "c", plan, Path(tempfile.mkdtemp()))
+        return dumper, dumper.run()
+
+    def _saved(self, dumper, name):
+        rel = dumper.results[name]["file"]
+        return json.loads((dumper.run_dir / rel).read_text(encoding="utf-8"))
+
+    def test_unsupported_api_is_es_error(self):
+        body = {"error": "Incorrect HTTP method for uri [/_license]", "status": 405}
+        dumper, counts = self._dump_one("license", "/_license",
+                                        self._proxy_error("/_license", 405, body))
+        self.assertEqual(counts["es_error"], 1)
+        self.assertEqual(counts["failed"], 0)
+        rec = dumper.results["license"]
+        self.assertEqual(rec["status"], "es_error")
+        self.assertEqual(rec["es_error_status"], 405)
+        self.assertEqual(rec["error"], "ES 返回错误 405")
+        # 落盘的应是集群返回的错误体本身，而不是代理包装/请求头回显
+        self.assertEqual(self._saved(dumper, "license"), body)
+
+    def test_expected_status_stays_skipped_and_keeps_body(self):
+        body = {"error": "repository_missing", "status": 404}
+        dumper, counts = self._dump_one(
+            "cat", "/_cat/snapshots/_all?format=json",
+            self._proxy_error("/_cat/snapshots/_all?format=json", 404, body))
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(counts["failed"], 0)
+        saved = self._saved(dumper, "cat_snapshots")
+        self.assertEqual(saved["expected_status"], 404)
+        self.assertEqual(saved["es_response"], body)
+
+    def test_plain_console_error_still_failed(self):
+        """非代理层的请求失败（网络/Console 拒绝）仍记 failed，不受本次改动影响"""
+        dumper, counts = self._dump_one("cluster", "/_cluster/health",
+                                        ConsoleAPIError("连接被重置"))
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(dumper.results["cluster_health"]["status"], "failed")
+
+    def test_manifest_reports_es_error(self):
+        body = {"error": {"reason": "no unassigned shards"}, "status": 400}
+        dumper, counts = self._dump_one(
+            "cluster", "/_cluster/allocation/explain",
+            self._proxy_error("/_cluster/allocation/explain", 400, body))
+        manifest = dumper.build_manifest(["cluster"], True, counts)
+        self.assertEqual(manifest["es_error"], 1)
+        self.assertEqual(manifest["failed"], 0)
+        item = [i for i in manifest["items"]
+                if i["name"] == "cluster_allocation_explain"][0]
+        self.assertEqual(item["status"], "es_error")
+        self.assertEqual(item["es_error_status"], 400)
+        summary = dumper.generate_summary_md(["cluster"], True, counts)
+        self.assertIn("ES 400", summary)
 
 
 if __name__ == "__main__":

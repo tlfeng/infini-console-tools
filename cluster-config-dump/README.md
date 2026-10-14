@@ -84,10 +84,16 @@ cluster_config_dump/
 - 每条 API 一个编号 JSON 文件，目录按类别编号，两次运行可直接 `diff -r`
 - `manifest.json` 记录每条的 `status`：
   - `ok`：正常响应
-  - `es_error`：ES 返回了错误响应体（**部分属预期**，如
-    `/_cluster/allocation/explain` 在所有分片已分配时返回 400；未启用 ML 时
-    ml 组全部报错）。错误体会原样落盘，是最有价值的排障线索之一
-  - `failed`：请求层面失败（网络/权限），错误信息写入结果文件
+  - `es_error`：集群返回了错误响应——既包括经 `_proxy` 透传回来的非 2xx，也包括
+    2xx 里带 `{"error", "status"}` 体的情况。**部分属预期**，如
+    `/_cluster/allocation/explain` 在所有分片已分配时返回 400；Easysearch 未实现的
+    xpack 接口（`/_license`、`/_ml/*` 等）返回 405/400。结果文件落盘的是集群原始错误体
+    JSON，`es_error_status` 记录其 HTTP 状态码，是最有价值的排障线索之一
+  - `skipped`：命中 API 目录中 `expected_status` 标注的状态码（如无快照仓库的 404、
+    基础 license 下 CCR 的 403），按预期跳过、不算失败；结果文件里以 `es_response`
+    保留集群错误体
+  - `failed`：请求层面失败（网络中断、Console 自身返回错误等非集群响应），错误信息
+    写入结果文件的 `_dump_error`
 - `summary.md` 自动提取：健康状态、未分配分片、pending tasks 积压、JVM 堆、
   磁盘水位、circuit breaker、线程池拒绝、节点版本一致性、License 到期、
   ILM/SLM 运行模式、快照仓库、弃用配置告警等

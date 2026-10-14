@@ -16,6 +16,7 @@ from common.console_client import (
     ConsoleClient,
     ConsoleAuthError,
     ConsoleAPIError,
+    ProxyResponseError,
     DEFAULT_MAX_ATTEMPTS,
     RETRY_BASE_DELAY,
     RETRY_JITTER,
@@ -462,6 +463,76 @@ class TestGetClusters(unittest.TestCase):
         conn = FakeConnection([json_response({"hits": {"total": {"value": 0}, "hits": []}})])
         client = make_client([conn])
         self.assertEqual(client.get_clusters(), [])
+
+
+class TestProxyResponseError(unittest.TestCase):
+    """_proxy 透传的集群错误应带结构化状态码与错误体，而不是笼统的请求失败"""
+
+    @staticmethod
+    def _wrapper(status: int, body, reason: str = "Method Not Allowed") -> dict:
+        return {
+            "request_header": f"GET /_license HTTP/1.1\r\nHost: 127.0.0.1:9200\r\n",
+            "response_header": f"HTTP/1.1 {status} {reason}\r\nContent-Length: 40\r\n",
+            "response_body": body if isinstance(body, str) else json.dumps(body),
+        }
+
+    def test_proxy_error_carries_es_status_and_body(self):
+        """代理非 2xx 解出集群状态码与错误体"""
+        conn = FakeConnection([json_response(
+            self._wrapper(405, {"error": "Incorrect HTTP method", "status": 405}),
+            status=405)])
+        client = make_client([conn])
+
+        with self.assertRaises(ProxyResponseError) as ctx:
+            client.proxy_request("c1", "GET", "/_license")
+        self.assertEqual(ctx.exception.es_status, 405)
+        self.assertEqual(ctx.exception.es_body["status"], 405)
+
+    def test_proxy_error_message_keeps_http_marker(self):
+        """错误文本仍含 HTTP 状态码，兼容按文本取码的老调用方"""
+        conn = FakeConnection([json_response(
+            self._wrapper(404, {"error": "repository_missing", "status": 404}),
+            status=404)])
+        client = make_client([conn])
+
+        with self.assertRaises(ConsoleAPIError) as ctx:
+            client.proxy_request("c1", "GET", "/_snapshot")
+        self.assertIn("HTTP 404", str(ctx.exception))
+        self.assertIsInstance(ctx.exception, ProxyResponseError)
+
+    def test_proxy_error_is_console_api_error_subclass(self):
+        """未识别该子类的调用方按 ConsoleAPIError 处理，行为不变"""
+        self.assertTrue(issubclass(ProxyResponseError, ConsoleAPIError))
+
+    def test_non_json_body_kept_as_text(self):
+        """错误体不是 JSON 时原样保留文本"""
+        conn = FakeConnection([json_response(
+            self._wrapper(500, "upstream exploded"), status=500)])
+        client = make_client([conn], max_attempts=1)  # 5xx 属可重试码，这里只跑一次
+
+        with self.assertRaises(ProxyResponseError) as ctx:
+            client.proxy_request("c1", "GET", "/_license")
+        self.assertEqual(ctx.exception.es_status, 500)
+        self.assertEqual(ctx.exception.es_body, "upstream exploded")
+
+    def test_console_native_error_is_not_proxy_error(self):
+        """Console 自身接口的 4xx 仍抛普通 ConsoleAPIError"""
+        conn = FakeConnection([json_response({"error": "forbidden"}, status=403)])
+        client = make_client([conn])
+
+        with self.assertRaises(ConsoleAPIError) as ctx:
+            client._make_request("/queue/stats")
+        self.assertNotIsInstance(ctx.exception, ProxyResponseError)
+
+    def test_proxy_path_with_unrelated_body_stays_console_error(self):
+        """代理端点上返回的不是包装结构（如 Console 403）时不误判"""
+        conn = FakeConnection([json_response(
+            {"error": "permission denied"}, status=403)])
+        client = make_client([conn])
+
+        with self.assertRaises(ConsoleAPIError) as ctx:
+            client.proxy_request("c1", "GET", "/_license")
+        self.assertNotIsInstance(ctx.exception, ProxyResponseError)
 
 
 if __name__ == "__main__":
