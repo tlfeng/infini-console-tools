@@ -618,6 +618,23 @@ class ConsoleClient:
             return response_body
         return result
 
+    def proxy_raw(
+        self,
+        cluster_id: str,
+        method: str,
+        path: str,
+        body: Optional[Any] = None,
+    ) -> tuple:
+        """通过 _proxy 发送请求，返回 (status, 完整代理包装)。
+
+        与 proxy_request 的区别：不解析、不抛业务错误。集群侧非 2xx 时
+        Console 返回 {request_header, response_header, response_body} 包装，
+        这里原样返回给诊断类工具（如凭据导出），由调用方自行解读。
+        """
+        encoded_path = urllib.parse.quote(path, safe="/-_.:?&=")
+        endpoint = f"/elasticsearch/{cluster_id}/_proxy?method={method.upper()}&path={encoded_path}"
+        return self._raw_request("POST", endpoint, body=body)
+
     def request(self, endpoint: str, method: str = "GET",
                 body: Optional[Any] = None) -> Dict[str, Any]:
         """调用任意 Console API（自动带登录态），失败抛 ConsoleAPIError。

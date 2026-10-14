@@ -37,6 +37,7 @@ from tests import (
     test_console_queue_delay,
     test_cluster_config_dump,
     test_cluster_register,
+    test_credential_export,
 )
 
 
@@ -59,6 +60,7 @@ def run_all_tests(verbosity=1):
     suite.addTests(loader.loadTestsFromModule(test_console_queue_delay))
     suite.addTests(loader.loadTestsFromModule(test_cluster_config_dump))
     suite.addTests(loader.loadTestsFromModule(test_cluster_register))
+    suite.addTests(loader.loadTestsFromModule(test_credential_export))
     
     # 运行测试
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -83,6 +85,7 @@ def run_specific_test(test_name, verbosity=1):
         "queue": test_console_queue_delay,
         "dump": test_cluster_config_dump,
         "register": test_cluster_register,
+        "credential": test_credential_export,
     }
     
     if test_name in test_map:

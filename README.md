@@ -17,6 +17,7 @@ INFINI Console 配套工具集，提供集群管理、索引采样、查询分�
 | **cluster-config-dump** | 集群配置采集工具 - 按类别批量执行只读 GET API 并落盘，生成健康体检摘要，支持单集群或全集群采集与变更 diff | `cluster-config-dump/` |
 | **cluster-register** | 集群自动注册工具 - 幂等地向 Console 注册 ES/Easysearch 集群并绑定凭据 | `cluster-register/` |
 | **console-init** | Console 初始化/重置工具 - 一键将 Console 带到"初始化后"干净状态（setup/init/reset） | `console-init/` |
+| **credential-export** | 凭据提取工具 - 管理员恢复 Console 中所有集群的认证凭据（迁移/备份用，输出明文） | `credential-export/` |
 
 ## 快速开始
 
