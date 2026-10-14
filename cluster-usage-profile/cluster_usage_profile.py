@@ -46,7 +46,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common.console_client import ConsoleClient, ConsoleAPIError, ConsoleAuthError
+from common.console_client import (
+    ConsoleClient,
+    ConsoleAPIError,
+    ConsoleAuthError,
+    check_cluster_reachable,
+)
 from common.config import add_common_args, load_and_merge_config, get_config_value
 
 
@@ -332,22 +337,21 @@ def filter_profile_targets(clusters: List[Dict],
     """
     从 Console 集群列表中过滤出要画像的目标，默认跳过 Console 系统集群。
 
+    过滤逻辑复用 ConsoleClient.select_target_clusters；本函数仅负责转换为
+    {cluster_id, display_name} 键名，并统计跳过的系统集群数（缺失 ID 的
+    条目静默丢弃，不计入 skipped）。
+
     返回 ([{cluster_id, display_name}, ...], 跳过的系统集群数)
     """
-    targets: List[Dict[str, str]] = []
-    skipped = 0
-    for c in clusters or []:
-        cluster_id = str(c.get("id") or "")
-        name = str(c.get("name") or "")
-        if not cluster_id:
-            continue
-        if not include_console_cluster and ConsoleClient.is_system_cluster(cluster_id, name):
-            skipped += 1
-            continue
-        targets.append({
-            "cluster_id": cluster_id,
-            "display_name": name or cluster_id,
-        })
+    all_clusters = clusters or []
+    # 先剔除缺失 ID 的条目，使 skipped = 剩余条目 - 目标 = 纯系统集群数
+    with_id = [c for c in all_clusters if str(c.get("id") or "")]
+    targets = [
+        {"cluster_id": c["id"], "display_name": c["display_name"]}
+        for c in ConsoleClient.select_target_clusters(with_id,
+                                                      include_console_cluster)
+    ]
+    skipped = 0 if include_console_cluster else len(with_id) - len(targets)
     return targets, skipped
 
 
@@ -1430,22 +1434,6 @@ def list_clusters_and_exit(client: ConsoleClient, clusters: Optional[List[Dict]]
         print(f"{str(c.get('id', '')):<28} {str(c.get('name', '')):<36} "
               f"{c.get('version', '')}")
     sys.exit(1)
-
-
-def check_cluster_reachable(client: ConsoleClient, cluster_id: str) -> Tuple[bool, str]:
-    """
-    通过 _proxy 访问集群根路径做可用性预检。
-
-    返回 (是否可达, 成功时为 "集群名 (v版本)"，失败时为错误信息)
-    """
-    try:
-        root = client.proxy_request(cluster_id, "GET", "/")
-    except ConsoleAPIError as e:
-        return False, str(e)
-    cname = root.get("cluster_name", "") if isinstance(root, dict) else ""
-    version = ((root.get("version") or {}).get("number", "")
-               if isinstance(root, dict) else "")
-    return True, f"{cname or cluster_id} (v{version})"
 
 
 def profile_one_cluster(client: ConsoleClient, cluster_id: str, display_name: str,

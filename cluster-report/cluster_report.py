@@ -74,12 +74,9 @@ class ClusterReporter:
 
         print(f"找到 {len(clusters)} 个集群")
 
-        # 过滤系统集群
+        # 过滤系统集群（select_target_clusters 同时会跳过缺失 ID 的条目）
         if not include_console_cluster:
-            clusters = [
-                c for c in clusters
-                if not ConsoleClient.is_system_cluster(c["id"], c["name"])
-            ]
+            clusters = ConsoleClient.select_target_clusters(clusters)
             print(f"过滤后处理 {len(clusters)} 个非系统集群")
 
         # 获取所有集群的状态
