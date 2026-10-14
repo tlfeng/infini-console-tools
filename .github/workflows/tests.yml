@@ -44,6 +44,10 @@ jobs:
         run: |
           python run_tests.py -v
       
+      - name: Run console-init bash tests
+        run: |
+          bash console-init/test_console_init.sh
+      
       - name: Run specific metrics-exporter tests
         run: |
           python -m pytest tests/test_metrics_exporter.py -v || echo "pytest not available, skipping"
